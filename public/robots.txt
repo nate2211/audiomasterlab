@@ -1,3 +1,11 @@
-# https://www.robotstxt.org/robotstxt.html
 User-agent: *
-Disallow:
+Allow: /
+
+AudioMaster Lab public SEO routes.
+Do not block /static/ because React needs JS and CSS assets to render pages correctly.
+Optional: discourage indexing production source maps if they are ever exposed.
+
+Disallow: /*.map$
+
+Sitemap: https://audiomasterlab.com/sitemap.xml
+Sitemap: https://audiomasterlab.com/sitemap.txt

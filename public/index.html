@@ -1,43 +1,103 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#000000" />
-    <meta
-      name="description"
-      content="Web site created using create-react-app"
-    />
-    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
-    <!--
-      manifest.json provides metadata used when your web app is installed on a
-      user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
-    -->
-    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
-    <!--
-      Notice the use of %PUBLIC_URL% in the tags above.
-      It will be replaced with the URL of the `public` folder during the build.
-      Only files inside the `public` folder can be referenced from the HTML.
+<head>
+  <meta charset="utf-8" />
 
-      Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
-      work correctly both with client-side routing and a non-root public URL.
-      Learn how to configure a non-root public URL by running `npm run build`.
-    -->
-    <title>React App</title>
-  </head>
-  <body>
-    <noscript>You need to enable JavaScript to run this app.</noscript>
-    <div id="root"></div>
-    <!--
-      This HTML file is a template.
-      If you open it directly in the browser, you will see an empty page.
+  <!-- Core responsive setup -->
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#070a13" />
+  <meta name="color-scheme" content="dark light" />
 
-      You can add webfonts, meta tags, or analytics to this file.
-      The build step will place the bundled scripts into the <body> tag.
+  <!-- Primary SEO -->
+  <title>AudioMaster Lab | WebAudio Mastering, Visualizer & WAV Renderer</title>
+  <meta
+          name="description"
+          content="AudioMaster Lab is a browser-based WebAudio mastering tool for decoding audio files, visualizing waveforms and frequency spectrum, applying EQ, compression, panning, delay, reverb, de-essing, and exporting processed WAV files."
+  />
+  <meta
+          name="keywords"
+          content="AudioMaster Lab, audio mastering, WebAudio API, waveform visualizer, frequency spectrum, WAV renderer, online audio editor, browser audio mixer, reverb, delay, EQ, compressor, de-esser"
+  />
+  <meta name="author" content="AudioMaster Lab" />
+  <meta name="application-name" content="AudioMaster Lab" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
 
-      To begin the development, run `npm start` or `yarn start`.
-      To create a production bundle, use `npm run build` or `yarn build`.
-    -->
-  </body>
+  <!-- Canonical URL: change this after you buy the final domain -->
+  <link rel="canonical" href="https://audiomasterlab.com/" />
+
+  <!-- Favicons / app icons -->
+  <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+  <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+  <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+
+  <!-- Open Graph / social preview -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="AudioMaster Lab" />
+  <meta
+          property="og:title"
+          content="AudioMaster Lab | WebAudio Mastering, Visualizer & WAV Renderer"
+  />
+  <meta
+          property="og:description"
+          content="Master audio directly in the browser with WebAudio effects, waveform and frequency visualizers, panning, delay, convolution reverb, EQ, compression, de-essing, and WAV export."
+  />
+  <meta property="og:url" content="https://audiomasterlab.com/" />
+  <meta
+          property="og:image"
+          content="https://audiomasterlab.com/social-preview.png"
+  />
+  <meta
+          property="og:image:alt"
+          content="AudioMaster Lab WebAudio mastering interface with waveform and frequency spectrum visualizers"
+  />
+
+
+  <!-- Basic PWA/mobile polish -->
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="AudioMaster Lab" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+  <!-- Structured data -->
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "AudioMaster Lab",
+      "applicationCategory": "MultimediaApplication",
+      "operatingSystem": "Web Browser",
+      "description": "AudioMaster Lab is a browser-based WebAudio mastering tool for decoding audio files, visualizing waveform and frequency spectrum data, applying audio effects, and exporting processed WAV files.",
+      "url": "https://audiomasterlab.com/",
+      "image": "https://audiomasterlab.com/social-preview.png",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "Audio file decoding",
+        "Live waveform visualizer",
+        "Live frequency spectrum visualizer",
+        "Base volume control",
+        "Stereo panning",
+        "Convolution reverb",
+        "Delay and feedback",
+        "EQ filters",
+        "Compression",
+        "De-essing",
+        "WAV export"
+      ]
+    }
+  </script>
+</head>
+
+<body>
+<noscript>
+  <strong>AudioMaster Lab requires JavaScript.</strong>
+  This browser-based audio mastering tool uses the WebAudio API to decode,
+  visualize, process, and render audio. Please enable JavaScript to use the app.
+</noscript>
+
+<div id="root"></div>
+</body>
 </html>
