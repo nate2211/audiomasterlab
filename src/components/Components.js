@@ -451,12 +451,14 @@ export function MediaInputForm({
                 >
                     Upload media file
                     <input
-                        hidden
                         type="file"
-                        accept="audio/*,video/*"
                         onChange={(event) => {
                             const file = event.target.files?.[0];
-                            if (file) onFileSelect(file);
+
+                            if (file) {
+                                onFileSelect(file);
+                            }
+
                             event.target.value = "";
                         }}
                     />
