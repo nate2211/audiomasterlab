@@ -248,6 +248,27 @@ async function unlockMobileAudioContext(context) {
     return unlocked || context.state === "running";
 }
 
+async function unlockOutputAudioElement(audioElement) {
+    if (!audioElement) return false;
+
+    try {
+        audioElement.muted = false;
+        audioElement.volume = 1;
+        audioElement.playsInline = true;
+        audioElement.autoplay = false;
+
+        const playPromise = audioElement.play();
+
+        if (playPromise && typeof playPromise.then === "function") {
+            await playPromise;
+        }
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function buildMobileAudioHint() {
     if (!isIOSAudioDevice()) {
         return "Make sure your device volume is up and then tap Play again.";
@@ -1140,6 +1161,8 @@ export default function Audio() {
     const liveNodesRef = useRef(null);
     const analyserRef = useRef(null);
     const monitorMuteGainRef = useRef(null);
+    const outputAudioRef = useRef(null);
+    const mediaStreamDestinationRef = useRef(null);
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -1227,6 +1250,8 @@ export default function Audio() {
                 objectUrlRef.current = null;
             }
 
+            detachOutputAudioElement();
+
             if (audioContextRef.current) {
                 audioContextRef.current.close().catch(() => {});
                 audioContextRef.current = null;
@@ -1255,6 +1280,21 @@ export default function Audio() {
             URL.revokeObjectURL(objectUrlRef.current);
             objectUrlRef.current = null;
         }
+    }
+
+    function detachOutputAudioElement() {
+        if (outputAudioRef.current) {
+            try {
+                outputAudioRef.current.pause();
+                outputAudioRef.current.srcObject = null;
+                outputAudioRef.current.removeAttribute("src");
+                outputAudioRef.current.load();
+            } catch {
+                // Safe to ignore.
+            }
+        }
+
+        mediaStreamDestinationRef.current = null;
     }
 
     function prepareCanvas(canvas) {
@@ -1577,6 +1617,8 @@ export default function Audio() {
         stopVisualizer();
         clearVisualizerCanvases();
 
+        detachOutputAudioElement();
+
         if (audioContextRef.current) {
             audioContextRef.current.close().catch(() => {});
             audioContextRef.current = null;
@@ -1727,6 +1769,28 @@ export default function Audio() {
         );
     }
 
+    function connectOutputStage(context, monitorMuteGain) {
+        if (isIOSAudioDevice() && context.createMediaStreamDestination) {
+            const mediaStreamDestination = context.createMediaStreamDestination();
+
+            monitorMuteGain.connect(mediaStreamDestination);
+
+            mediaStreamDestinationRef.current = mediaStreamDestination;
+
+            if (outputAudioRef.current) {
+                outputAudioRef.current.srcObject = mediaStreamDestination.stream;
+                outputAudioRef.current.muted = false;
+                outputAudioRef.current.volume = 1;
+                outputAudioRef.current.playsInline = true;
+                outputAudioRef.current.autoplay = false;
+            }
+
+            return;
+        }
+
+        monitorMuteGain.connect(context.destination);
+    }
+
     function ensureLiveGraph() {
         const AudioContextClass = getAudioContextClass();
 
@@ -1759,7 +1823,7 @@ export default function Audio() {
             );
 
             analyser.connect(monitorMuteGain);
-            monitorMuteGain.connect(context.destination);
+            connectOutputStage(context, monitorMuteGain);
 
             const nodes = createProcessingGraph(
                 context,
@@ -1797,6 +1861,18 @@ export default function Audio() {
         try {
             const { context, nodes } = ensureLiveGraph();
             const unlocked = await unlockMobileAudioContext(context);
+
+            if (isIOSAudioDevice()) {
+                const elementUnlocked = await unlockOutputAudioElement(
+                    outputAudioRef.current
+                );
+
+                if (!elementUnlocked) {
+                    throw new Error(
+                        `The iPhone audio element did not unlock. ${buildMobileAudioHint()}`
+                    );
+                }
+            }
 
             if (!unlocked || context.state !== "running") {
                 throw new Error(
@@ -1857,7 +1933,7 @@ export default function Audio() {
 
             setInfo(
                 isIOSAudioDevice()
-                    ? "Playing through the full WebAudio graph. iPhone sends audio to the currently selected output route; if no AirPods, Bluetooth, CarPlay, or AirPlay route is active, it should use the iPhone speaker."
+                    ? "Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker."
                     : "Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb."
             );
         } catch (error) {
@@ -2188,6 +2264,23 @@ export default function Audio() {
 
     return (
         <PageShell>
+            <Box
+                component="audio"
+                ref={outputAudioRef}
+                playsInline
+                preload="auto"
+                controls={false}
+                sx={{
+                    position: "fixed",
+                    width: 1,
+                    height: 1,
+                    opacity: 0,
+                    pointerEvents: "none",
+                    left: -9999,
+                    top: -9999,
+                }}
+            />
+
             <Helmet>
                 <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
                 <meta
