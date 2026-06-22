@@ -170,7 +170,9 @@ function getReadableBytes(size) {
         Math.floor(Math.log(bytes) / Math.log(1024))
     );
 
-    return `${(bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    return `${(bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${
+        units[index]
+    }`;
 }
 
 function getAudioContextClass() {
@@ -179,6 +181,79 @@ function getAudioContextClass() {
 
 function getOfflineAudioContextClass() {
     return window.OfflineAudioContext || window.webkitOfflineAudioContext;
+}
+
+function isIOSAudioDevice() {
+    if (typeof navigator === "undefined") {
+        return false;
+    }
+
+    const platform = navigator.platform || "";
+    const userAgent = navigator.userAgent || "";
+    const touchCapableMac =
+        platform === "MacIntel" &&
+        typeof navigator.maxTouchPoints === "number" &&
+        navigator.maxTouchPoints > 1;
+
+    return /iPhone|iPad|iPod/i.test(userAgent) || touchCapableMac;
+}
+
+async function unlockMobileAudioContext(context) {
+    if (!context) return false;
+
+    let unlocked = false;
+
+    try {
+        if (context.state !== "running") {
+            await context.resume();
+        }
+
+        unlocked = context.state === "running";
+    } catch {
+        unlocked = false;
+    }
+
+    try {
+        const sampleRate = context.sampleRate || 44100;
+        const unlockBuffer = context.createBuffer(1, 1, sampleRate);
+        const unlockSource = context.createBufferSource();
+        const unlockGain = context.createGain();
+
+        unlockGain.gain.value = 0.00001;
+        unlockSource.buffer = unlockBuffer;
+
+        unlockSource.connect(unlockGain);
+        unlockGain.connect(context.destination);
+
+        unlockSource.start(0);
+
+        unlockSource.onended = () => {
+            try {
+                unlockSource.disconnect();
+                unlockGain.disconnect();
+            } catch {
+                // Safe to ignore cleanup issues.
+            }
+        };
+
+        if (context.state !== "running") {
+            await context.resume();
+        }
+
+        unlocked = context.state === "running" || unlocked;
+    } catch {
+        // Some browsers do not need the silent unlock source.
+    }
+
+    return unlocked || context.state === "running";
+}
+
+function buildMobileAudioHint() {
+    if (!isIOSAudioDevice()) {
+        return "Make sure your device volume is up and then tap Play again.";
+    }
+
+    return "On iPhone, turn the side volume up, make sure the browser is not routed to AirPods, Bluetooth, CarPlay, or AirPlay, and tap Play again. Web apps cannot force speaker output; iOS plays through the currently selected output.";
 }
 
 function setAudioParam(param, value, time) {
@@ -701,6 +776,7 @@ function createPannerStage(context) {
     }
 
     const panner = context.createPanner();
+
     panner.panningModel = "equalpower";
     panner.distanceModel = "linear";
     panner.refDistance = 1;
@@ -1240,6 +1316,7 @@ export default function Audio() {
         }
 
         const dataArray = waveformDataRef.current;
+
         analyser.getByteTimeDomainData(dataArray);
 
         context.clearRect(0, 0, width, height);
@@ -1312,6 +1389,7 @@ export default function Audio() {
         }
 
         const dataArray = frequencyDataRef.current;
+
         analyser.getByteFrequencyData(dataArray);
 
         context.clearRect(0, 0, width, height);
@@ -1577,6 +1655,7 @@ export default function Audio() {
             clearObjectUrl();
 
             const objectUrl = URL.createObjectURL(file);
+
             objectUrlRef.current = objectUrl;
 
             setInputFile(file);
@@ -1656,13 +1735,16 @@ export default function Audio() {
         }
 
         if (!audioContextRef.current) {
-            audioContextRef.current = new AudioContextClass();
+            audioContextRef.current = new AudioContextClass({
+                latencyHint: "interactive",
+            });
         }
 
         const context = audioContextRef.current;
 
         if (!liveNodesRef.current) {
             const analyser = context.createAnalyser();
+
             analyser.fftSize = 2048;
             analyser.minDecibels = -90;
             analyser.maxDecibels = -10;
@@ -1714,15 +1796,19 @@ export default function Audio() {
 
         try {
             const { context, nodes } = ensureLiveGraph();
+            const unlocked = await unlockMobileAudioContext(context);
 
-            if (context.state !== "running") {
-                await context.resume();
+            if (!unlocked || context.state !== "running") {
+                throw new Error(
+                    `The browser has not unlocked audio output yet. ${buildMobileAudioHint()}`
+                );
             }
 
             manualStopRef.current = false;
             stopActiveSource();
 
             let safeOffset = resetToBeginning ? 0 : startedOffsetRef.current;
+
             safeOffset = clamp(safeOffset, 0, buffer.duration);
 
             if (safeOffset >= buffer.duration) {
@@ -1730,6 +1816,7 @@ export default function Audio() {
             }
 
             const source = context.createBufferSource();
+
             source.buffer = buffer;
 
             applySourcePlaybackSettings(
@@ -1769,13 +1856,15 @@ export default function Audio() {
             startVisualizer();
 
             setInfo(
-                "Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb."
+                isIOSAudioDevice()
+                    ? "Playing through the full WebAudio graph. iPhone sends audio to the currently selected output route; if no AirPods, Bluetooth, CarPlay, or AirPlay route is active, it should use the iPhone speaker."
+                    : "Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb."
             );
         } catch (error) {
             setError(
                 `Could not start playback. ${
                     error?.message || "The browser blocked the audio graph."
-                }`
+                } ${buildMobileAudioHint()}`
             );
         }
     }
@@ -2017,6 +2106,7 @@ export default function Audio() {
 
             if (!decodedBuffer) {
                 const { arrayBuffer, metadata } = await loadSourceArrayBuffer();
+
                 decodedBuffer = await decodeAudioBufferFromArrayBuffer(
                     arrayBuffer,
                     metadata
@@ -2051,6 +2141,7 @@ export default function Audio() {
             );
 
             const source = offlineContext.createBufferSource();
+
             source.buffer = decodedBuffer;
 
             applySourcePlaybackSettings(
