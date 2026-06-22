@@ -17,6 +17,7 @@ import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
 import EqualizerRoundedIcon from "@mui/icons-material/EqualizerRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
+import { Helmet } from "react-helmet-async";
 import {
     GlassCard,
     MediaInputForm,
@@ -26,7 +27,6 @@ import {
     StatusBanner,
     ControlSlider,
 } from "../components/Components.js";
-import {Helmet} from "react-helmet-async";
 
 const DEFAULT_SETTINGS = {
     baseVolume: 1,
@@ -72,9 +72,19 @@ const MEDIA_EXTENSION_HINTS = [
     ".m4a",
     ".mp4",
     ".m4v",
+    ".mov",
+    ".qt",
     ".aac",
     ".caf",
     ".flac",
+    ".aif",
+    ".aiff",
+    ".aifc",
+    ".mpga",
+    ".mpeg",
+    ".3gp",
+    ".3g2",
+    ".amr",
 ];
 
 function clamp(value, min, max) {
@@ -147,6 +157,22 @@ function formatTime(seconds) {
     return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
 }
 
+function getReadableBytes(size) {
+    const bytes = Number(size);
+
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+        return "0 B";
+    }
+
+    const units = ["B", "KB", "MB", "GB"];
+    const index = Math.min(
+        units.length - 1,
+        Math.floor(Math.log(bytes) / Math.log(1024))
+    );
+
+    return `${(bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
 function getAudioContextClass() {
     return window.AudioContext || window.webkitAudioContext;
 }
@@ -178,6 +204,17 @@ function getEffectivePlaybackRate(settings) {
 
 function getLowerName(value) {
     return String(value || "").trim().toLowerCase();
+}
+
+function getFileExtension(fileName) {
+    const cleanName = String(fileName || "").split("?")[0].split("#")[0];
+    const lastDot = cleanName.lastIndexOf(".");
+
+    if (lastDot < 0) {
+        return "";
+    }
+
+    return cleanName.slice(lastDot).toLowerCase();
 }
 
 function getUrlPathname(urlValue) {
@@ -212,6 +249,65 @@ function isLikelyMediaUrl(urlValue) {
     return hasAnyExtension(urlValue, MEDIA_EXTENSION_HINTS);
 }
 
+function isAppleMobileDevice() {
+    if (typeof navigator === "undefined") {
+        return false;
+    }
+
+    const platform = navigator.platform || "";
+    const userAgent = navigator.userAgent || "";
+    const touchCapableMac =
+        platform === "MacIntel" &&
+        typeof navigator.maxTouchPoints === "number" &&
+        navigator.maxTouchPoints > 1;
+
+    return /iPhone|iPad|iPod/i.test(userAgent) || touchCapableMac;
+}
+
+function isLikelySupportedPickedFile(file) {
+    if (!file) return false;
+
+    const type = String(file.type || "").toLowerCase();
+
+    if (type.startsWith("audio/") || type.startsWith("video/")) {
+        return true;
+    }
+
+    return MEDIA_EXTENSION_HINTS.includes(getFileExtension(file.name));
+}
+
+function buildPickedFileInfo(file, sourceLabel = "Upload media file") {
+    const pieces = [];
+
+    if (sourceLabel) pieces.push(sourceLabel);
+    pieces.push(file?.type || "unknown MIME type");
+    pieces.push(getReadableBytes(file?.size || 0));
+
+    if (file?.lastModified) {
+        try {
+            pieces.push(`modified ${new Date(file.lastModified).toLocaleDateString()}`);
+        } catch {
+            // Ignore date formatting issues.
+        }
+    }
+
+    return pieces.join(" • ");
+}
+
+function buildPickedFileWarning(file) {
+    if (!file) return "";
+
+    if (file.size === 0) {
+        return "The selected file is empty. If this came from iPhone Files, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another cloud provider, open the file in that app first so it downloads locally, then select it again with Upload media file.";
+    }
+
+    if (!isLikelySupportedPickedFile(file)) {
+        return "This selected file does not look like a common browser-decodable audio/video file. You can still try it, but MP3, WAV, M4A, MP4, MOV, WebM, OGG/Opus, AAC, CAF, and FLAC usually work best.";
+    }
+
+    return "";
+}
+
 function validateDirectMediaUrl(urlValue) {
     const cleanUrl = String(urlValue || "").trim();
 
@@ -221,7 +317,7 @@ function validateDirectMediaUrl(urlValue) {
 
     if (isStreamingManifestUrl(cleanUrl)) {
         throw new Error(
-            "This looks like an HLS/DASH streaming manifest. Use a direct decodable media file such as .mp3, .wav, .m4a, .mp4, .webm, or .ogg."
+            "This looks like an HLS/DASH streaming manifest. Use a direct decodable media file such as .mp3, .wav, .m4a, .mp4, .mov, .webm, or .ogg."
         );
     }
 
@@ -307,7 +403,7 @@ function describeMediaBytes(arrayBuffer) {
         ];
 
         if (mp4Brands.includes(brand)) {
-            return "mp4/m4a container";
+            return "mp4/m4a/mov container";
         }
 
         return `mp4-like container (${brand.trim() || "unknown brand"})`;
@@ -333,12 +429,15 @@ function buildDecodeFailureMessage(error, metadata, byteDescription) {
         ? ` Content-Type: ${metadata.contentType}.`
         : "";
     const detected = byteDescription ? ` Detected bytes: ${byteDescription}.` : "";
+    const providerHint = metadata?.providerHint
+        ? ` Source: ${metadata.providerHint}.`
+        : "";
 
     if (byteDescription === "html") {
-        return `The link/file returned HTML instead of raw media${name}.${contentType} Use a direct .mp3, .wav, .m4a, .mp4, .webm, or .ogg file URL.`;
+        return `The link/file returned HTML instead of raw media${name}.${contentType}${providerHint} Use a direct .mp3, .wav, .m4a, .mp4, .mov, .webm, or .ogg file URL.`;
     }
 
-    return `Could not decode audio${name}.${contentType}${detected} The browser may not support this codec/container, the file may be encrypted/DRM-protected, or the URL may not be a direct media file. ${
+    return `Could not decode audio${name}.${contentType}${detected}${providerHint} The browser may not support this codec/container, the file may be encrypted/DRM-protected, the cloud file may not be downloaded locally yet, or the URL may not be a direct media file. ${
         error?.message || ""
     }`.trim();
 }
@@ -393,7 +492,7 @@ async function fetchDirectMediaArrayBuffer(urlValue) {
     }
 }
 
-async function readFileMediaArrayBuffer(file) {
+async function readFileMediaArrayBuffer(file, sourceLabel = "Upload media file") {
     if (!file) {
         throw new Error("No file was selected.");
     }
@@ -401,7 +500,9 @@ async function readFileMediaArrayBuffer(file) {
     const arrayBuffer = await file.arrayBuffer();
 
     if (!arrayBuffer || arrayBuffer.byteLength < 8) {
-        throw new Error("The selected file is empty or too small to decode.");
+        throw new Error(
+            "The selected file is empty or too small to decode. If it came from iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another cloud provider, open the file in that app first so it downloads locally, then select it again with Upload media file."
+        );
     }
 
     return {
@@ -411,7 +512,8 @@ async function readFileMediaArrayBuffer(file) {
             sourceType: "file",
             contentType: file.type || "",
             byteLength: file.size || arrayBuffer.byteLength,
-            likelyMedia: true,
+            likelyMedia: isLikelySupportedPickedFile(file),
+            providerHint: sourceLabel,
         },
     };
 }
@@ -517,10 +619,7 @@ function drawCanvasLabel(context, text, canvasWidth, canvasHeight) {
     let fontSize = 12;
     context.font = `800 ${fontSize}px system-ui, -apple-system, Segoe UI, sans-serif`;
 
-    while (
-        fontSize > 9 &&
-        context.measureText(text).width > maxWidth - 24
-        ) {
+    while (fontSize > 9 && context.measureText(text).width > maxWidth - 24) {
         fontSize -= 1;
         context.font = `800 ${fontSize}px system-ui, -apple-system, Segoe UI, sans-serif`;
     }
@@ -990,7 +1089,7 @@ export default function Audio() {
     const [directLink, setDirectLink] = useState("");
     const [settings, setSettings] = useState(DEFAULT_SETTINGS);
     const [status, setStatus] = useState(
-        "Upload MP3, WAV, OGG, WebM, M4A, MP4, or paste a direct media URL to begin."
+        "Upload MP3, WAV, OGG, WebM, M4A, MP4, MOV, or choose a file from iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another Files provider."
     );
     const [statusTone, setStatusTone] = useState("info");
     const [mixerEnabled, setMixerEnabled] = useState(false);
@@ -1461,7 +1560,17 @@ export default function Audio() {
         return decodedBuffer;
     }
 
-    async function handleFileSelect(file) {
+    async function handleFileSelect(file, sourceLabel = "Upload media file") {
+        if (!file) return;
+
+        const isApplePick = isAppleMobileDevice();
+        const finalSourceLabel = isApplePick
+            ? "Upload media file / iPhone Files picker"
+            : sourceLabel;
+
+        const pickedInfo = buildPickedFileInfo(file, finalSourceLabel);
+        const pickedWarning = buildPickedFileWarning(file);
+
         try {
             setIsLoading(true);
             resetDecodedState();
@@ -1474,13 +1583,22 @@ export default function Audio() {
             setSourceKind("file");
             setSourceUrl(objectUrl);
 
-            const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(file);
+            if (pickedWarning) {
+                setStatus(pickedWarning);
+                setStatusTone("info");
+            }
+
+            const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
+                file,
+                finalSourceLabel
+            );
+
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
 
             setInfo(
                 `Loaded ${file.name}. Browser decoded ${formatTime(
                     decodedBuffer.duration
-                )}.`
+                )}. Source: ${pickedInfo}.`
             );
         } catch (error) {
             setError(error?.message || "Could not decode this media file.");
@@ -1525,7 +1643,9 @@ export default function Audio() {
         setSourceKind("");
         setDirectLink("");
 
-        setInfo("Media cleared. Upload a new file or paste a direct media link.");
+        setInfo(
+            "Media cleared. Use Upload media file for desktop files or iPhone Files providers, or paste a direct media link."
+        );
     }
 
     function ensureLiveGraph() {
@@ -1867,7 +1987,11 @@ export default function Audio() {
         }
 
         if (sourceKind === "file" && inputFile) {
-            return readFileMediaArrayBuffer(inputFile);
+            const sourceLabel = isAppleMobileDevice()
+                ? "Upload media file / iPhone Files picker"
+                : "Upload media file";
+
+            return readFileMediaArrayBuffer(inputFile, sourceLabel);
         }
 
         if (sourceKind === "url" && sourceUrl) {
@@ -1977,11 +2101,11 @@ export default function Audio() {
                 <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
                 <meta
                     name="description"
-                    content="Use AudioMaster Lab's WebAudio tool to decode audio files, preview a live processing graph, visualize the waveform and frequency spectrum, apply EQ, compression, panning, delay, convolution reverb, de-essing, and export a processed WAV file."
+                    content="Use AudioMaster Lab's WebAudio tool to import files from desktop, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, and Dropbox, decode audio files, preview a live processing graph, visualize waveform and frequency spectrum, apply effects, and export WAV."
                 />
                 <meta
                     name="keywords"
-                    content="WebAudio mixer, audio visualizer, waveform visualizer, frequency spectrum, online audio mastering, WAV renderer, EQ, compressor, de-esser, delay, reverb"
+                    content="WebAudio mixer, audio visualizer, waveform visualizer, frequency spectrum, online audio mastering, WAV renderer, EQ, compressor, de-esser, delay, reverb, iPhone audio file picker, iCloud Drive audio, Proton Drive audio"
                 />
                 <link rel="canonical" href="https://audiomasterlab.com/audio" />
 
@@ -1991,7 +2115,7 @@ export default function Audio() {
                 />
                 <meta
                     property="og:description"
-                    content="Process audio in the browser with a live WebAudio graph, waveform and frequency visualizers, EQ, compression, panning, delay, reverb, de-essing, and WAV export."
+                    content="Process audio in the browser with the upload media button, iPhone Files support, WebAudio effects, waveform and frequency visualizers, EQ, compression, delay, reverb, and WAV export."
                 />
                 <meta property="og:url" content="https://audiomasterlab.com/audio" />
                 <meta
@@ -2005,7 +2129,7 @@ export default function Audio() {
                 />
                 <meta
                     name="twitter:description"
-                    content="Master audio in the browser with WebAudio effects, visualizers, and WAV export."
+                    content="Master audio in the browser with the upload media button, iPhone Files import, WebAudio effects, visualizers, and WAV export."
                 />
                 <meta
                     name="twitter:image"
@@ -2021,9 +2145,13 @@ export default function Audio() {
                         operatingSystem: "Web Browser",
                         url: "https://audiomasterlab.com/audio",
                         description:
-                            "A browser-based WebAudio mixer and renderer with waveform visualization, frequency spectrum visualization, EQ, compression, panning, delay, reverb, de-essing, and WAV export.",
+                            "A browser-based WebAudio mixer and renderer with upload media file support for desktop files, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, waveform visualization, frequency spectrum visualization, EQ, compression, panning, delay, reverb, de-essing, and WAV export.",
                         featureList: [
                             "Audio file decoding",
+                            "Upload media file button",
+                            "iPhone Files picker support",
+                            "On My iPhone import",
+                            "iCloud Drive, Google Drive, Proton Drive, and Dropbox import",
                             "Live WebAudio graph",
                             "Waveform visualizer",
                             "Frequency spectrum visualizer",
@@ -2039,11 +2167,12 @@ export default function Audio() {
                     })}
                 </script>
             </Helmet>
+
             <Stack spacing={4}>
                 <SectionTitle
                     eyebrow="Audio tool"
                     title="Advanced WebAudio mixer, visualizer, and renderer"
-                    description="Decode audio/video containers into an AudioBuffer, visualize the processed signal, scrub the full duration, add clarity, demud, de-essing, panning, convolution reverb, delay, EQ, compression, speed, pitch, and render the processed result to WAV."
+                    description="Decode audio/video containers into an AudioBuffer, import from desktop or iPhone Files providers through the same Upload media file button, visualize the processed signal, scrub the full duration, add effects, and render the processed result to WAV."
                 />
 
                 <GlassCard>
@@ -2211,7 +2340,7 @@ export default function Audio() {
                             fileName={inputFile?.name || ""}
                             linkValue={directLink}
                             onLinkChange={setDirectLink}
-                            onFileSelect={handleFileSelect}
+                            onFileSelect={(file) => handleFileSelect(file, "Upload media file")}
                             onLoadLink={handleLoadDirectLink}
                             onClear={handleClearMedia}
                             disabled={isRendering || isLoading}
@@ -2391,7 +2520,11 @@ export default function Audio() {
                                                             justifyContent="space-between"
                                                             spacing={1}
                                                         >
-                                                            <Stack direction="row" alignItems="center" spacing={0.8}>
+                                                            <Stack
+                                                                direction="row"
+                                                                alignItems="center"
+                                                                spacing={0.8}
+                                                            >
                                                                 <VolumeUpRoundedIcon
                                                                     sx={{
                                                                         fontSize: 19,
@@ -2900,9 +3033,12 @@ export default function Audio() {
                                 variant="caption"
                                 sx={{ color: "rgba(255,255,255,0.52)", lineHeight: 1.6 }}
                             >
-                                Best support: MP3, WAV, OGG/Opus, WebM audio/video, M4A, and MP4
-                                with a browser-supported audio codec. HLS/DASH manifests, DRM
-                                streams, and normal streaming pages are not direct decodable files.
+                                Best support: MP3, WAV, OGG/Opus, WebM audio/video,
+                                M4A, MP4, MOV, AAC, CAF, and browser-supported containers.
+                                iPhone files from iCloud Drive, Google Drive, Proton Drive,
+                                Dropbox, and other providers may need to be downloaded locally
+                                first. HLS/DASH manifests, DRM streams, and normal streaming pages
+                                are not direct decodable files.
                             </Typography>
 
                             {mixerEnabled && (
