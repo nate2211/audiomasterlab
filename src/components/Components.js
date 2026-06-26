@@ -16,8 +16,10 @@ import {
     Toolbar,
     Typography,
 } from "@mui/material";
+
 import HomeRoundedIcon from "@mui/icons-material/HomeRounded";
 import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
+import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import CloudUploadRoundedIcon from "@mui/icons-material/CloudUploadRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import AudiotrackRoundedIcon from "@mui/icons-material/AudiotrackRounded";
@@ -38,6 +40,11 @@ export function NavBar() {
             path: "/audio",
             icon: <GraphicEqRoundedIcon fontSize="small" />,
         },
+        {
+            label: "Editor",
+            path: "/editor",
+            icon: <TimelineRoundedIcon fontSize="small" />,
+        },
     ];
 
     return (
@@ -49,6 +56,7 @@ export function NavBar() {
                 background:
                     "linear-gradient(90deg, rgba(8,11,24,0.96), rgba(14,20,42,0.94))",
                 backdropFilter: "blur(14px)",
+                zIndex: 50,
             }}
         >
             <Toolbar sx={{ minHeight: 76 }}>
@@ -58,7 +66,8 @@ export function NavBar() {
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "space-between",
-                        px: { xs: 0, sm: 2 },
+                        gap: 2,
+                        px: { xs: 1, sm: 2 },
                     }}
                 >
                     <Stack
@@ -68,6 +77,7 @@ export function NavBar() {
                         spacing={1.4}
                         alignItems="center"
                         sx={{
+                            minWidth: 0,
                             textDecoration: "none",
                             color: "inherit",
                         }}
@@ -76,28 +86,32 @@ export function NavBar() {
                             sx={{
                                 width: 42,
                                 height: 42,
+                                flex: "0 0 auto",
                                 borderRadius: "14px",
                                 display: "grid",
                                 placeItems: "center",
                                 background:
                                     "linear-gradient(135deg, rgba(103,232,249,0.95), rgba(167,139,250,0.95))",
                                 boxShadow: "0 16px 44px rgba(103,232,249,0.22)",
+                                color: "#06111e",
                             }}
                         >
                             <AudiotrackRoundedIcon />
                         </Box>
 
-                        <Box>
+                        <Box sx={{ minWidth: 0, display: { xs: "none", sm: "block" } }}>
                             <Typography
                                 variant="h6"
                                 sx={{
                                     fontWeight: 900,
                                     lineHeight: 1,
                                     letterSpacing: "-0.03em",
+                                    whiteSpace: "nowrap",
                                 }}
                             >
                                 AudioMaster Lab
                             </Typography>
+
                             <Typography
                                 variant="caption"
                                 sx={{ color: "rgba(255,255,255,0.62)" }}
@@ -107,7 +121,18 @@ export function NavBar() {
                         </Box>
                     </Stack>
 
-                    <Stack direction="row" spacing={1}>
+                    <Stack
+                        direction="row"
+                        spacing={{ xs: 0.5, sm: 1 }}
+                        sx={{
+                            overflowX: "auto",
+                            maxWidth: "100%",
+                            pb: 0.2,
+                            "&::-webkit-scrollbar": {
+                                height: 0,
+                            },
+                        }}
+                    >
                         {navItems.map((item) => {
                             const active = location.pathname === item.path;
 
@@ -119,13 +144,21 @@ export function NavBar() {
                                     startIcon={item.icon}
                                     variant={active ? "contained" : "text"}
                                     sx={{
+                                        flex: "0 0 auto",
                                         borderRadius: 999,
                                         color: active ? "#08111f" : "rgba(255,255,255,0.78)",
                                         background: active
                                             ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
                                             : "transparent",
-                                        fontWeight: 800,
-                                        px: { xs: 1.4, sm: 2.2 },
+                                        fontWeight: 900,
+                                        px: { xs: 1.35, sm: 2.2 },
+                                        minWidth: { xs: "auto", sm: 64 },
+                                        "& .MuiButton-startIcon": {
+                                            mr: { xs: 0, sm: 0.8 },
+                                        },
+                                        "& .MuiButton-startIcon + *": {
+                                            display: { xs: "none", sm: "inline" },
+                                        },
                                         "&:hover": {
                                             background: active
                                                 ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
@@ -429,6 +462,7 @@ export function MediaInputForm({
                     <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.5 }}>
                         Media input
                     </Typography>
+
                     <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
                         Upload an audio/video file or load a direct media URL that allows
                         browser access.
@@ -442,16 +476,26 @@ export function MediaInputForm({
                     startIcon={<CloudUploadRoundedIcon />}
                     disabled={disabled}
                     sx={{
-                        borderRadius: 3,
-                        py: 1.35,
-                        fontWeight: 900,
+                        width: "100%",
+                        borderRadius: 999,
+                        py: 1.55,
+                        px: 2.5,
+                        fontWeight: 950,
                         color: "#06111e",
                         background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                        boxShadow: "0 18px 46px rgba(103,232,249,0.18)",
+                        cursor: disabled ? "not-allowed" : "pointer",
+                        "&:hover": {
+                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                            filter: "brightness(1.04)",
+                        },
                     }}
                 >
                     Upload media file
                     <input
+                        hidden
                         type="file"
+                        accept="audio/*,video/*,.mp3,.wav,.ogg,.oga,.opus,.webm,.m4a,.mp4,.mov,.aac,.flac,.aif,.aiff"
                         onChange={(event) => {
                             const file = event.target.files?.[0];
 
@@ -494,8 +538,12 @@ export function MediaInputForm({
                                 color: "#fff",
                                 borderRadius: 3,
                                 background: "rgba(255,255,255,0.08)",
-                                "&:before": { borderBottomColor: "rgba(255,255,255,0.14)" },
-                                "&:after": { borderBottomColor: "#67e8f9" },
+                                "&:before": {
+                                    borderBottomColor: "rgba(255,255,255,0.14)",
+                                },
+                                "&:after": {
+                                    borderBottomColor: "#67e8f9",
+                                },
                             },
                         }}
                     />
@@ -547,6 +595,7 @@ export function ControlSlider({
         <Box>
             <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.7 }}>
                 <Typography sx={{ fontWeight: 850 }}>{label}</Typography>
+
                 <Typography sx={{ color: "#67e8f9", fontWeight: 900 }}>
                     {Number(value).toFixed(step < 1 ? 2 : 0)}
                     {unit}
@@ -563,6 +612,7 @@ export function ControlSlider({
                     const cleanValue = Array.isArray(nextValue)
                         ? nextValue[0]
                         : nextValue;
+
                     onChange(cleanValue);
                 }}
                 sx={{
