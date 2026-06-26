@@ -593,7 +593,6 @@ export default function Editor() {
     const startedOffsetRef = useRef(0);
     const audioBufferRef = useRef(null);
 
-    const [audioBufferVersion, setAudioBufferVersion] = useState(0);
     const [fileName, setFileName] = useState("");
     const [fileInfo, setFileInfo] = useState("");
     const [status, setStatus] = useState(INITIAL_STATUS);
@@ -608,10 +607,7 @@ export default function Editor() {
     const [blocks, setBlocks] = useState([]);
     const [selectedTool, setSelectedTool] = useState("silence");
     const [selectedBlockId, setSelectedBlockId] = useState("");
-
-    const peaks = useMemo(() => {
-        return buildWaveformPeaks(audioBufferRef.current, 2600);
-    }, [audioBufferVersion]);
+    const [peaks, setPeaks] = useState([]);
 
     const selectedBlock = useMemo(() => {
         return blocks.find((block) => block.id === selectedBlockId) || null;
@@ -823,12 +819,12 @@ export default function Editor() {
             setPosition(0);
             setDuration(0);
             audioBufferRef.current = null;
-            setAudioBufferVersion((value) => value + 1);
+            setPeaks([]);
 
             const decoded = await decodeFileToAudioBuffer(file);
 
             audioBufferRef.current = decoded;
-            setAudioBufferVersion((value) => value + 1);
+            setPeaks(buildWaveformPeaks(decoded, 2600));
 
             setFileName(file.name);
             setDuration(decoded.duration);
@@ -850,7 +846,7 @@ export default function Editor() {
     function handleClear() {
         stopPlayback(true);
         audioBufferRef.current = null;
-        setAudioBufferVersion((value) => value + 1);
+        setPeaks([]);
         setFileName("");
         setFileInfo("");
         setDuration(0);
