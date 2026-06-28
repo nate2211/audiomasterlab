@@ -6,10 +6,17 @@ import {
     LinearProgress,
     Slider,
     Stack,
+    TextField,
     Typography,
 } from "@mui/material";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
+import PauseRoundedIcon from "@mui/icons-material/PauseRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
+import RepeatRoundedIcon from "@mui/icons-material/RepeatRounded";
+import QueueMusicRoundedIcon from "@mui/icons-material/QueueMusicRounded";
+import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
+import SkipNextRoundedIcon from "@mui/icons-material/SkipNextRounded";
+import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import VolumeOffRoundedIcon from "@mui/icons-material/VolumeOffRounded";
 import VolumeUpRoundedIcon from "@mui/icons-material/VolumeUpRounded";
 import VolumeDownRoundedIcon from "@mui/icons-material/VolumeDownRounded";
@@ -1151,6 +1158,92 @@ function getDownloadName(sourceKind, file) {
     return "rendered-audio-mix.wav";
 }
 
+
+function makePlaylistId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function buildPlaylistItemFromFile(file) {
+    return {
+        id: makePlaylistId(),
+        kind: "file",
+        title: file?.name || "Untitled audio file",
+        file,
+        size: file?.size || 0,
+        type: file?.type || "unknown MIME type",
+        addedAt: new Date().toISOString(),
+    };
+}
+
+function getPlaylistUrlTitle(urlValue) {
+    try {
+        const parsed = new URL(urlValue);
+        const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
+
+        if (lastPart) {
+            return decodeURIComponent(lastPart);
+        }
+
+        return parsed.hostname || "Direct media link";
+    } catch {
+        return String(urlValue || "Direct media link").slice(0, 96);
+    }
+}
+
+function buildPlaylistItemFromUrl(urlValue) {
+    const cleanUrl = validateDirectMediaUrl(urlValue);
+
+    return {
+        id: makePlaylistId(),
+        kind: "url",
+        title: getPlaylistUrlTitle(cleanUrl),
+        url: cleanUrl,
+        size: 0,
+        type: "direct media URL",
+        addedAt: new Date().toISOString(),
+    };
+}
+
+function splitPlaylistLinks(value) {
+    return String(value || "")
+        .split(/[\n,]+/)
+        .map((link) => link.trim())
+        .filter(Boolean);
+}
+
+function getPlaylistItemMeta(item) {
+    if (!item) {
+        return "Unknown playlist item";
+    }
+
+    if (item.kind === "url") {
+        try {
+            const parsed = new URL(item.url);
+            return `Direct media URL • ${parsed.hostname}`;
+        } catch {
+            return "Direct media URL";
+        }
+    }
+
+    return `${item.type || "unknown MIME type"} • ${getReadableBytes(item.size)}`;
+}
+
+function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
+    if (repeatEnabled) {
+        return "Repeat is ON. The current song will restart when it ends.";
+    }
+
+    if (playlistLength > 0 && activeIndex >= 0 && activeIndex < playlistLength - 1) {
+        return "Repeat is OFF. The next playlist song will start when this one ends.";
+    }
+
+    if (playlistLength > 0 && activeIndex === -1) {
+        return "Repeat is OFF. Load a playlist item to enable automatic next-song playback.";
+    }
+
+    return "Repeat is OFF. Playback will stop when the current song ends.";
+}
+
 export default function Audio() {
     const objectUrlRef = useRef(null);
     const audioContextRef = useRef(null);
@@ -1181,11 +1274,15 @@ export default function Audio() {
     const wasPlayingBeforeScrubRef = useRef(false);
     const mutedRef = useRef(false);
     const latestSettingsRef = useRef(DEFAULT_SETTINGS);
+    const repeatEnabledRef = useRef(false);
+    const playlistRef = useRef([]);
+    const activePlaylistIndexRef = useRef(-1);
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
     const [inputFile, setInputFile] = useState(null);
     const [directLink, setDirectLink] = useState("");
+    const [playlistLink, setPlaylistLink] = useState("");
     const [settings, setSettings] = useState(DEFAULT_SETTINGS);
     const [status, setStatus] = useState(
         "Upload MP3, WAV, OGG, WebM, M4A, MP4, MOV, or choose a file from iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another Files provider."
@@ -1201,6 +1298,9 @@ export default function Audio() {
     const [position, setPosition] = useState(0);
     const [duration, setDuration] = useState(0);
     const [mediaInfo, setMediaInfo] = useState("");
+    const [playlist, setPlaylist] = useState([]);
+    const [activePlaylistIndex, setActivePlaylistIndex] = useState(-1);
+    const [repeatEnabled, setRepeatEnabled] = useState(false);
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
@@ -1211,6 +1311,13 @@ export default function Audio() {
 
     const effectiveRate = getEffectivePlaybackRate(settingsView);
     const pitchCents = semitonesToCents(settingsView.pitchSemitones);
+    const activePlaylistItem =
+        activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
+    const playlistStatusLabel = getPlaylistStatusLabel(
+        repeatEnabled,
+        playlist.length,
+        activePlaylistIndex
+    );
 
     useEffect(() => {
         document.title = "Audio Tool | AudioBufferSourceNode Mixer";
@@ -1237,6 +1344,18 @@ export default function Audio() {
             );
         }
     }, [settings]);
+
+    useEffect(() => {
+        playlistRef.current = playlist;
+    }, [playlist]);
+
+    useEffect(() => {
+        activePlaylistIndexRef.current = activePlaylistIndex;
+    }, [activePlaylistIndex]);
+
+    useEffect(() => {
+        repeatEnabledRef.current = repeatEnabled;
+    }, [repeatEnabled]);
 
     useEffect(() => {
         clearVisualizerCanvases();
@@ -1703,6 +1822,8 @@ export default function Audio() {
             setInputFile(file);
             setSourceKind("file");
             setSourceUrl(objectUrl);
+            setActivePlaylistIndex(-1);
+            activePlaylistIndexRef.current = -1;
 
             if (pickedWarning) {
                 setStatus(pickedWarning);
@@ -1739,6 +1860,8 @@ export default function Audio() {
             setInputFile(null);
             setSourceKind("url");
             setSourceUrl(cleanLink);
+            setActivePlaylistIndex(-1);
+            activePlaylistIndexRef.current = -1;
 
             const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
@@ -1763,10 +1886,339 @@ export default function Audio() {
         setSourceUrl("");
         setSourceKind("");
         setDirectLink("");
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
 
         setInfo(
             "Media cleared. Use Upload media file for desktop files or iPhone Files providers, or paste a direct media link."
         );
+    }
+
+    function addFilesToPlaylist(files) {
+        const pickedFiles = Array.from(files || []).filter(Boolean);
+
+        if (!pickedFiles.length) {
+            return;
+        }
+
+        const supportedFiles = pickedFiles.filter((file) =>
+            isLikelySupportedPickedFile(file)
+        );
+        const skippedCount = pickedFiles.length - supportedFiles.length;
+
+        if (!supportedFiles.length) {
+            setError(
+                "No supported audio/video files were selected. Try MP3, WAV, M4A, MP4, MOV, WebM, OGG/Opus, AAC, CAF, or FLAC."
+            );
+            return;
+        }
+
+        const nextItems = supportedFiles.map(buildPlaylistItemFromFile);
+
+        setPlaylist((current) => [...current, ...nextItems]);
+
+        setInfo(
+            `Added ${nextItems.length} file(s) to the playlist${
+                skippedCount ? ` and skipped ${skippedCount} unsupported file(s)` : ""
+            }.`
+        );
+    }
+
+    function addDirectLinksToPlaylist() {
+        const links = splitPlaylistLinks(playlistLink);
+
+        if (!links.length) {
+            setError("Paste at least one direct media URL before adding links to the playlist.");
+            return;
+        }
+
+        const nextItems = [];
+        const rejectedLinks = [];
+
+        links.forEach((link) => {
+            try {
+                nextItems.push(buildPlaylistItemFromUrl(link));
+            } catch (error) {
+                rejectedLinks.push({
+                    link,
+                    reason: error?.message || "Invalid media URL",
+                });
+            }
+        });
+
+        if (!nextItems.length) {
+            setError(
+                "No direct media links were added. Use direct .mp3, .wav, .m4a, .mp4, .mov, .webm, .ogg, .aac, .caf, or .flac URLs that the browser can fetch."
+            );
+            return;
+        }
+
+        setPlaylist((current) => [...current, ...nextItems]);
+        setPlaylistLink("");
+
+        setInfo(
+            `Added ${nextItems.length} direct media link(s) to the playlist${
+                rejectedLinks.length ? ` and skipped ${rejectedLinks.length} invalid link(s)` : ""
+            }.`
+        );
+    }
+
+    function addCurrentMediaToPlaylist() {
+        if (sourceKind === "file" && inputFile) {
+            setPlaylist((current) => [...current, buildPlaylistItemFromFile(inputFile)]);
+            setInfo(`Added the currently loaded file "${inputFile.name}" to the playlist.`);
+            return;
+        }
+
+        if (sourceKind === "url" && sourceUrl) {
+            try {
+                const nextItem = buildPlaylistItemFromUrl(sourceUrl);
+
+                setPlaylist((current) => [...current, nextItem]);
+                setInfo(`Added the currently loaded direct link "${nextItem.title}" to the playlist.`);
+            } catch (error) {
+                setError(error?.message || "The currently loaded link could not be added.");
+            }
+
+            return;
+        }
+
+        setError("Load a file or direct media link first, then add the loaded source to the playlist.");
+    }
+
+    async function loadPlaylistItem(index, autoplay = false) {
+        const item = playlistRef.current[index];
+
+        if (!item) {
+            setError("That playlist item is no longer available.");
+            return;
+        }
+
+        if (item.kind === "url") {
+            try {
+                setIsLoading(true);
+                resetDecodedState();
+                clearObjectUrl();
+
+                const cleanLink = validateDirectMediaUrl(item.url);
+
+                setInputFile(null);
+                setSourceKind("url");
+                setSourceUrl(cleanLink);
+                setActivePlaylistIndex(index);
+                activePlaylistIndexRef.current = index;
+
+                const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
+                const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+
+                setInfo(
+                    `Loaded playlist link ${index + 1} of ${
+                        playlistRef.current.length
+                    }: "${item.title}". Browser decoded ${formatTime(
+                        decodedBuffer.duration
+                    )}.`
+                );
+
+                if (autoplay) {
+                    window.setTimeout(() => {
+                        startBufferPlayback(true);
+                    }, 80);
+                }
+            } catch (error) {
+                setError(error?.message || "Could not decode this playlist link.");
+            } finally {
+                setIsLoading(false);
+            }
+
+            return;
+        }
+
+        if (!item.file) {
+            setError("That playlist file is no longer available. Add it again from your device.");
+            return;
+        }
+
+        const pickedInfo = buildPickedFileInfo(item.file, "Playlist file");
+        const pickedWarning = buildPickedFileWarning(item.file);
+
+        try {
+            setIsLoading(true);
+            resetDecodedState();
+            clearObjectUrl();
+
+            const objectUrl = URL.createObjectURL(item.file);
+
+            objectUrlRef.current = objectUrl;
+
+            setInputFile(item.file);
+            setSourceKind("file");
+            setSourceUrl(objectUrl);
+            setActivePlaylistIndex(index);
+            activePlaylistIndexRef.current = index;
+
+            if (pickedWarning) {
+                setStatus(pickedWarning);
+                setStatusTone("info");
+            }
+
+            const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
+                item.file,
+                "Playlist file"
+            );
+
+            const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+
+            setInfo(
+                `Loaded playlist file ${index + 1} of ${
+                    playlistRef.current.length
+                }: "${item.title}". Browser decoded ${formatTime(
+                    decodedBuffer.duration
+                )}. Source: ${pickedInfo}.`
+            );
+
+            if (autoplay) {
+                window.setTimeout(() => {
+                    startBufferPlayback(true);
+                }, 80);
+            }
+        } catch (error) {
+            setError(error?.message || "Could not decode this playlist file.");
+        } finally {
+            setIsLoading(false);
+        }
+    }
+
+    function removePlaylistItem(id) {
+        const currentIndex = activePlaylistIndexRef.current;
+
+        setPlaylist((current) => {
+            const removedIndex = current.findIndex((item) => item.id === id);
+            const nextPlaylist = current.filter((item) => item.id !== id);
+
+            if (removedIndex === currentIndex) {
+                setActivePlaylistIndex(-1);
+                activePlaylistIndexRef.current = -1;
+            } else if (removedIndex >= 0 && removedIndex < currentIndex) {
+                setActivePlaylistIndex(currentIndex - 1);
+                activePlaylistIndexRef.current = currentIndex - 1;
+            }
+
+            return nextPlaylist;
+        });
+    }
+
+    function clearPlaylist() {
+        setPlaylist([]);
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
+        setInfo("Playlist cleared. The currently loaded buffer stays loaded until you clear media.");
+    }
+
+    function toggleRepeat() {
+        setRepeatEnabled((current) => {
+            const nextValue = !current;
+
+            repeatEnabledRef.current = nextValue;
+
+            setInfo(
+                nextValue
+                    ? "Repeat turned on. This song will restart automatically when it ends."
+                    : "Repeat turned off. If a playlist song is loaded, the next playlist item will play when this one ends."
+            );
+
+            return nextValue;
+        });
+    }
+
+    function playNextPlaylistItem() {
+        const list = playlistRef.current;
+
+        if (!list.length) {
+            setError("Add uploaded files or direct media links to the playlist first.");
+            return;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+        const nextIndex =
+            currentIndex >= 0 && currentIndex < list.length - 1
+                ? currentIndex + 1
+                : 0;
+
+        loadPlaylistItem(nextIndex, true);
+    }
+
+    async function playPlaylistFromStart() {
+        const list = playlistRef.current;
+
+        if (!list.length) {
+            setError("Add uploaded files or direct media links to the playlist first.");
+            return;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+
+        if (hasMedia && currentIndex >= 0 && currentIndex < list.length) {
+            await startBufferPlayback(false);
+            return;
+        }
+
+        await loadPlaylistItem(currentIndex >= 0 ? currentIndex : 0, true);
+    }
+
+    async function handlePlaylistPrimaryPlay() {
+        if (playingRef.current && activePlaylistIndexRef.current >= 0) {
+            pausePlayback();
+            return;
+        }
+
+        await playPlaylistFromStart();
+    }
+
+    async function handlePlaybackEnded() {
+        if (manualStopRef.current) return;
+
+        activeSourceRef.current = null;
+        startedOffsetRef.current = 0;
+        startedAtContextTimeRef.current = 0;
+
+        setPosition(0);
+        setPlayingState(false);
+        stopPositionTimer();
+        stopVisualizer();
+
+        if (repeatEnabledRef.current) {
+            setInfo("Repeat is on. Restarting the current song.");
+            window.setTimeout(() => {
+                startBufferPlayback(true);
+            }, 80);
+            return;
+        }
+
+        const list = playlistRef.current;
+        const currentIndex = activePlaylistIndexRef.current;
+
+        if (list.length > 0) {
+            const nextIndex =
+                currentIndex >= 0 && currentIndex < list.length - 1
+                    ? currentIndex + 1
+                    : 0;
+
+            if (nextIndex === 0 && currentIndex >= list.length - 1) {
+                setInfo("Repeat is off. End of playlist reached, looping back to the first track.");
+            } else if (currentIndex < 0) {
+                setInfo("Repeat is off. Starting playlist from the first track.");
+            } else {
+                setInfo("Repeat is off. Loading the next playlist song.");
+            }
+
+            await loadPlaylistItem(nextIndex, true);
+            return;
+        }
+
+        setInfo("Repeat is off and no playlist track is available, so the current audio is starting again from the beginning.");
+        window.setTimeout(() => {
+            startBufferPlayback(true);
+        }, 80);
     }
 
     function connectOutputStage(context, monitorMuteGain) {
@@ -1911,17 +2363,7 @@ export default function Audio() {
             );
 
             source.onended = () => {
-                if (manualStopRef.current) return;
-
-                activeSourceRef.current = null;
-                startedOffsetRef.current = 0;
-                startedAtContextTimeRef.current = 0;
-
-                setPosition(0);
-                setPlayingState(false);
-                stopPositionTimer();
-                stopVisualizer();
-                setInfo("Playback finished. Press Play to create a new buffer source.");
+                handlePlaybackEnded();
             };
 
             source.start(0, safeOffset);
@@ -1933,8 +2375,8 @@ export default function Audio() {
 
             setInfo(
                 isIOSAudioDevice()
-                    ? "Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker."
-                    : "Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb."
+                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. "}Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker.`
+                    : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
         } catch (error) {
             setError(
@@ -2347,6 +2789,10 @@ export default function Audio() {
                             "Compression",
                             "De-essing",
                             "WAV export",
+                            "Local file playlists",
+                            "Direct media URL playlists",
+                            "Repeat current song toggle",
+                            "Automatic next-track playback",
                         ],
                     })}
                 </script>
@@ -2355,8 +2801,8 @@ export default function Audio() {
             <Stack spacing={4}>
                 <SectionTitle
                     eyebrow="Audio tool"
-                    title="Advanced WebAudio mixer, visualizer, and renderer"
-                    description="Decode audio/video containers into an AudioBuffer, import from desktop or iPhone Files providers through the same Upload media file button, visualize the processed signal, scrub the full duration, add effects, and render the processed result to WAV."
+                    title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
+                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, and render the processed result to WAV."
                 />
 
                 <GlassCard>
@@ -2472,6 +2918,30 @@ export default function Audio() {
                                     <TuneRoundedIcon sx={{ fontSize: 18 }} />
                                     live graph
                                 </Box>
+
+                                <Box
+                                    sx={{
+                                        display: "inline-flex",
+                                        alignItems: "center",
+                                        gap: 0.75,
+                                        px: 1.4,
+                                        py: 0.8,
+                                        borderRadius: 999,
+                                        background: repeatEnabled
+                                            ? "rgba(103,232,249,0.15)"
+                                            : "rgba(255,255,255,0.07)",
+                                        border: repeatEnabled
+                                            ? "1px solid rgba(103,232,249,0.28)"
+                                            : "1px solid rgba(255,255,255,0.12)",
+                                        color: repeatEnabled ? "#67e8f9" : "rgba(255,255,255,0.7)",
+                                        fontSize: 12,
+                                        fontWeight: 900,
+                                        letterSpacing: 0.3,
+                                    }}
+                                >
+                                    <RepeatRoundedIcon sx={{ fontSize: 18 }} />
+                                    {repeatEnabled ? "repeat on" : "repeat off"}
+                                </Box>
                             </Stack>
                         </Box>
 
@@ -2529,6 +2999,361 @@ export default function Audio() {
                             onClear={handleClearMedia}
                             disabled={isRendering || isLoading}
                         />
+
+                        <GlassCard>
+                            <Stack spacing={2.5}>
+                                <Box>
+                                    <Stack direction="row" alignItems="center" spacing={1.1}>
+                                        <QueueMusicRoundedIcon sx={{ color: "#67e8f9" }} />
+
+                                        <Typography variant="h5" sx={{ fontWeight: 950 }}>
+                                            Playlist player: uploads and direct links
+                                        </Typography>
+                                    </Stack>
+
+                                    <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
+                                        Add uploaded files, paste direct media URLs, play the whole
+                                        playlist with one large button, repeat the current song, or let
+                                        playback continue to the next playlist item when repeat is off.
+                                    </Typography>
+                                </Box>
+
+                                <Button
+                                    fullWidth
+                                    size="large"
+                                    variant="contained"
+                                    startIcon={
+                                        isPlaying && activePlaylistIndex >= 0 ? (
+                                            <PauseRoundedIcon />
+                                        ) : (
+                                            <PlayArrowRoundedIcon />
+                                        )
+                                    }
+                                    onClick={handlePlaylistPrimaryPlay}
+                                    disabled={!playlist.length || isRendering || isLoading}
+                                    sx={{
+                                        borderRadius: 5,
+                                        py: { xs: 1.9, md: 2.35 },
+                                        px: 2.25,
+                                        fontSize: { xs: 17, md: 20 },
+                                        fontWeight: 1000,
+                                        letterSpacing: 0.2,
+                                        color: "#06111e",
+                                        background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                        boxShadow:
+                                            "0 24px 70px rgba(103,232,249,0.26), inset 0 1px 0 rgba(255,255,255,0.25)",
+                                        "&:hover": {
+                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            filter: "brightness(1.05)",
+                                            transform: "translateY(-1px)",
+                                        },
+                                    }}
+                                >
+                                    {isPlaying && activePlaylistIndex >= 0
+                                        ? "Pause playlist"
+                                        : "Play playlist"}
+                                </Button>
+
+                                <Button
+                                    component="label"
+                                    variant="contained"
+                                    startIcon={<PlaylistAddRoundedIcon />}
+                                    disabled={isRendering || isLoading}
+                                    sx={{
+                                        borderRadius: 999,
+                                        py: 1.35,
+                                        fontWeight: 950,
+                                        color: "#06111e",
+                                        background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                        boxShadow: "0 18px 46px rgba(103,232,249,0.18)",
+                                        "&:hover": {
+                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            filter: "brightness(1.04)",
+                                        },
+                                    }}
+                                >
+                                    Add uploaded files to playlist
+                                    <input
+                                        hidden
+                                        multiple
+                                        type="file"
+                                        accept="audio/*,video/*,.mp3,.wav,.ogg,.oga,.opus,.webm,.m4a,.mp4,.mov,.aac,.flac,.aif,.aiff"
+                                        onChange={(event) => {
+                                            addFilesToPlaylist(event.target.files);
+                                            event.target.value = "";
+                                        }}
+                                    />
+                                </Button>
+
+                                <Box
+                                    sx={{
+                                        borderRadius: 4,
+                                        p: 1.5,
+                                        background: "rgba(255,255,255,0.045)",
+                                        border: "1px solid rgba(255,255,255,0.08)",
+                                    }}
+                                >
+                                    <Stack spacing={1.25}>
+                                        <TextField
+                                            fullWidth
+                                            multiline
+                                            minRows={2}
+                                            value={playlistLink}
+                                            onChange={(event) => setPlaylistLink(event.target.value)}
+                                            disabled={isRendering || isLoading}
+                                            placeholder="Paste direct media URL(s), one per line or comma-separated: .mp3, .wav, .m4a, .mp4, .mov, .webm, .ogg..."
+                                            label="Direct file links for playlist"
+                                            variant="outlined"
+                                            sx={{
+                                                "& .MuiOutlinedInput-root": {
+                                                    color: "#fff",
+                                                    borderRadius: 3,
+                                                    background: "rgba(7,10,19,0.48)",
+                                                    "& fieldset": {
+                                                        borderColor: "rgba(255,255,255,0.16)",
+                                                    },
+                                                    "&:hover fieldset": {
+                                                        borderColor: "rgba(103,232,249,0.35)",
+                                                    },
+                                                    "&.Mui-focused fieldset": {
+                                                        borderColor: "#67e8f9",
+                                                    },
+                                                },
+                                                "& .MuiInputLabel-root": {
+                                                    color: "rgba(255,255,255,0.68)",
+                                                },
+                                                "& .MuiInputLabel-root.Mui-focused": {
+                                                    color: "#67e8f9",
+                                                },
+                                            }}
+                                        />
+
+                                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                                            <Button
+                                                fullWidth
+                                                variant="outlined"
+                                                startIcon={<PlaylistAddRoundedIcon />}
+                                                onClick={addDirectLinksToPlaylist}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    borderRadius: 999,
+                                                    py: 1.15,
+                                                    color: "#fff",
+                                                    borderColor: "rgba(255,255,255,0.18)",
+                                                    fontWeight: 950,
+                                                }}
+                                            >
+                                                Add direct link(s)
+                                            </Button>
+
+                                            <Button
+                                                fullWidth
+                                                variant="text"
+                                                onClick={addCurrentMediaToPlaylist}
+                                                disabled={isRendering || isLoading || (!hasMedia && !sourceUrl)}
+                                                sx={{
+                                                    color: "rgba(255,255,255,0.78)",
+                                                    fontWeight: 950,
+                                                }}
+                                            >
+                                                Add loaded source
+                                            </Button>
+                                        </Stack>
+                                    </Stack>
+                                </Box>
+
+                                <Button
+                                    variant={repeatEnabled ? "contained" : "outlined"}
+                                    startIcon={<RepeatRoundedIcon />}
+                                    onClick={toggleRepeat}
+                                    disabled={isRendering || isLoading}
+                                    sx={{
+                                        borderRadius: 4,
+                                        py: 1.25,
+                                        color: repeatEnabled ? "#06111e" : "#fff",
+                                        borderColor: "rgba(255,255,255,0.18)",
+                                        fontWeight: 950,
+                                        background: repeatEnabled
+                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                            : "transparent",
+                                    }}
+                                >
+                                    {repeatEnabled
+                                        ? "Repeat current song: ON"
+                                        : "Repeat current song: OFF"}
+                                </Button>
+
+                                <Box
+                                    sx={{
+                                        borderRadius: 4,
+                                        p: 2,
+                                        background: repeatEnabled
+                                            ? "rgba(103,232,249,0.1)"
+                                            : "rgba(255,255,255,0.055)",
+                                        border: repeatEnabled
+                                            ? "1px solid rgba(103,232,249,0.2)"
+                                            : "1px solid rgba(255,255,255,0.08)",
+                                    }}
+                                >
+                                    <Typography sx={{ color: "rgba(255,255,255,0.78)", lineHeight: 1.7 }}>
+                                        {playlistStatusLabel}
+                                    </Typography>
+                                </Box>
+
+                                {activePlaylistItem && (
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 1.6,
+                                            background: "rgba(103,232,249,0.08)",
+                                            border: "1px solid rgba(103,232,249,0.16)",
+                                        }}
+                                    >
+                                        <Typography
+                                            variant="caption"
+                                            sx={{
+                                                color: "#67e8f9",
+                                                fontWeight: 950,
+                                                textTransform: "uppercase",
+                                                letterSpacing: 0.8,
+                                            }}
+                                        >
+                                            Active playlist track
+                                        </Typography>
+
+                                        <Typography
+                                            sx={{
+                                                color: "#fff",
+                                                fontWeight: 900,
+                                                overflow: "hidden",
+                                                textOverflow: "ellipsis",
+                                                whiteSpace: "nowrap",
+                                            }}
+                                            title={activePlaylistItem.title}
+                                        >
+                                            {activePlaylistIndex + 1}. {activePlaylistItem.title}
+                                        </Typography>
+                                    </Box>
+                                )}
+
+                                {!playlist.length ? (
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 3,
+                                            textAlign: "center",
+                                            border: "1px dashed rgba(255,255,255,0.18)",
+                                            color: "rgba(255,255,255,0.62)",
+                                        }}
+                                    >
+                                        No playlist items yet. Add uploaded files or paste direct file links above.
+                                    </Box>
+                                ) : (
+                                    <Stack spacing={1.1}>
+                                        {playlist.map((item, index) => {
+                                            const active = index === activePlaylistIndex;
+
+                                            return (
+                                                <Box
+                                                    key={item.id}
+                                                    sx={{
+                                                        display: "grid",
+                                                        gridTemplateColumns: "minmax(0, 1fr) auto auto",
+                                                        gap: 1,
+                                                        alignItems: "center",
+                                                        borderRadius: 3,
+                                                        p: 1.25,
+                                                        background: active
+                                                            ? "rgba(103,232,249,0.14)"
+                                                            : "rgba(255,255,255,0.06)",
+                                                        border: active
+                                                            ? "1px solid rgba(103,232,249,0.3)"
+                                                            : "1px solid rgba(255,255,255,0.08)",
+                                                    }}
+                                                >
+                                                    <Box sx={{ minWidth: 0 }}>
+                                                        <Typography
+                                                            sx={{
+                                                                fontWeight: 900,
+                                                                overflow: "hidden",
+                                                                textOverflow: "ellipsis",
+                                                                whiteSpace: "nowrap",
+                                                            }}
+                                                            title={item.title}
+                                                        >
+                                                            {index + 1}. {item.title}
+                                                        </Typography>
+
+                                                        <Typography
+                                                            variant="caption"
+                                                            sx={{ color: "rgba(255,255,255,0.55)" }}
+                                                        >
+                                                            {getPlaylistItemMeta(item)}
+                                                        </Typography>
+                                                    </Box>
+
+                                                    <Button
+                                                        size="small"
+                                                        variant="outlined"
+                                                        onClick={() => loadPlaylistItem(index, true)}
+                                                        disabled={isRendering || isLoading}
+                                                        sx={{
+                                                            borderRadius: 999,
+                                                            color: "#fff",
+                                                            borderColor: "rgba(255,255,255,0.18)",
+                                                            fontWeight: 900,
+                                                        }}
+                                                    >
+                                                        Play
+                                                    </Button>
+
+                                                    <Button
+                                                        size="small"
+                                                        onClick={() => removePlaylistItem(item.id)}
+                                                        disabled={isRendering || isLoading}
+                                                        sx={{
+                                                            minWidth: 42,
+                                                            color: "rgba(255,255,255,0.68)",
+                                                        }}
+                                                    >
+                                                        <DeleteRoundedIcon fontSize="small" />
+                                                    </Button>
+                                                </Box>
+                                            );
+                                        })}
+
+                                        <Stack direction="row" flexWrap="wrap" gap={1}>
+                                            <Button
+                                                variant="outlined"
+                                                startIcon={<SkipNextRoundedIcon />}
+                                                onClick={playNextPlaylistItem}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    borderRadius: 999,
+                                                    color: "#fff",
+                                                    borderColor: "rgba(255,255,255,0.18)",
+                                                    fontWeight: 900,
+                                                }}
+                                            >
+                                                Play next
+                                            </Button>
+
+                                            <Button
+                                                variant="text"
+                                                onClick={clearPlaylist}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    color: "rgba(255,255,255,0.72)",
+                                                    fontWeight: 900,
+                                                }}
+                                            >
+                                                Clear playlist
+                                            </Button>
+                                        </Stack>
+                                    </Stack>
+                                )}
+                            </Stack>
+                        </GlassCard>
 
                         <GlassCard>
                             <Stack spacing={2.5}>
@@ -2852,7 +3677,9 @@ export default function Audio() {
                                         fullWidth
                                         size="large"
                                         variant="contained"
-                                        startIcon={<PlayArrowRoundedIcon />}
+                                        startIcon={
+                                            isPlaying ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
+                                        }
                                         onClick={handlePlayPause}
                                         disabled={!hasMedia || isRendering || isLoading}
                                         sx={{
@@ -2882,6 +3709,44 @@ export default function Audio() {
                                         }}
                                     >
                                         Restart
+                                    </Button>
+                                    <Button
+                                        fullWidth
+                                        size="large"
+                                        variant={repeatEnabled ? "contained" : "outlined"}
+                                        startIcon={<RepeatRoundedIcon />}
+                                        onClick={toggleRepeat}
+                                        disabled={!hasMedia || isRendering || isLoading}
+                                        sx={{
+                                            borderRadius: 4,
+                                            py: 1.35,
+                                            color: repeatEnabled ? "#06111e" : "#fff",
+                                            borderColor: "rgba(255,255,255,0.18)",
+                                            fontWeight: 950,
+                                            background: repeatEnabled
+                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                : "transparent",
+                                        }}
+                                    >
+                                        {repeatEnabled ? "Repeat on" : "Repeat off"}
+                                    </Button>
+
+                                    <Button
+                                        fullWidth
+                                        size="large"
+                                        variant="outlined"
+                                        startIcon={<SkipNextRoundedIcon />}
+                                        onClick={playNextPlaylistItem}
+                                        disabled={!playlist.length || isRendering || isLoading}
+                                        sx={{
+                                            borderRadius: 4,
+                                            py: 1.35,
+                                            color: "#fff",
+                                            borderColor: "rgba(255,255,255,0.18)",
+                                            fontWeight: 950,
+                                        }}
+                                    >
+                                        Next track
                                     </Button>
                                 </Stack>
 

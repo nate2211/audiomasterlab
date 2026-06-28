@@ -3,7 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Box, CssBaseline } from "@mui/material";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import { Helmet, HelmetProvider } from "react-helmet-async";
-
+import YoutubePage from "./pages/Youtube.js";
 import { NavBar } from "./components/Components.js";
 import Home from "./pages/Home.js";
 import Audio from "./pages/Audio.js";
@@ -71,6 +71,7 @@ export default function App() {
                 <Route path="/audio" element={<Audio />} />
                 <Route path="/editor" element={<Editor />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
+                <Route path="/youtube" element={<YoutubePage />} />
               </Routes>
             </Box>
           </BrowserRouter>

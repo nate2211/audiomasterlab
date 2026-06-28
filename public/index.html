@@ -9,85 +9,147 @@
   <meta name="color-scheme" content="dark light" />
 
   <!-- Primary SEO -->
-  <title>AudioMaster Lab | WebAudio Mastering, Visualizer & WAV Renderer</title>
+  <title>AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool</title>
+
   <meta
           name="description"
-          content="AudioMaster Lab is a browser-based WebAudio mastering tool for decoding audio files, visualizing waveforms and frequency spectrum, applying EQ, compression, panning, delay, reverb, de-essing, and exporting processed WAV files."
+          content="AudioMaster Lab is a free browser-based audio editor, mixing tool, mastering tool, waveform visualizer, WAV renderer, and YouTube browsing playlist player with loop, auto-play, search, and playlist controls."
   />
+
   <meta
           name="keywords"
-          content="AudioMaster Lab, audio mastering, WebAudio API, waveform visualizer, frequency spectrum, WAV renderer, online audio editor, browser audio mixer, reverb, delay, EQ, compressor, de-esser"
+          content="AudioMaster Lab, free audio editor, free audio mastering, free mixing tool, online audio editor, browser audio editor, WebAudio API, waveform visualizer, frequency spectrum, WAV renderer, online mastering tool, EQ, compressor, reverb, delay, de-esser, audio timeline editor, YouTube playlist tool, YouTube browser, YouTube loop tool, YouTube playlist player, YouTube autoplay, free YouTube music browser"
   />
+
   <meta name="author" content="AudioMaster Lab" />
   <meta name="application-name" content="AudioMaster Lab" />
-  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
 
-  <!-- Canonical URL: change this after you buy the final domain -->
+  <!-- Canonical URL -->
   <link rel="canonical" href="https://audiomasterlab.com/" />
 
   <!-- Favicons / app icons -->
   <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+  <link rel="shortcut icon" href="%PUBLIC_URL%/favicon.ico" />
   <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
   <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
 
   <!-- Open Graph / social preview -->
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="AudioMaster Lab" />
+
   <meta
           property="og:title"
-          content="AudioMaster Lab | WebAudio Mastering, Visualizer & WAV Renderer"
+          content="AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool"
   />
+
   <meta
           property="og:description"
-          content="Master audio directly in the browser with WebAudio effects, waveform and frequency visualizers, panning, delay, convolution reverb, EQ, compression, de-essing, and WAV export."
+          content="Edit, mix, master, visualize, and render audio in your browser. Browse YouTube, build playlists, loop tracks, auto-play the next song, and use playlist controls for free."
   />
+
   <meta property="og:url" content="https://audiomasterlab.com/" />
-  <meta
-          property="og:image"
-          content="https://audiomasterlab.com/social-preview.png"
-  />
+  <meta property="og:image" content="https://audiomasterlab.com/social-preview.png" />
+
   <meta
           property="og:image:alt"
-          content="AudioMaster Lab WebAudio mastering interface with waveform and frequency spectrum visualizers"
+          content="AudioMaster Lab free browser audio editor with waveform tools, mastering effects, and YouTube playlist controls"
   />
 
+  <!-- Twitter / X preview -->
+  <meta name="twitter:card" content="summary_large_image" />
 
-  <!-- Basic PWA/mobile polish -->
+  <meta
+          name="twitter:title"
+          content="AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool"
+  />
+
+  <meta
+          name="twitter:description"
+          content="A free WebAudio editor and mastering lab with waveform editing, effects, WAV export, plus a YouTube browser with playlists, looping, and auto-play controls."
+  />
+
+  <meta name="twitter:image" content="https://audiomasterlab.com/social-preview.png" />
+
+  <!-- PWA / mobile polish -->
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="AudioMaster Lab" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7468131499712645"
-          crossorigin="anonymous"></script>
-  <!-- Structured data -->
+
+  <!-- Google AdSense -->
+  <script
+          async
+          src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7468131499712645"
+          crossorigin="anonymous"
+  ></script>
+
+  <!-- Structured data: main app -->
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
       "@type": "SoftwareApplication",
       "name": "AudioMaster Lab",
+      "alternateName": [
+        "Free Audio Editor",
+        "Free Audio Mastering Tool",
+        "YouTube Playlist Tool"
+      ],
       "applicationCategory": "MultimediaApplication",
+      "applicationSubCategory": "Audio editing, audio mastering, mixing, waveform editing, and YouTube playlist playback",
       "operatingSystem": "Web Browser",
-      "description": "AudioMaster Lab is a browser-based WebAudio mastering tool for decoding audio files, visualizing waveform and frequency spectrum data, applying audio effects, and exporting processed WAV files.",
       "url": "https://audiomasterlab.com/",
       "image": "https://audiomasterlab.com/social-preview.png",
+      "description": "AudioMaster Lab is a free browser-based audio editor, mixing tool, mastering tool, waveform visualizer, WAV renderer, and YouTube playlist browser with loop, auto-play, search, and playlist controls.",
+      "isAccessibleForFree": true,
+      "browserRequirements": "Requires JavaScript and a modern browser with WebAudio support.",
       "offers": {
         "@type": "Offer",
         "price": "0",
-        "priceCurrency": "USD"
+        "priceCurrency": "USD",
+        "availability": "https://schema.org/InStock"
       },
       "featureList": [
+        "Free browser-based audio editor",
+        "Free mixing and mastering tools",
         "Audio file decoding",
-        "Live waveform visualizer",
-        "Live frequency spectrum visualizer",
+        "Timeline audio editing",
+        "Waveform visualization",
+        "Frequency spectrum visualization",
         "Base volume control",
         "Stereo panning",
-        "Convolution reverb",
-        "Delay and feedback",
         "EQ filters",
         "Compression",
         "De-essing",
-        "WAV export"
+        "Delay and feedback",
+        "Convolution reverb",
+        "Effect blocks",
+        "Processed WAV export",
+        "YouTube browsing",
+        "YouTube search",
+        "YouTube playlist creation",
+        "YouTube playlist playback",
+        "Loop controls",
+        "Auto-play next track",
+        "Play videos without adding them to a playlist"
       ]
+    }
+  </script>
+
+  <!-- Structured data: website -->
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "name": "AudioMaster Lab",
+      "url": "https://audiomasterlab.com/",
+      "description": "A free web app for audio editing, mixing, mastering, waveform visualization, WAV rendering, and YouTube playlist browsing.",
+      "inLanguage": "en-US",
+      "publisher": {
+        "@type": "Organization",
+        "name": "AudioMaster Lab",
+        "url": "https://audiomasterlab.com/"
+      }
     }
   </script>
 </head>
@@ -95,8 +157,11 @@
 <body>
 <noscript>
   <strong>AudioMaster Lab requires JavaScript.</strong>
-  This browser-based audio mastering tool uses the WebAudio API to decode,
-  visualize, process, and render audio. Please enable JavaScript to use the app.
+  This free browser-based audio editor, mixing tool, mastering tool, waveform
+  visualizer, WAV renderer, and YouTube playlist browser uses JavaScript,
+  React, and the WebAudio API. Please enable JavaScript to edit audio,
+  process effects, export WAV files, browse YouTube, create playlists, loop
+  tracks, and use auto-play controls.
 </noscript>
 
 <div id="root"></div>

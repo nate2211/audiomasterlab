@@ -7,6 +7,7 @@ import {
     Card,
     CardContent,
     Chip,
+    CircularProgress,
     Container,
     Divider,
     Paper,
@@ -20,6 +21,7 @@ import {
 import HomeRoundedIcon from "@mui/icons-material/HomeRounded";
 import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
 import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
+import YouTubeIcon from "@mui/icons-material/YouTube";
 import CloudUploadRoundedIcon from "@mui/icons-material/CloudUploadRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import AudiotrackRoundedIcon from "@mui/icons-material/AudiotrackRounded";
@@ -39,6 +41,11 @@ export function NavBar() {
             label: "Audio Tool",
             path: "/audio",
             icon: <GraphicEqRoundedIcon fontSize="small" />,
+        },
+        {
+            label: "YouTube",
+            path: "/youtube",
+            icon: <YouTubeIcon fontSize="small" />,
         },
         {
             label: "Editor",
@@ -116,7 +123,7 @@ export function NavBar() {
                                 variant="caption"
                                 sx={{ color: "rgba(255,255,255,0.62)" }}
                             >
-                                WebAudio mastering tool
+                                WebAudio mastering + playlists
                             </Typography>
                         </Box>
                     </Stack>
@@ -454,6 +461,9 @@ export function MediaInputForm({
                                    onLoadLink,
                                    onClear,
                                    disabled,
+                                   multiple = false,
+                                   uploadLabel = "Upload media file",
+                                   helperText = "Upload an audio/video file or load a direct media URL that allows browser access.",
                                }) {
     return (
         <GlassCard>
@@ -464,8 +474,7 @@ export function MediaInputForm({
                     </Typography>
 
                     <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
-                        Upload an audio/video file or load a direct media URL that allows
-                        browser access.
+                        {helperText}
                     </Typography>
                 </Box>
 
@@ -491,16 +500,25 @@ export function MediaInputForm({
                         },
                     }}
                 >
-                    Upload media file
+                    {uploadLabel}
                     <input
                         hidden
+                        multiple={multiple}
                         type="file"
                         accept="audio/*,video/*,.mp3,.wav,.ogg,.oga,.opus,.webm,.m4a,.mp4,.mov,.aac,.flac,.aif,.aiff"
                         onChange={(event) => {
-                            const file = event.target.files?.[0];
+                            if (multiple) {
+                                const files = Array.from(event.target.files || []);
 
-                            if (file) {
-                                onFileSelect(file);
+                                if (files.length) {
+                                    onFileSelect(files);
+                                }
+                            } else {
+                                const file = event.target.files?.[0];
+
+                                if (file) {
+                                    onFileSelect(file);
+                                }
                             }
 
                             event.target.value = "";
@@ -647,29 +665,47 @@ export function StatusBanner({ status, tone = "info" }) {
                     : "1px solid rgba(103,232,249,0.18)",
             }}
         >
-            <Typography sx={{ fontWeight: 750 }}>{status}</Typography>
+            <Typography sx={{ color: "rgba(255,255,255,0.82)", lineHeight: 1.7 }}>
+                {status}
+            </Typography>
         </Paper>
     );
 }
 
-export function RenderButton({ onClick, disabled, rendering }) {
+export function RenderButton({
+                                 onClick,
+                                 disabled,
+                                 loading,
+                                 label = "Render processed WAV",
+                             }) {
     return (
         <Button
-            fullWidth
-            size="large"
             variant="contained"
-            startIcon={<FileDownloadRoundedIcon />}
+            size="large"
+            startIcon={
+                loading ? (
+                    <CircularProgress size={18} sx={{ color: "#06111e" }} />
+                ) : (
+                    <FileDownloadRoundedIcon />
+                )
+            }
             onClick={onClick}
-            disabled={disabled}
+            disabled={disabled || loading}
             sx={{
-                borderRadius: 4,
-                py: 1.55,
+                width: "100%",
+                borderRadius: 999,
+                py: 1.45,
                 fontWeight: 950,
                 color: "#06111e",
                 background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                boxShadow: "0 18px 46px rgba(103,232,249,0.18)",
+                "&:hover": {
+                    background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                    filter: "brightness(1.04)",
+                },
             }}
         >
-            {rendering ? "Rendering mixed file..." : "Render audio with effects"}
+            {loading ? "Rendering..." : label}
         </Button>
     );
 }
