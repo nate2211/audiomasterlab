@@ -1,4 +1,4 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Box, CssBaseline } from "@mui/material";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
@@ -9,8 +9,8 @@ import Home from "./pages/Home.js";
 import Audio from "./pages/Audio.js";
 import Editor from "./pages/Editor.js";
 import Recorder from "./pages/Recorder.js";
-import Transcripe from "./pages/Transcripe.js";
 import ArchiveAudioBrowser from "./pages/Archive";
+const Transcripe = lazy(() => import("./pages/Transcripe.js"));
 const theme = createTheme({
   palette: {
     mode: "dark",
@@ -68,16 +68,18 @@ export default function App() {
             <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
               <NavBar />
 
-              <Routes>
-                <Route path="/" element={<Home />} />
-                <Route path="/audio" element={<Audio />} />
-                <Route path="/recorder" element={<Recorder />} />
-                <Route path="/editor" element={<Editor />} />
-                <Route path="/youtube" element={<YoutubePage />} />
-                <Route path="/transcripe" element={<Transcripe />} />
-                <Route path="/archive" element={<ArchiveAudioBrowser />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
+              <Suspense fallback={<Box sx={{ p: 4, color: "#fff" }}>Loading page...</Box>}>
+                <Routes>
+                  <Route path="/" element={<Home />} />
+                  <Route path="/audio" element={<Audio />} />
+                  <Route path="/recorder" element={<Recorder />} />
+                  <Route path="/editor" element={<Editor />} />
+                  <Route path="/youtube" element={<YoutubePage />} />
+                  <Route path="/transcripe" element={<Transcripe />} />
+                  <Route path="/archive" element={<ArchiveAudioBrowser />} />
+                  <Route path="*" element={<Navigate to="/" replace />} />
+                </Routes>
+              </Suspense>
             </Box>
           </BrowserRouter>
         </ThemeProvider>

@@ -26,12 +26,26 @@ import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
 
-import { env, pipeline } from "@huggingface/transformers";
 import { GlassCard, PageShell, StatusBanner } from "../components/Components.js";
 
-env.allowLocalModels = false;
-env.allowRemoteModels = true;
-env.useBrowserCache = true;
+let transformersModulePromise = null;
+
+async function loadTransformers() {
+    if (!transformersModulePromise) {
+        transformersModulePromise = import("@huggingface/transformers");
+    }
+
+    const { env, pipeline } = await transformersModulePromise;
+
+    env.allowLocalModels = false;
+    env.allowRemoteModels = true;
+    env.useBrowserCache = true;
+
+    // Use the hosted WASM binaries unless you decide to self-host them later.
+    // Hugging Face documents that Transformers.js uses hosted pretrained models
+    // and precompiled WASM binaries by default.
+    return { pipeline };
+}
 
 const MODEL_ID = "onnx-community/whisper-tiny.en";
 const MAX_FILE_SIZE_MB = 90;
@@ -250,19 +264,16 @@ export default function Transcripe() {
         }
 
         setProgress(2);
-        setStatus("Loading fp32 Whisper model. First load can take time.");
+        setStatus("Loading Whisper model. First load can take time.");
+
+        const { pipeline } = await loadTransformers();
 
         const instance = await pipeline("automatic-speech-recognition", MODEL_ID, {
             device: "wasm",
-
-            // Critical fix:
-            // Do NOT use q4/q8/int8 here. The error you got is from a broken
-            // quantized DequantizeLinear / MatMulNBits path.
             dtype: {
                 encoder_model: "fp32",
                 decoder_model_merged: "fp32",
             },
-
             progress_callback: (event) => {
                 const amount = Number(event?.progress);
 
@@ -273,16 +284,11 @@ export default function Transcripe() {
                 const eventStatus = event?.status || "loading";
                 const eventFile = event?.file || event?.name || "";
 
-                if (eventFile) {
-                    setStatus(`Model ${eventStatus}: ${eventFile}`);
-                } else {
-                    setStatus(`Model ${eventStatus}...`);
-                }
+                setStatus(eventFile ? `Model ${eventStatus}: ${eventFile}` : `Model ${eventStatus}...`);
             },
         });
 
         transcriberRef.current = instance;
-
         return instance;
     }
 
