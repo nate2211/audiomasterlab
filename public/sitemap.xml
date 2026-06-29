@@ -2,21 +2,29 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
         <loc>https://audiomasterlab.com/</loc>
-        <lastmod>2026-06-21</lastmod>
+        <lastmod>2026-06-28</lastmod>
         <changefreq>weekly</changefreq>
         <priority>1.0</priority>
     </url>
 
     <url>
         <loc>https://audiomasterlab.com/audio</loc>
-        <lastmod>2026-06-21</lastmod>
+        <lastmod>2026-06-28</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.95</priority>
     </url>
+
     <url>
         <loc>https://audiomasterlab.com/editor</loc>
-        <lastmod>2026-06-21</lastmod>
+        <lastmod>2026-06-28</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.95</priority>
+    </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/youtube</loc>
+        <lastmod>2026-06-28</lastmod>
+        <changefreq>weekly</changefreq>
+        <priority>0.90</priority>
     </url>
 </urlset>
