@@ -3,165 +3,341 @@
 <head>
   <meta charset="utf-8" />
 
-  <!-- Core responsive setup -->
+  <!-- Basic mobile / browser setup -->
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#070a13" />
+  <meta name="theme-color" content="#050816" />
   <meta name="color-scheme" content="dark light" />
 
   <!-- Primary SEO -->
-  <title>AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool</title>
-
+  <title>CloudCord Voice | Free Voice Chat Rooms, VoIP, AWS & Automation Support</title>
   <meta
           name="description"
-          content="AudioMaster Lab is a free browser-based audio editor, mixing tool, mastering tool, waveform visualizer, WAV renderer, and YouTube browsing playlist player with loop, auto-play, search, and playlist controls."
+          content="CloudCord Voice provides free browser voice chat rooms with webcam support, plus flat-rate technical projects for VoIP setup, AWS support, Freshservice workflows, Node/Python automation, network troubleshooting, and business support handoff."
   />
-
   <meta
           name="keywords"
-          content="AudioMaster Lab, free audio editor, free audio mastering, free mixing tool, online audio editor, browser audio editor, WebAudio API, waveform visualizer, frequency spectrum, WAV renderer, online mastering tool, EQ, compressor, reverb, delay, de-esser, audio timeline editor, YouTube playlist tool, YouTube browser, YouTube loop tool, YouTube playlist player, YouTube autoplay, free YouTube music browser"
+          content="CloudCord Voice, free voice chat, free voice rooms, browser voice chat, webcam rooms, WebRTC voice chat, group video call, VoIP setup, AWS support, Freshservice workflows, Node.js automation, Python automation, network troubleshooting, Teams Phone, Zoom Phone, Google Voice, Route 53, EC2, S3, RDS"
   />
+  <meta name="author" content="CloudCord Voice" />
+  <meta name="robots" content="index, follow" />
+  <meta name="application-name" content="CloudCord Voice" />
 
-  <meta name="author" content="AudioMaster Lab" />
-  <meta name="application-name" content="AudioMaster Lab" />
-  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+  <!-- Canonical -->
+  <link rel="canonical" href="https://cloud-cord.com/" />
 
-  <!-- Canonical URL -->
-  <link rel="canonical" href="https://audiomasterlab.com/" />
-
-  <!-- Favicons / app icons -->
+  <!-- App icons -->
   <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
   <link rel="shortcut icon" href="%PUBLIC_URL%/favicon.ico" />
   <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
   <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
 
+  <!-- Homepage image hints -->
+  <link rel="preload" as="image" href="%PUBLIC_URL%/voip-stock1.webp" />
+  <link rel="prefetch" as="image" href="%PUBLIC_URL%/voip-stock2.webp" />
+
   <!-- Open Graph / social preview -->
   <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="AudioMaster Lab" />
-
+  <meta property="og:site_name" content="CloudCord Voice" />
+  <meta property="og:url" content="https://cloud-cord.com/" />
   <meta
           property="og:title"
-          content="AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool"
+          content="CloudCord Voice | Free Voice Chat Rooms, VoIP, AWS & Automation Support"
   />
-
   <meta
           property="og:description"
-          content="Edit, mix, master, visualize, and render audio in your browser. Browse YouTube, build playlists, loop tracks, auto-play the next song, and use playlist controls for free."
+          content="Create free browser voice chat rooms with webcam support, then explore flat-rate VoIP, AWS, automation, support workflow, and network troubleshooting services."
   />
+  <meta property="og:image" content="%PUBLIC_URL%/logo512.png" />
+  <meta property="og:image:alt" content="CloudCord Voice logo" />
 
-  <meta property="og:url" content="https://audiomasterlab.com/" />
-  <meta property="og:image" content="https://audiomasterlab.com/social-preview.png" />
-
-  <meta
-          property="og:image:alt"
-          content="AudioMaster Lab free browser audio editor with waveform tools, mastering effects, and YouTube playlist controls"
-  />
-
-  <!-- Twitter / X preview -->
+  <!-- Twitter / X card -->
   <meta name="twitter:card" content="summary_large_image" />
-
   <meta
           name="twitter:title"
-          content="AudioMaster Lab | Free Audio Editor, Mixing, Mastering & YouTube Playlist Tool"
+          content="CloudCord Voice | Free Voice Chat Rooms & Technical Support Projects"
   />
-
   <meta
           name="twitter:description"
-          content="A free WebAudio editor and mastering lab with waveform editing, effects, WAV export, plus a YouTube browser with playlists, looping, and auto-play controls."
+          content="Free browser voice rooms with webcam support plus fixed-scope technical projects for VoIP setup, AWS support, Freshservice workflows, automation, diagnostics, and handoff documentation."
   />
+  <meta name="twitter:image" content="%PUBLIC_URL%/logo512.png" />
+  <meta name="twitter:image:alt" content="CloudCord Voice logo" />
 
-  <meta name="twitter:image" content="https://audiomasterlab.com/social-preview.png" />
-
-  <!-- PWA / mobile polish -->
-  <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-title" content="AudioMaster Lab" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-
-  <!-- Google AdSense -->
-  <script
-          async
-          src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7468131499712645"
-          crossorigin="anonymous"
-  ></script>
-
-  <!-- Structured data: main app -->
+  <!-- Business structured data -->
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
-      "@type": "SoftwareApplication",
-      "name": "AudioMaster Lab",
-      "alternateName": [
-        "Free Audio Editor",
-        "Free Audio Mastering Tool",
-        "YouTube Playlist Tool"
+      "@type": "ProfessionalService",
+      "name": "CloudCord Voice",
+      "url": "https://cloud-cord.com/",
+      "description": "CloudCord Voice provides free browser voice chat rooms with webcam support, plus flat-rate technical projects for VoIP setup, AWS support, Freshservice workflows, Node/Python automation, network troubleshooting, and business support handoff.",
+      "email": "cloudcordvoice@protonmail.com",
+      "areaServed": "United States",
+      "serviceType": [
+        "Free browser voice chat rooms",
+        "WebRTC webcam rooms",
+        "Group voice chat",
+        "VoIP setup",
+        "AWS support",
+        "Freshservice workflows",
+        "Node.js automation",
+        "Python automation",
+        "Network troubleshooting",
+        "Technical handoff documentation"
       ],
-      "applicationCategory": "MultimediaApplication",
-      "applicationSubCategory": "Audio editing, audio mastering, mixing, waveform editing, and YouTube playlist playback",
-      "operatingSystem": "Web Browser",
-      "url": "https://audiomasterlab.com/",
-      "image": "https://audiomasterlab.com/social-preview.png",
-      "description": "AudioMaster Lab is a free browser-based audio editor, mixing tool, mastering tool, waveform visualizer, WAV renderer, and YouTube playlist browser with loop, auto-play, search, and playlist controls.",
-      "isAccessibleForFree": true,
-      "browserRequirements": "Requires JavaScript and a modern browser with WebAudio support.",
-      "offers": {
-        "@type": "Offer",
-        "price": "0",
-        "priceCurrency": "USD",
-        "availability": "https://schema.org/InStock"
-      },
-      "featureList": [
-        "Free browser-based audio editor",
-        "Free mixing and mastering tools",
-        "Audio file decoding",
-        "Timeline audio editing",
-        "Waveform visualization",
-        "Frequency spectrum visualization",
-        "Base volume control",
-        "Stereo panning",
-        "EQ filters",
-        "Compression",
-        "De-essing",
-        "Delay and feedback",
-        "Convolution reverb",
-        "Effect blocks",
-        "Processed WAV export",
-        "YouTube browsing",
-        "YouTube search",
-        "YouTube playlist creation",
-        "YouTube playlist playback",
-        "Loop controls",
-        "Auto-play next track",
-        "Play videos without adding them to a playlist"
+      "sameAs": [
+        "https://cloud-cord.com/"
       ]
     }
   </script>
 
-  <!-- Structured data: website -->
+  <!-- Software / web app structured data for voice rooms -->
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
-      "@type": "WebSite",
-      "name": "AudioMaster Lab",
-      "url": "https://audiomasterlab.com/",
-      "description": "A free web app for audio editing, mixing, mastering, waveform visualization, WAV rendering, and YouTube playlist browsing.",
-      "inLanguage": "en-US",
-      "publisher": {
-        "@type": "Organization",
-        "name": "AudioMaster Lab",
-        "url": "https://audiomasterlab.com/"
-      }
+      "@type": "WebApplication",
+      "name": "CloudCord Voice Rooms",
+      "url": "https://cloud-cord.com/voice-call",
+      "applicationCategory": "CommunicationApplication",
+      "operatingSystem": "Web browser",
+      "description": "CloudCord Voice Rooms lets users create free browser-based voice and webcam rooms with shareable links for group calling.",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "Free voice chat rooms",
+        "Shareable room links",
+        "Webcam support",
+        "Microphone mute controls",
+        "Camera controls",
+        "Group call tiles",
+        "Browser-based WebRTC calling"
+      ]
     }
   </script>
 </head>
 
 <body>
 <noscript>
-  <strong>AudioMaster Lab requires JavaScript.</strong>
-  This free browser-based audio editor, mixing tool, mastering tool, waveform
-  visualizer, WAV renderer, and YouTube playlist browser uses JavaScript,
-  React, and the WebAudio API. Please enable JavaScript to edit audio,
-  process effects, export WAV files, browse YouTube, create playlists, loop
-  tracks, and use auto-play controls.
+  <section
+          style="
+      min-height: 100vh;
+      padding: 48px 20px;
+      background: #050816;
+      color: #f8fafc;
+      font-family: Arial, Helvetica, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    "
+  >
+    <main
+            style="
+        width: 100%;
+        max-width: 1080px;
+        padding: 34px;
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 24px;
+        background: #0f172a;
+      "
+    >
+      <p
+              style="
+          margin: 0 0 12px;
+          color: #7dd3fc;
+          font-size: 14px;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        "
+      >
+        CloudCord Voice
+      </p>
+
+      <h1
+              style="
+          margin: 0 0 16px;
+          color: #ffffff;
+          font-size: 38px;
+          line-height: 1.08;
+        "
+      >
+        Free browser voice rooms plus flat-rate VoIP, AWS, automation, and network troubleshooting projects.
+      </h1>
+
+      <p
+              style="
+          margin: 0 0 24px;
+          color: #cbd5e1;
+          font-size: 18px;
+          line-height: 1.7;
+        "
+      >
+        CloudCord Voice includes free browser-based voice chat rooms with webcam support,
+        shareable room links, group call tiles, microphone controls, and camera controls.
+        CloudCord Voice also helps small businesses complete fixed-scope technical projects:
+        business phone setup, AWS service support, Freshservice workflows, Microsoft 365
+        support, Slack and calendar workflow setup, Node/Python automation, DNS review,
+        firewall/NAT troubleshooting, packet capture basics, Wireshark review, and project
+        handoff documentation.
+      </p>
+
+      <div
+              style="
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+          gap: 14px;
+          margin: 0 0 28px;
+        "
+      >
+        <article
+                style="
+            padding: 16px;
+            border: 1px solid rgba(125,211,252,0.22);
+            border-radius: 16px;
+            background: #020617;
+          "
+        >
+          <h2 style="margin: 0 0 8px; font-size: 18px; color: #ffffff;">
+            Free Voice Rooms
+          </h2>
+          <p style="margin: 0; color: #cbd5e1; line-height: 1.6;">
+            Create a room link, share it with other people, and join a browser-based
+            voice room with microphone, webcam, and group call tile support.
+          </p>
+        </article>
+
+        <article
+                style="
+            padding: 16px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            background: #111827;
+          "
+        >
+          <h2 style="margin: 0 0 8px; font-size: 18px; color: #ffffff;">
+            VoIP Setup
+          </h2>
+          <p style="margin: 0; color: #cbd5e1; line-height: 1.6;">
+            Microsoft Teams Phone, Zoom Phone, Google Voice, call routing, voicemail,
+            business hours, forwarding, and phone-system handoff notes.
+          </p>
+        </article>
+
+        <article
+                style="
+            padding: 16px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            background: #111827;
+          "
+        >
+          <h2 style="margin: 0 0 8px; font-size: 18px; color: #ffffff;">
+            AWS Support
+          </h2>
+          <p style="margin: 0; color: #cbd5e1; line-height: 1.6;">
+            EC2, S3, RDS, Route 53, Amplify, Elastic Beanstalk, PostgreSQL, DNS,
+            deployment review, and cloud handoff documentation.
+          </p>
+        </article>
+
+        <article
+                style="
+            padding: 16px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            background: #111827;
+          "
+        >
+          <h2 style="margin: 0 0 8px; font-size: 18px; color: #ffffff;">
+            Support Workflows
+          </h2>
+          <p style="margin: 0; color: #cbd5e1; line-height: 1.6;">
+            Freshservice categories, statuses, intake flow, assignment rules,
+            escalation paths, Microsoft 365, Slack, Google Calendar, and Outlook Calendar.
+          </p>
+        </article>
+
+        <article
+                style="
+            padding: 16px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 16px;
+            background: #111827;
+          "
+        >
+          <h2 style="margin: 0 0 8px; font-size: 18px; color: #ffffff;">
+            Automation & Diagnostics
+          </h2>
+          <p style="margin: 0; color: #cbd5e1; line-height: 1.6;">
+            Node.js scripts, Python scripts, webhooks, forms, reports, dashboards,
+            DNS checks, firewall rules, NAT behavior, ping, traceroute, and packet capture basics.
+          </p>
+        </article>
+      </div>
+
+      <section
+              style="
+          padding: 18px;
+          border-radius: 18px;
+          background: #020617;
+          border: 1px solid rgba(125,211,252,0.22);
+          margin-bottom: 24px;
+        "
+      >
+        <h2 style="margin: 0 0 10px; color: #ffffff; font-size: 22px;">
+          JavaScript is required for free voice rooms and the full website.
+        </h2>
+
+        <p style="margin: 0; color: #cbd5e1; line-height: 1.7;">
+          The full CloudCord Voice website uses JavaScript for page routing, service pages,
+          project pages, the contact form, and browser voice rooms. Please enable JavaScript
+          to create or join voice chat rooms, use webcam calling, and view the complete
+          interactive site. You can still contact us directly by email below.
+        </p>
+      </section>
+
+      <nav
+              aria-label="CloudCord Voice fallback navigation"
+              style="
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-bottom: 24px;
+        "
+      >
+        <a href="/" style="color: #7dd3fc; font-weight: 700;">Home</a>
+        <a href="/about" style="color: #7dd3fc; font-weight: 700;">About</a>
+        <a href="/services" style="color: #7dd3fc; font-weight: 700;">Services</a>
+        <a href="/projects" style="color: #7dd3fc; font-weight: 700;">Projects</a>
+        <a href="/voice-call" style="color: #7dd3fc; font-weight: 700;">Free Voice Rooms</a>
+        <a href="/contact" style="color: #7dd3fc; font-weight: 700;">Contact</a>
+        <a href="/sitemap.xml" style="color: #7dd3fc; font-weight: 700;">Sitemap</a>
+      </nav>
+
+      <p style="margin: 0 0 14px; color: #cbd5e1; line-height: 1.7;">
+        Need help with VoIP setup, AWS support, Freshservice workflows, automation,
+        or network troubleshooting?
+      </p>
+
+      <a
+              href="mailto:cloudcordvoice@protonmail.com"
+              style="
+          display: inline-block;
+          padding: 13px 18px;
+          border-radius: 12px;
+          background: #7c4dff;
+          color: #ffffff;
+          text-decoration: none;
+          font-weight: 700;
+        "
+      >
+        Email cloudcordvoice@protonmail.com
+      </a>
+    </main>
+  </section>
 </noscript>
 
 <div id="root"></div>
