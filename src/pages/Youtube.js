@@ -39,6 +39,7 @@ import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import ShuffleRoundedIcon from "@mui/icons-material/ShuffleRounded";
 import OpenWithRoundedIcon from "@mui/icons-material/OpenWithRounded";
 import AspectRatioRoundedIcon from "@mui/icons-material/AspectRatioRounded";
+import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
 
 import { Helmet } from "react-helmet-async";
 
@@ -333,6 +334,7 @@ export default function YoutubePage() {
     const playerContainerRef = useRef(null);
     const playerShellRef = useRef(null);
     const loadMoreSentinelRef = useRef(null);
+    const wakeLockRef = useRef(null);
 
     const playlistRef = useRef([]);
     const selectedVideoRef = useRef(null);
@@ -343,6 +345,7 @@ export default function YoutubePage() {
     const nextPageTokenRef = useRef("");
     const loadingMoreRef = useRef(false);
     const queryRef = useRef("");
+    const keepAwakeWantedRef = useRef(false);
 
     const [query, setQuery] = useState("");
     const [urlInput, setUrlInput] = useState("");
@@ -359,6 +362,8 @@ export default function YoutubePage() {
     const [repeatVideo, setRepeatVideo] = useState(false);
     const [loopPlaylist, setLoopPlaylist] = useState(true);
     const [autoLoadMore, setAutoLoadMore] = useState(true);
+    const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(false);
+    const [keepAwakeSupported, setKeepAwakeSupported] = useState(false);
 
     const [status, setStatus] = useState(
         "Search YouTube or paste a YouTube link. Browse mode plays search results. Playlist mode plays your saved queue."
@@ -518,6 +523,139 @@ export default function YoutubePage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [autoLoadMore, videos.length, nextPageToken]);
 
+    useEffect(() => {
+        setKeepAwakeSupported(typeof navigator !== "undefined" && "wakeLock" in navigator);
+    }, []);
+
+    useEffect(() => {
+        async function handleVisibilityChange() {
+            if (
+                document.visibilityState === "visible" &&
+                keepAwakeWantedRef.current &&
+                !wakeLockRef.current
+            ) {
+                await requestScreenWakeLock();
+            }
+        }
+
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+
+        return () => {
+            document.removeEventListener("visibilitychange", handleVisibilityChange);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            keepAwakeWantedRef.current = false;
+
+            try {
+                wakeLockRef.current?.release?.();
+            } catch {
+                // Safe cleanup.
+            }
+        };
+    }, []);
+
+    async function requestScreenWakeLock() {
+        if (typeof navigator === "undefined" || !("wakeLock" in navigator)) {
+            keepAwakeWantedRef.current = false;
+            wakeLockRef.current = null;
+            setKeepAwakeEnabled(false);
+            setStatus("No dim mode is not supported in this browser. On iPhone, try Safari and keep the tab visible.");
+            return false;
+        }
+
+        if (document.visibilityState !== "visible") {
+            setStatus("No dim mode can only start while this tab is visible.");
+            return false;
+        }
+
+        if (wakeLockRef.current) {
+            setKeepAwakeEnabled(true);
+            return true;
+        }
+
+        try {
+            const lock = await navigator.wakeLock.request("screen");
+
+            wakeLockRef.current = lock;
+            keepAwakeWantedRef.current = true;
+            setKeepAwakeEnabled(true);
+            setStatus("No dim mode is on. Keep this tab visible and your phone should stay awake while YouTube plays.");
+
+            lock.addEventListener("release", () => {
+                if (wakeLockRef.current === lock) {
+                    wakeLockRef.current = null;
+                }
+
+                setKeepAwakeEnabled(false);
+
+                if (keepAwakeWantedRef.current && document.visibilityState === "visible") {
+                    setStatus("No dim mode was released by the browser or system. Tap the toggle again if the screen starts dimming.");
+                }
+            });
+
+            return true;
+        } catch (error) {
+            wakeLockRef.current = null;
+            keepAwakeWantedRef.current = false;
+            setKeepAwakeEnabled(false);
+            setStatus(
+                `No dim mode could not start: ${error?.name || "Error"}${
+                    error?.message ? ` - ${error.message}` : ""
+                }`
+            );
+            return false;
+        }
+    }
+
+    async function releaseScreenWakeLock(showMessage = true) {
+        keepAwakeWantedRef.current = false;
+
+        try {
+            await wakeLockRef.current?.release?.();
+        } catch {
+            // Safe cleanup.
+        }
+
+        wakeLockRef.current = null;
+        setKeepAwakeEnabled(false);
+
+        if (showMessage) {
+            setStatus("No dim mode is off. Your phone may dim or auto-lock normally.");
+        }
+    }
+
+    async function toggleScreenWakeLock() {
+        if (wakeLockRef.current || keepAwakeEnabled) {
+            await releaseScreenWakeLock(true);
+            return;
+        }
+
+        keepAwakeWantedRef.current = true;
+        await requestScreenWakeLock();
+    }
+
+    function applyIframePlaybackPermissions(player) {
+        try {
+            const iframe = player?.getIframe?.();
+
+            if (!iframe) return;
+
+            iframe.setAttribute(
+                "allow",
+                "autoplay; encrypted-media; fullscreen; picture-in-picture"
+            );
+            iframe.setAttribute("allowfullscreen", "true");
+            iframe.setAttribute("webkitallowfullscreen", "true");
+            iframe.setAttribute("mozallowfullscreen", "true");
+        } catch {
+            // Some embedded states do not expose the iframe immediately.
+        }
+    }
+
     function startPlayerResize(event) {
         event.preventDefault();
 
@@ -560,6 +698,8 @@ export default function YoutubePage() {
         }
 
         if (playerRef.current) {
+            applyIframePlaybackPermissions(playerRef.current);
+
             if (shouldPlay) {
                 playerRef.current.loadVideoById(videoId);
             } else {
@@ -575,11 +715,16 @@ export default function YoutubePage() {
             videoId,
             playerVars: {
                 playsinline: 1,
+                controls: 1,
                 rel: 0,
                 modestbranding: 1,
+                enablejsapi: 1,
+                origin: window.location.origin,
             },
             events: {
                 onReady: (event) => {
+                    applyIframePlaybackPermissions(event.target);
+
                     if (shouldPlay) {
                         event.target.playVideo();
                     }
@@ -588,6 +733,9 @@ export default function YoutubePage() {
                     if (event.data === window.YT.PlayerState.ENDED) {
                         handleVideoEnded(event.target);
                     }
+                },
+                onAutoplayBlocked: () => {
+                    setStatus("Playback was blocked by the browser. Tap Play on the YouTube player once, then try again.");
                 },
             },
         });
@@ -1186,7 +1334,7 @@ export default function YoutubePage() {
                 <title>YouTube Browser</title>
                 <meta
                     name="description"
-                    content="Browse YouTube results with endless loading, create manual or auto YouTube playlists from one query or multiple pipe-delimited queries, and choose whether AudioMaster Lab plays browsing results or your playlist through the official YouTube embed player."
+                    content="Browse YouTube results with endless loading, create manual or auto YouTube playlists from one query or multiple pipe-delimited queries, keep the screen awake with No Dim mode, and choose whether AudioMaster Lab plays browsing results or your playlist through the official YouTube embed player."
                 />
             </Helmet>
 
@@ -1236,8 +1384,9 @@ export default function YoutubePage() {
                             >
                                 Search YouTube, scroll to load more results, save videos into a
                                 local playlist, or auto-build a mixed playlist from your query.
-                                Use a vertical bar to mix artists or topics, like Playboi Carti |
-                                Trippie Redd. Videos play through the official YouTube embed player only.
+                                Turn on No Dim mode to request a screen wake lock so phones stay
+                                awake while this tab remains visible. Videos play through the
+                                official YouTube embed player only.
                             </Typography>
                         </Box>
 
@@ -1252,6 +1401,60 @@ export default function YoutubePage() {
                         >
                             <CardContent sx={{ p: { xs: 2.5, md: 3.2 } }}>
                                 <Stack spacing={2.5}>
+                                    <Box
+                                        sx={{
+                                            display: "grid",
+                                            gridTemplateColumns: { xs: "1fr", lg: "1fr auto" },
+                                            gap: 1.5,
+                                            alignItems: "center",
+                                            p: 1.5,
+                                            borderRadius: 4,
+                                            background: keepAwakeEnabled
+                                                ? "linear-gradient(135deg, rgba(103,232,249,0.13), rgba(167,139,250,0.12))"
+                                                : "rgba(255,255,255,0.045)",
+                                            border: keepAwakeEnabled
+                                                ? "1px solid rgba(103,232,249,0.24)"
+                                                : "1px solid rgba(255,255,255,0.09)",
+                                        }}
+                                    >
+                                        <Box>
+                                            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.7 }}>
+                                                <LightModeRoundedIcon
+                                                    sx={{
+                                                        color: keepAwakeEnabled
+                                                            ? "#67e8f9"
+                                                            : "rgba(255,255,255,0.54)",
+                                                    }}
+                                                />
+                                                <Typography sx={{ fontWeight: 950 }}>
+                                                    No Dim mode
+                                                </Typography>
+                                            </Stack>
+
+                                            <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.6 }}>
+                                                Keeps the screen awake while this page stays open and visible. It cannot
+                                                override a manual lock button press, backgrounded apps, low-power mode, or
+                                                YouTube/iOS lock-screen playback rules.
+                                            </Typography>
+                                        </Box>
+
+                                        <Stack direction="row" alignItems="center" spacing={1.2} justifyContent={{ xs: "space-between", lg: "flex-end" }}>
+                                            <Typography sx={{ fontWeight: 900, color: keepAwakeSupported ? "#fff" : "rgba(255,255,255,0.52)" }}>
+                                                {keepAwakeSupported
+                                                    ? keepAwakeEnabled
+                                                        ? "Screen awake"
+                                                        : "Keep screen on"
+                                                    : "Not supported"}
+                                            </Typography>
+
+                                            <Switch
+                                                checked={keepAwakeEnabled}
+                                                disabled={!keepAwakeSupported}
+                                                onChange={toggleScreenWakeLock}
+                                            />
+                                        </Stack>
+                                    </Box>
+
                                     <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
                                         <TextField
                                             fullWidth
@@ -1512,6 +1715,60 @@ export default function YoutubePage() {
                                         </Stack>
                                     </Box>
 
+                                    <Box
+                                        sx={{
+                                            display: "grid",
+                                            gridTemplateColumns: { xs: "1fr", lg: "1fr auto" },
+                                            gap: 1.5,
+                                            alignItems: "center",
+                                            p: 1.5,
+                                            borderRadius: 4,
+                                            background: keepAwakeEnabled
+                                                ? "linear-gradient(135deg, rgba(103,232,249,0.13), rgba(167,139,250,0.12))"
+                                                : "rgba(255,255,255,0.045)",
+                                            border: keepAwakeEnabled
+                                                ? "1px solid rgba(103,232,249,0.24)"
+                                                : "1px solid rgba(255,255,255,0.09)",
+                                        }}
+                                    >
+                                        <Box>
+                                            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.7 }}>
+                                                <LightModeRoundedIcon
+                                                    sx={{
+                                                        color: keepAwakeEnabled
+                                                            ? "#67e8f9"
+                                                            : "rgba(255,255,255,0.54)",
+                                                    }}
+                                                />
+                                                <Typography sx={{ fontWeight: 950 }}>
+                                                    No Dim mode
+                                                </Typography>
+                                            </Stack>
+
+                                            <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.6 }}>
+                                                Keeps the screen awake while this page stays open and visible. It cannot
+                                                override a manual lock button press, backgrounded apps, low-power mode, or
+                                                YouTube/iOS lock-screen playback rules.
+                                            </Typography>
+                                        </Box>
+
+                                        <Stack direction="row" alignItems="center" spacing={1.2} justifyContent={{ xs: "space-between", lg: "flex-end" }}>
+                                            <Typography sx={{ fontWeight: 900, color: keepAwakeSupported ? "#fff" : "rgba(255,255,255,0.52)" }}>
+                                                {keepAwakeSupported
+                                                    ? keepAwakeEnabled
+                                                        ? "Screen awake"
+                                                        : "Keep screen on"
+                                                    : "Not supported"}
+                                            </Typography>
+
+                                            <Switch
+                                                checked={keepAwakeEnabled}
+                                                disabled={!keepAwakeSupported}
+                                                onChange={toggleScreenWakeLock}
+                                            />
+                                        </Stack>
+                                    </Box>
+
                                     <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
                                         <TextField
                                             fullWidth
@@ -1666,6 +1923,24 @@ export default function YoutubePage() {
                                                 onChange={(event) =>
                                                     setAutoLoadMore(event.target.checked)
                                                 }
+                                            />
+                                        </Stack>
+
+                                        <Stack direction="row" alignItems="center" spacing={1}>
+                                            <LightModeRoundedIcon
+                                                sx={{
+                                                    color: keepAwakeEnabled
+                                                        ? "#67e8f9"
+                                                        : "rgba(255,255,255,0.45)",
+                                                }}
+                                            />
+                                            <Typography sx={{ fontWeight: 900 }}>
+                                                No dim / screen awake
+                                            </Typography>
+                                            <Switch
+                                                checked={keepAwakeEnabled}
+                                                disabled={!keepAwakeSupported}
+                                                onChange={toggleScreenWakeLock}
                                             />
                                         </Stack>
                                     </Stack>
