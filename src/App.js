@@ -8,7 +8,9 @@ import { NavBar } from "./components/Components.js";
 import Home from "./pages/Home.js";
 import Audio from "./pages/Audio.js";
 import Editor from "./pages/Editor.js";
-
+import Recorder from "./pages/Recorder.js";
+import Transcripe from "./pages/Transcripe.js";
+import ArchiveAudioBrowser from "./pages/Archive";
 const theme = createTheme({
   palette: {
     mode: "dark",
@@ -48,11 +50,11 @@ export default function App() {
           <meta name="application-name" content="AudioMaster Lab" />
           <meta
               name="description"
-              content="AudioMaster Lab is a browser-based WebAudio mastering and timeline editing tool with waveform visualization, frequency spectrum analysis, drawable effect blocks, EQ, compression, delay, reverb, panning, de-essing, and WAV export."
+              content="AudioMaster Lab is a browser-based WebAudio mastering and timeline editing tool with waveform visualization, frequency spectrum analysis, drawable effect blocks, EQ, compression, delay, reverb, panning, de-essing, recording, and WAV export."
           />
           <meta
               name="keywords"
-              content="AudioMaster Lab, WebAudio mastering, online audio editor, waveform editor, timeline audio editor, frequency spectrum, WAV export, browser audio mixer"
+              content="AudioMaster Lab, WebAudio mastering, online audio editor, waveform editor, timeline audio editor, browser audio recorder, WAV export, MP3 export, browser audio mixer"
           />
           <meta property="og:site_name" content="AudioMaster Lab" />
           <meta property="og:type" content="website" />
@@ -69,9 +71,12 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<Home />} />
                 <Route path="/audio" element={<Audio />} />
+                <Route path="/recorder" element={<Recorder />} />
                 <Route path="/editor" element={<Editor />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
                 <Route path="/youtube" element={<YoutubePage />} />
+                <Route path="/transcripe" element={<Transcripe />} />
+                <Route path="/archive" element={<ArchiveAudioBrowser />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>
             </Box>
           </BrowserRouter>

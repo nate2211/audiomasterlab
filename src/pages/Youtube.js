@@ -1,8 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
-    Accordion,
-    AccordionDetails,
-    AccordionSummary,
     Box,
     Button,
     Card,
@@ -15,6 +12,8 @@ import {
     DialogContent,
     DialogTitle,
     Divider,
+    Drawer,
+    Alert,
     IconButton,
     LinearProgress,
     Slider,
@@ -35,16 +34,16 @@ import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import SkipNextRoundedIcon from "@mui/icons-material/SkipNextRounded";
 import OpenInNewRoundedIcon from "@mui/icons-material/OpenInNewRounded";
 import TravelExploreRoundedIcon from "@mui/icons-material/TravelExploreRounded";
-import ViewListRoundedIcon from "@mui/icons-material/ViewListRounded";
 import RadioButtonCheckedRoundedIcon from "@mui/icons-material/RadioButtonCheckedRounded";
 import HelpOutlineRoundedIcon from "@mui/icons-material/HelpOutlineRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import ShuffleRoundedIcon from "@mui/icons-material/ShuffleRounded";
 import OpenWithRoundedIcon from "@mui/icons-material/OpenWithRounded";
-import AspectRatioRoundedIcon from "@mui/icons-material/AspectRatioRounded";
-import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
-import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import RecommendRoundedIcon from "@mui/icons-material/RecommendRounded";
+import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
+import LinkRoundedIcon from "@mui/icons-material/LinkRounded";
+import ClearAllRoundedIcon from "@mui/icons-material/ClearAllRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 import { Helmet } from "react-helmet-async";
 
@@ -57,6 +56,12 @@ const SAVED_RECOMMENDATION_QUERIES_COOKIE = "aml_youtube_saved_queries";
 const SAVED_RECOMMENDATIONS_TOGGLE_COOKIE = "aml_youtube_use_saved_query_recommendations";
 const MAX_SAVED_RECOMMENDATION_QUERIES = 18;
 const SAVED_RECOMMENDED_PER_QUERY = 10;
+const ORGANIC_INTERESTS_TOGGLE_COOKIE = "aml_youtube_use_local_interest_discovery";
+const INTEREST_PROFILE_KEY = "aml_youtube_interest_profile_v2";
+const MAX_INTEREST_QUERIES = 24;
+const ORGANIC_INTEREST_SEARCH_LIMIT = 8;
+const PLAYLIST_PAGE_SIZE = 50;
+const PLAYLIST_MAX_PAGES = 4;
 
 
 function getCookieValue(name) {
@@ -209,6 +214,189 @@ function extractVideoId(value) {
     return "";
 }
 
+
+function parseYouTubeTime(value) {
+    if (!value) return 0;
+
+    const raw = String(value).toLowerCase().trim();
+
+    if (/^\d+$/.test(raw)) {
+        return Number(raw);
+    }
+
+    const hours = Number(raw.match(/(\d+)h/)?.[1] || 0);
+    const minutes = Number(raw.match(/(\d+)m/)?.[1] || 0);
+    const seconds = Number(raw.match(/(\d+)s/)?.[1] || 0);
+
+    return hours * 3600 + minutes * 60 + seconds;
+}
+
+function parseYouTubeInput(value) {
+    const clean = String(value || "").trim();
+
+    if (!clean) {
+        return { type: "empty" };
+    }
+
+    const urls = clean.match(/https?:\/\/[^\s]+/gi) || [];
+
+    if (urls.length > 1) {
+        return {
+            type: "videoList",
+            videoIds: urls.map(extractVideoId).filter(Boolean),
+            rawUrls: urls,
+        };
+    }
+
+    try {
+        const url = new URL(clean);
+        const host = url.hostname.toLowerCase().replace(/^www\./, "");
+        const isYouTube =
+            host === "youtube.com" ||
+            host === "m.youtube.com" ||
+            host === "music.youtube.com" ||
+            host === "youtu.be" ||
+            host.endsWith(".youtube.com");
+
+        if (!isYouTube) {
+            return { type: "search", query: clean };
+        }
+
+        const playlistId = url.searchParams.get("list") || "";
+        const videoId = extractVideoId(clean);
+        const startSeconds = parseYouTubeTime(
+            url.searchParams.get("t") || url.searchParams.get("start") || ""
+        );
+
+        if (playlistId && videoId) {
+            return { type: "videoInPlaylist", videoId, playlistId, startSeconds };
+        }
+
+        if (playlistId) {
+            return { type: "playlist", playlistId };
+        }
+
+        if (videoId) {
+            return { type: "video", videoId, startSeconds };
+        }
+
+        return { type: "search", query: clean };
+    } catch {
+        const videoId = extractVideoId(clean);
+
+        if (videoId) {
+            return { type: "video", videoId, startSeconds: 0 };
+        }
+
+        return { type: "search", query: clean };
+    }
+}
+
+function readInterestProfile() {
+    if (typeof window === "undefined" || !window.localStorage) return {};
+
+    try {
+        const parsed = JSON.parse(window.localStorage.getItem(INTEREST_PROFILE_KEY) || "{}");
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function writeInterestProfile(profile) {
+    if (typeof window === "undefined" || !window.localStorage) return;
+
+    try {
+        window.localStorage.setItem(INTEREST_PROFILE_KEY, JSON.stringify(profile || {}));
+    } catch {
+        // localStorage can fail in private browsing or restricted contexts.
+    }
+}
+
+function clearLocalInterestProfile() {
+    if (typeof window === "undefined" || !window.localStorage) return;
+
+    try {
+        window.localStorage.removeItem(INTEREST_PROFILE_KEY);
+    } catch {
+        // Safe cleanup.
+    }
+}
+
+function normalizeInterestTopic(topic) {
+    const withoutControlCharacters = String(topic || "")
+        .split("")
+        .map((character) => (character.charCodeAt(0) < 32 ? " " : character))
+        .join("");
+
+    return withoutControlCharacters
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 96);
+}
+
+function addInterestSignal(topic, weight = 1) {
+    const clean = normalizeInterestTopic(topic);
+    const key = clean.toLowerCase();
+
+    if (!clean || key.length < 2) return;
+
+    const profile = readInterestProfile();
+    const current = profile[key] || {
+        label: clean,
+        score: 0,
+        lastUsed: 0,
+    };
+
+    profile[key] = {
+        label: current.label || clean,
+        score: Math.min(100, Number(current.score || 0) + weight),
+        lastUsed: Date.now(),
+    };
+
+    writeInterestProfile(profile);
+}
+
+function getTopInterestQueries(limit = MAX_INTEREST_QUERIES) {
+    const profile = readInterestProfile();
+
+    return Object.entries(profile)
+        .map(([topic, data]) => ({
+            topic,
+            label: normalizeInterestTopic(data?.label || topic),
+            score: Number(data?.score || 0),
+            lastUsed: Number(data?.lastUsed || 0),
+        }))
+        .filter((item) => item.label && item.score > 0)
+        .sort((a, b) => b.score - a.score || b.lastUsed - a.lastUsed)
+        .slice(0, limit)
+        .map((item) => item.label);
+}
+
+function rememberVideoInterest(video, sourceQuery = "") {
+    const cleanSource = String(sourceQuery || "").trim();
+
+    if (cleanSource && cleanSource.toLowerCase() !== "direct link") {
+        splitAutoPlaylistQueries(cleanSource).forEach((part) => addInterestSignal(part, 3));
+    }
+
+    if (video?.channelTitle) {
+        addInterestSignal(video.channelTitle, 1.1);
+    }
+
+    if (video?.title) {
+        const titleWords = video.title
+            .replace(/&amp;/gi, " ")
+            .replace(/[^\w\s]/g, " ")
+            .split(/\s+/)
+            .map((word) => word.trim())
+            .filter((word) => word.length > 3 && !/^\d+$/.test(word))
+            .slice(0, 5);
+
+        titleWords.forEach((word) => addInterestSignal(word, 0.25));
+    }
+}
+
 function formatYoutubeDuration(value) {
     if (!value) return "";
 
@@ -247,6 +435,12 @@ function formatCount(value) {
     }
 
     return String(number);
+}
+
+function buildYoutubeWatchUrl(videoId) {
+    const cleanId = String(videoId || "").trim();
+
+    return cleanId ? `https://www.youtube.com/watch?v=${cleanId}` : "";
 }
 
 function buildFallbackVideo(videoId, title = "") {
@@ -451,6 +645,112 @@ async function fetchYoutubeRecommendedVideos(pageToken = "") {
 }
 
 
+
+async function fetchYoutubePlaylistItems(playlistId, pageToken = "") {
+    if (!YOUTUBE_API_KEY) {
+        throw new Error("Missing REACT_APP_YOUTUBE_API_KEY in your .env file.");
+    }
+
+    const cleanPlaylistId = String(playlistId || "").trim();
+
+    if (!cleanPlaylistId) {
+        throw new Error("Paste a valid YouTube playlist link or playlist ID.");
+    }
+
+    const url = new URL("https://www.googleapis.com/youtube/v3/playlistItems");
+
+    url.searchParams.set("part", "snippet,contentDetails");
+    url.searchParams.set("playlistId", cleanPlaylistId);
+    url.searchParams.set("maxResults", String(PLAYLIST_PAGE_SIZE));
+    url.searchParams.set("key", YOUTUBE_API_KEY);
+
+    if (pageToken) {
+        url.searchParams.set("pageToken", pageToken);
+    }
+
+    const response = await fetch(url.toString());
+
+    if (!response.ok) {
+        throw new Error(`YouTube playlist lookup failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const ids = (data.items || [])
+        .map((item) => item.contentDetails?.videoId || item.snippet?.resourceId?.videoId)
+        .filter(Boolean);
+
+    const videos = await fetchYoutubeVideoDetails(ids);
+
+    return {
+        videos,
+        nextPageToken: data.nextPageToken || "",
+        totalResults: data.pageInfo?.totalResults || 0,
+    };
+}
+
+async function fetchYoutubePlaylistVideos(playlistId, maxPages = PLAYLIST_MAX_PAGES) {
+    const videos = [];
+    let pageToken = "";
+    let totalResults = 0;
+
+    for (let page = 0; page < maxPages; page += 1) {
+        const result = await fetchYoutubePlaylistItems(playlistId, pageToken);
+        videos.push(...result.videos);
+        totalResults = result.totalResults || totalResults;
+        pageToken = result.nextPageToken || "";
+
+        if (!pageToken) {
+            break;
+        }
+    }
+
+    return {
+        videos: uniqueVideosById(videos),
+        nextPageToken: pageToken,
+        totalResults: totalResults || videos.length,
+    };
+}
+
+async function fetchOrganicInterestFeed(pageToken = "", append = false) {
+    const interestQueries = getTopInterestQueries(ORGANIC_INTEREST_SEARCH_LIMIT);
+
+    if (!interestQueries.length) {
+        return fetchYoutubeRecommendedVideos(pageToken);
+    }
+
+    const popular = await fetchYoutubeRecommendedVideos(pageToken);
+
+    if (append) {
+        return {
+            ...popular,
+            queryParts: interestQueries,
+            source: "popular-append",
+        };
+    }
+
+    const groups = await Promise.all(
+        interestQueries.map(async (interest) => {
+            const result = await fetchYoutubeVideosBySearch(interest, "");
+            return shuffleArray(result.videos).slice(0, 8);
+        })
+    );
+
+    const mixedInterestVideos = interleaveVideoGroups(groups, 42);
+    const videos = uniqueVideosById([
+        ...mixedInterestVideos,
+        ...popular.videos,
+    ]).slice(0, RECOMMENDED_PAGE_SIZE);
+
+    return {
+        videos,
+        nextPageToken: popular.nextPageToken || "",
+        prevPageToken: popular.prevPageToken || "",
+        totalResults: videos.length,
+        queryParts: interestQueries,
+        source: "local-interest-profile",
+    };
+}
+
 async function fetchYoutubeRecommendedVideosFromSavedQueries(savedQueries, perQueryLimit = SAVED_RECOMMENDED_PER_QUERY) {
     const cleanQueries = normalizeSavedRecommendationQueries(savedQueries);
 
@@ -520,10 +820,13 @@ export default function YoutubePage() {
     const loadingMoreRef = useRef(false);
     const activeQueryRef = useRef("");
     const keepAwakeWantedRef = useRef(false);
+    const useInterestDiscoveryRef = useRef(
+        readBooleanCookie(ORGANIC_INTERESTS_TOGGLE_COOKIE, true)
+    );
 
     const [query, setQuery] = useState("");
     const [activeQuery, setActiveQuery] = useState("");
-    const [urlInput, setUrlInput] = useState("");
+    // The old separate URL field is intentionally replaced by one smart input.
 
     const [videos, setVideos] = useState([]);
     const [recommendedVideos, setRecommendedVideos] = useState([]);
@@ -537,6 +840,11 @@ export default function YoutubePage() {
     const [savedRecommendationQueries, setSavedRecommendationQueries] = useState(() =>
         readSavedRecommendationQueries()
     );
+    const [useInterestDiscovery, setUseInterestDiscovery] = useState(() =>
+        readBooleanCookie(ORGANIC_INTERESTS_TOGGLE_COOKIE, true)
+    );
+    const [interestQueries, setInterestQueries] = useState(() => getTopInterestQueries(16));
+    const [settingsOpen, setSettingsOpen] = useState(false);
 
     const [selectedVideo, setSelectedVideo] = useState(null);
     const [playlist, setPlaylist] = useState([]);
@@ -568,7 +876,7 @@ export default function YoutubePage() {
     });
     const [theaterMode, setTheaterMode] = useState(false);
 
-    const [expandedSections, setExpandedSections] = useState({
+    const [, setExpandedSections] = useState({
         player: true,
         browse: true,
         playlist: false,
@@ -582,21 +890,29 @@ export default function YoutubePage() {
     const showingRecommendations = !activeQuery.trim();
     const savedQueryRecommendationsReady =
         useSavedQueryRecommendations && savedRecommendationQueries.length > 0;
+    const organicInterestReady =
+        useInterestDiscovery && !savedQueryRecommendationsReady && interestQueries.length > 0;
     const browseVideos = showingRecommendations ? recommendedVideos : videos;
     const browseNextPageToken = showingRecommendations ? recommendedNextPageToken : nextPageToken;
     const browseTitle = showingRecommendations
         ? savedQueryRecommendationsReady
-            ? "Recommended from saved queries"
-            : "Recommended videos"
+            ? "Discover from saved searches"
+            : organicInterestReady
+                ? "Discover from your interests"
+                : "Discover popular videos"
         : "Browse results";
     const browseSubtitle = showingRecommendations
         ? recommendedVideos.length
             ? savedQueryRecommendationsReady
                 ? `${recommendedVideos.length} videos mixed from ${savedRecommendationQueries.length} saved quer${savedRecommendationQueries.length === 1 ? "y" : "ies"}`
-                : `${recommendedVideos.length} real YouTube videos loaded${recommendedTotalResults ? ` / ${recommendedTotalResults} possible` : ""}`
+                : organicInterestReady
+                    ? `${recommendedVideos.length} videos mixed from local interests and YouTube popular videos`
+                    : `${recommendedVideos.length} real YouTube videos loaded${recommendedTotalResults ? ` / ${recommendedTotalResults} possible` : ""}`
             : savedQueryRecommendationsReady
                 ? "Saved-query recommendations appear here when there is no active search"
-                : "Real YouTube videos appear here when there is no search query"
+                : organicInterestReady
+                    ? "Local interest discovery appears here when there is no active search"
+                    : "Real YouTube videos appear here when there is no search query"
         : videos.length
             ? `${videos.length} loaded${totalResults ? ` / ${totalResults} possible` : ""}`
             : "Search results appear here";
@@ -626,6 +942,15 @@ export default function YoutubePage() {
     useEffect(() => {
         savedRecommendationQueriesRef.current = savedRecommendationQueries;
     }, [savedRecommendationQueries]);
+
+    useEffect(() => {
+        useInterestDiscoveryRef.current = useInterestDiscovery;
+        setCookieValue(
+            ORGANIC_INTERESTS_TOGGLE_COOKIE,
+            useInterestDiscovery ? "1" : "0",
+            365
+        );
+    }, [useInterestDiscovery]);
 
     useEffect(() => {
         playlistRef.current = playlist;
@@ -805,76 +1130,106 @@ export default function YoutubePage() {
         };
     }, []);
 
-    function toggleSection(section) {
-        setExpandedSections((current) => ({
-            ...current,
-            [section]: !current[section],
-        }));
-    }
-
     function renderPanel(section, icon, title, subtitle, children) {
         return (
-            <Accordion
-                expanded={!!expandedSections[section]}
-                onChange={() => toggleSection(section)}
-                disableGutters
+            <Card
+                id={`${section}-panel`}
+                component="section"
+                aria-label={title}
                 elevation={0}
                 sx={{
-                    borderRadius: "28px !important",
+                    borderRadius: 5,
                     overflow: "hidden",
-                    background: "rgba(255,255,255,0.065)",
-                    border: "1px solid rgba(255,255,255,0.1)",
+                    background: "rgba(15,23,42,0.72)",
+                    border: "1px solid rgba(148,163,184,0.16)",
                     color: "#fff",
-                    "&::before": { display: "none" },
+                    boxShadow: "0 18px 60px rgba(0,0,0,0.28)",
                 }}
             >
-                <AccordionSummary
-                    expandIcon={<ExpandMoreRoundedIcon sx={{ color: "#fff" }} />}
-                    sx={{
-                        px: { xs: 2.5, md: 3.2 },
-                        py: 1.2,
-                        "& .MuiAccordionSummary-content": {
-                            alignItems: "center",
-                            gap: 1.5,
-                        },
-                    }}
-                >
-                    <Box
-                        sx={{
-                            width: 42,
-                            height: 42,
-                            borderRadius: 3,
-                            display: "grid",
-                            placeItems: "center",
-                            background: "rgba(103,232,249,0.12)",
-                            border: "1px solid rgba(103,232,249,0.18)",
-                            color: "#67e8f9",
-                            flexShrink: 0,
-                        }}
-                    >
-                        {icon}
-                    </Box>
-
-                    <Box sx={{ minWidth: 0 }}>
-                        <Typography sx={{ fontWeight: 950, fontSize: { xs: "1rem", md: "1.12rem" } }}>
-                            {title}
-                        </Typography>
-                        {subtitle && (
-                            <Typography
-                                variant="body2"
-                                sx={{ color: "rgba(255,255,255,0.58)", mt: 0.2 }}
+                <CardContent sx={{ p: { xs: 2.5, md: 3.2 } }}>
+                    <Stack spacing={2.2}>
+                        <Stack direction="row" alignItems="center" spacing={1.5}>
+                            <Box
+                                sx={{
+                                    width: 42,
+                                    height: 42,
+                                    borderRadius: 3,
+                                    display: "grid",
+                                    placeItems: "center",
+                                    background: "rgba(103,232,249,0.12)",
+                                    border: "1px solid rgba(103,232,249,0.18)",
+                                    color: "#67e8f9",
+                                    flexShrink: 0,
+                                }}
                             >
-                                {subtitle}
-                            </Typography>
-                        )}
-                    </Box>
-                </AccordionSummary>
+                                {icon}
+                            </Box>
 
-                <AccordionDetails sx={{ px: { xs: 2.5, md: 3.2 }, pb: { xs: 2.5, md: 3.2 } }}>
-                    {children}
-                </AccordionDetails>
-            </Accordion>
+                            <Box sx={{ minWidth: 0 }}>
+                                <Typography sx={{ fontWeight: 950, fontSize: { xs: "1rem", md: "1.12rem" } }}>
+                                    {title}
+                                </Typography>
+                                {subtitle && (
+                                    <Typography
+                                        variant="body2"
+                                        sx={{ color: "rgba(255,255,255,0.58)", mt: 0.2 }}
+                                    >
+                                        {subtitle}
+                                    </Typography>
+                                )}
+                            </Box>
+                        </Stack>
+
+                        <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                        {children}
+                    </Stack>
+                </CardContent>
+            </Card>
         );
+    }
+
+    function refreshInterestQueries() {
+        setInterestQueries(getTopInterestQueries(16));
+    }
+
+    async function toggleInterestDiscovery(event) {
+        const enabled = event.target.checked;
+
+        setUseInterestDiscovery(enabled);
+        useInterestDiscoveryRef.current = enabled;
+        setCookieValue(ORGANIC_INTERESTS_TOGGLE_COOKIE, enabled ? "1" : "0", 365);
+
+        if (!activeQueryRef.current.trim()) {
+            setRecommendedVideos([]);
+            recommendedVideosRef.current = [];
+            setRecommendedNextPageToken("");
+            recommendedNextPageTokenRef.current = "";
+            setRecommendedTotalResults(0);
+            await loadRecommendedVideos(false);
+            return;
+        }
+
+        setStatus(
+            enabled
+                ? "Local interest discovery is on. Clear the search to discover videos from this browser's interests."
+                : "Local interest discovery is off. Clear the search to use saved searches or YouTube popular videos."
+        );
+    }
+
+    function clearInterestDiscoveryProfile() {
+        clearLocalInterestProfile();
+        setInterestQueries([]);
+
+        if (!activeQueryRef.current.trim() && useInterestDiscoveryRef.current && !useSavedQueryRecommendationsRef.current) {
+            setRecommendedVideos([]);
+            recommendedVideosRef.current = [];
+            setRecommendedNextPageToken("");
+            recommendedNextPageTokenRef.current = "";
+            setRecommendedTotalResults(0);
+        }
+
+        setStatus("Local interest discovery was cleared from this browser.");
     }
 
     async function requestScreenWakeLock() {
@@ -1010,7 +1365,7 @@ export default function YoutubePage() {
         setStatus("YouTube player size reset.");
     }
 
-    function createOrLoadPlayer(videoId, shouldPlay = true) {
+    function createOrLoadPlayer(videoId, shouldPlay = true, startSeconds = 0) {
         if (!window.YT || !window.YT.Player) {
             setStatus("YouTube player is still loading. Try again in a moment.");
             return;
@@ -1020,9 +1375,17 @@ export default function YoutubePage() {
             applyIframePlaybackPermissions(playerRef.current);
 
             if (shouldPlay) {
-                playerRef.current.loadVideoById(videoId);
+                if (startSeconds > 0) {
+                    playerRef.current.loadVideoById({ videoId, startSeconds });
+                } else {
+                    playerRef.current.loadVideoById(videoId);
+                }
             } else {
-                playerRef.current.cueVideoById(videoId);
+                if (startSeconds > 0) {
+                    playerRef.current.cueVideoById({ videoId, startSeconds });
+                } else {
+                    playerRef.current.cueVideoById(videoId);
+                }
             }
 
             return;
@@ -1048,6 +1411,10 @@ export default function YoutubePage() {
             events: {
                 onReady: (event) => {
                     applyIframePlaybackPermissions(event.target);
+
+                    if (startSeconds > 0) {
+                        event.target.seekTo(startSeconds, true);
+                    }
 
                     if (shouldPlay) {
                         event.target.playVideo();
@@ -1093,6 +1460,9 @@ export default function YoutubePage() {
             nowPlaying: true,
         }));
 
+        rememberVideoInterest(video, options.sourceQuery || activeQueryRef.current);
+        refreshInterestQueries();
+
         if (!video.embeddable) {
             setStatus("This video is marked as not embeddable, so it may not play here.");
         } else if (mode === "playlist") {
@@ -1103,7 +1473,7 @@ export default function YoutubePage() {
             setStatus(`Browsing YouTube: ${video.title}`);
         }
 
-        createOrLoadPlayer(video.id, true);
+        createOrLoadPlayer(video.id, true, Number(options.startSeconds || 0));
     }
 
     function handleVideoEnded(player) {
@@ -1143,7 +1513,10 @@ export default function YoutubePage() {
         if (loadingMoreRef.current && append) return;
 
         const savedQueries = savedRecommendationQueriesRef.current;
+        const interestQueriesSnapshot = getTopInterestQueries(ORGANIC_INTEREST_SEARCH_LIMIT);
         const useSavedFeed = useSavedQueryRecommendationsRef.current && savedQueries.length > 0;
+        const useOrganicInterestFeed =
+            !useSavedFeed && useInterestDiscoveryRef.current && interestQueriesSnapshot.length > 0;
 
         try {
             loadingMoreRef.current = append;
@@ -1152,17 +1525,23 @@ export default function YoutubePage() {
             setStatus(
                 useSavedFeed
                     ? append
-                        ? "Loading more saved-query recommendations..."
-                        : "Loading recommendations from saved search queries..."
-                    : append
-                        ? "Loading more recommended YouTube videos..."
-                        : "Loading real YouTube recommended videos..."
+                        ? "Loading more saved-search recommendations..."
+                        : "Loading Discover from saved searches..."
+                    : useOrganicInterestFeed
+                        ? append
+                            ? "Loading more YouTube popular videos for Discover..."
+                            : "Building Discover from local interests and YouTube popular videos..."
+                        : append
+                            ? "Loading more popular YouTube videos..."
+                            : "Loading YouTube popular videos..."
             );
 
             const pageToken = append ? recommendedNextPageTokenRef.current : "";
             const result = useSavedFeed
                 ? await fetchYoutubeRecommendedVideosFromSavedQueries(savedQueries)
-                : await fetchYoutubeRecommendedVideos(pageToken);
+                : useOrganicInterestFeed
+                    ? await fetchOrganicInterestFeed(pageToken, append)
+                    : await fetchYoutubeRecommendedVideos(pageToken);
             const nextVideos = append
                 ? uniqueVideosById([...recommendedVideosRef.current, ...result.videos])
                 : result.videos;
@@ -1178,13 +1557,17 @@ export default function YoutubePage() {
             setStatus(
                 result.videos.length
                     ? useSavedFeed
-                        ? `Loaded ${result.videos.length} recommended videos from saved quer${savedQueries.length === 1 ? "y" : "ies"}: ${savedQueries.slice(0, 4).join(" + ")}${savedQueries.length > 4 ? " + more" : ""}.`
-                        : append
-                            ? `Loaded ${result.videos.length} more recommended videos from YouTube.`
-                            : `Loaded ${result.videos.length} recommended videos from YouTube. These come from the official mostPopular feed, not hardcoded placeholders.`
+                        ? `Loaded ${result.videos.length} Discover videos from saved quer${savedQueries.length === 1 ? "y" : "ies"}: ${savedQueries.slice(0, 4).join(" + ")}${savedQueries.length > 4 ? " + more" : ""}.`
+                        : useOrganicInterestFeed
+                            ? `Loaded ${result.videos.length} Discover videos from local interests: ${interestQueriesSnapshot.slice(0, 4).join(" + ")}${interestQueriesSnapshot.length > 4 ? " + more" : ""}.`
+                            : append
+                                ? `Loaded ${result.videos.length} more popular videos from YouTube.`
+                                : `Loaded ${result.videos.length} popular videos from YouTube. These come from the official API, not hardcoded placeholders.`
                     : useSavedFeed
                         ? "No videos were returned from your saved recommendation queries. Try saving a broader search."
-                        : "No recommended videos were returned from YouTube."
+                        : useOrganicInterestFeed
+                            ? "No videos were returned from your local interest feed. Try searching or playing a few broader topics."
+                            : "No recommended videos were returned from YouTube."
             );
         } catch (error) {
             if (useSavedQueryRecommendationsRef.current && !savedQueries.length) {
@@ -1278,6 +1661,8 @@ export default function YoutubePage() {
             setStatus("Searching YouTube...");
             const result = await fetchYoutubeVideosBySearch(cleanQuery);
             rememberRecommendationQueries(cleanQuery);
+            addInterestSignal(cleanQuery, 3);
+            refreshInterestQueries();
 
             setVideos(result.videos);
             videosRef.current = result.videos;
@@ -1343,9 +1728,8 @@ export default function YoutubePage() {
         await handleLoadMore();
     }
 
-    async function handleLoadUrl() {
-        const videoId = extractVideoId(urlInput);
 
+    async function loadVideoById(videoId, startSeconds = 0) {
         if (!videoId) {
             setStatus("Paste a valid YouTube video URL or 11-character video ID.");
             return;
@@ -1353,7 +1737,7 @@ export default function YoutubePage() {
 
         try {
             setLoading(true);
-            setStatus("Loading YouTube link...");
+            setStatus("Loading YouTube video from the smart input...");
 
             const details = await fetchYoutubeVideoDetails([videoId]);
             const video = details[0] || buildFallbackVideo(videoId);
@@ -1362,7 +1746,12 @@ export default function YoutubePage() {
             videosRef.current = uniqueVideosById([video, ...videosRef.current]);
             setActiveQuery("Direct link");
             activeQueryRef.current = "Direct link";
-            loadVideo(video, { mode: "browse" });
+
+            loadVideo(video, {
+                mode: "browse",
+                startSeconds,
+                sourceQuery: "",
+            });
         } catch (error) {
             const fallback = buildFallbackVideo(videoId);
 
@@ -1370,14 +1759,156 @@ export default function YoutubePage() {
             videosRef.current = uniqueVideosById([fallback, ...videosRef.current]);
             setActiveQuery("Direct link");
             activeQueryRef.current = "Direct link";
-            loadVideo(fallback, { mode: "browse" });
+
+            loadVideo(fallback, {
+                mode: "browse",
+                startSeconds,
+                sourceQuery: "",
+            });
+
             setStatus(
-                `Loaded basic YouTube embed from link. Metadata lookup failed: ${
+                `Loaded a basic YouTube embed from the smart input. Metadata lookup failed: ${
                     error?.message || "unknown error"
                 }`
             );
         } finally {
             setLoading(false);
+        }
+    }
+
+    async function loadMultipleVideoLinks(videoIds) {
+        const cleanIds = Array.from(new Set(videoIds || [])).filter(Boolean);
+
+        if (!cleanIds.length) {
+            setStatus("No valid YouTube video links were found in that paste.");
+            return;
+        }
+
+        try {
+            setLoading(true);
+            setStatus(`Loading ${cleanIds.length} pasted YouTube link${cleanIds.length === 1 ? "" : "s"}...`);
+
+            const details = await fetchYoutubeVideoDetails(cleanIds);
+            const foundIds = new Set(details.map((video) => video.id));
+            const fallbacks = cleanIds
+                .filter((id) => !foundIds.has(id))
+                .map((id) => buildFallbackVideo(id));
+            const nextVideos = uniqueVideosById([...details, ...fallbacks]);
+            const nextPlaylist = nextVideos.map((video) => ({
+                ...video,
+                playlistId: makePlaylistId(),
+            }));
+
+            setVideos((current) => uniqueVideosById([...nextVideos, ...current]));
+            videosRef.current = uniqueVideosById([...nextVideos, ...videosRef.current]);
+            setPlaylist((current) => [...current, ...nextPlaylist]);
+            playlistRef.current = [...playlistRef.current, ...nextPlaylist];
+            setPlaybackMode("playlist");
+            playbackModeRef.current = "playlist";
+            setActiveQuery("Pasted links");
+            activeQueryRef.current = "Pasted links";
+            setExpandedSections((current) => ({
+                ...current,
+                player: true,
+                browse: true,
+                playlist: true,
+            }));
+
+            if (nextPlaylist[0]) {
+                loadVideo(nextPlaylist[0], {
+                    mode: "playlist",
+                    playlistIndex: Math.max(0, playlistRef.current.length - nextPlaylist.length),
+                    sourceQuery: "",
+                });
+            }
+
+            setStatus(`Loaded ${nextVideos.length} pasted YouTube video${nextVideos.length === 1 ? "" : "s"} and added them to your playlist.`);
+        } catch (error) {
+            setStatus(error?.message || "Could not load pasted YouTube links.");
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    async function loadYouTubePlaylist(playlistId, autoplay = true) {
+        try {
+            setLoading(true);
+            setStatus("Loading YouTube playlist from the smart input...");
+
+            const result = await fetchYoutubePlaylistVideos(playlistId);
+            const nextPlaylist = result.videos.map((video) => ({
+                ...video,
+                playlistId: makePlaylistId(),
+            }));
+
+            setPlaylist(nextPlaylist);
+            playlistRef.current = nextPlaylist;
+            setVideos((current) => uniqueVideosById([...result.videos, ...current]));
+            videosRef.current = uniqueVideosById([...result.videos, ...videosRef.current]);
+            setPlaybackMode("playlist");
+            playbackModeRef.current = "playlist";
+            setActiveQuery("YouTube playlist");
+            activeQueryRef.current = "YouTube playlist";
+
+            setExpandedSections((current) => ({
+                ...current,
+                player: true,
+                browse: true,
+                playlist: true,
+                controls: false,
+            }));
+
+            if (autoplay && nextPlaylist[0]) {
+                loadVideo(nextPlaylist[0], {
+                    mode: "playlist",
+                    playlistIndex: 0,
+                    sourceQuery: "",
+                });
+            }
+
+            setStatus(
+                result.nextPageToken
+                    ? `Loaded the first ${nextPlaylist.length} embeddable videos from that YouTube playlist. Large playlists are capped for speed.`
+                    : `Loaded ${nextPlaylist.length} videos from that YouTube playlist.`
+            );
+        } catch (error) {
+            setStatus(error?.message || "Could not load that YouTube playlist.");
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    async function handleSmartSubmit() {
+        const parsed = parseYouTubeInput(query);
+
+        if (parsed.type === "empty") {
+            clearSearchAndShowRecommended();
+            return;
+        }
+
+        if (parsed.type === "search") {
+            await handleSearch();
+            return;
+        }
+
+        if (parsed.type === "video") {
+            await loadVideoById(parsed.videoId, parsed.startSeconds);
+            return;
+        }
+
+        if (parsed.type === "videoList") {
+            await loadMultipleVideoLinks(parsed.videoIds);
+            return;
+        }
+
+        if (parsed.type === "playlist") {
+            await loadYouTubePlaylist(parsed.playlistId);
+            return;
+        }
+
+        if (parsed.type === "videoInPlaylist") {
+            await loadVideoById(parsed.videoId, parsed.startSeconds);
+            await loadYouTubePlaylist(parsed.playlistId, false);
         }
     }
 
@@ -1396,6 +1927,8 @@ export default function YoutubePage() {
 
             const result = await fetchAutoPlaylistVideos(cleanQuery, autoPlaylistLimit);
             rememberRecommendationQueries(result.queryParts);
+            result.queryParts.forEach((part) => addInterestSignal(part, 3));
+            refreshInterestQueries();
 
             if (!result.videos.length) {
                 setStatus("No videos were found for that auto playlist query.");
@@ -1460,6 +1993,9 @@ export default function YoutubePage() {
 
     function addVideoToPlaylist(video) {
         if (!video?.id) return;
+
+        rememberVideoInterest(video, activeQueryRef.current);
+        refreshInterestQueries();
 
         setPlaylist((current) => {
             if (current.some((item) => item.id === video.id)) {
@@ -1590,14 +2126,32 @@ export default function YoutubePage() {
 
     function openSelectedOnYouTube() {
         const video = selectedVideoRef.current;
+        const link = buildYoutubeWatchUrl(video?.id);
 
-        if (!video?.id) return;
+        if (!link) return;
 
-        window.open(
-            `https://www.youtube.com/watch?v=${video.id}`,
-            "_blank",
-            "noopener,noreferrer"
-        );
+        window.open(link, "_blank", "noopener,noreferrer");
+    }
+
+    async function copySelectedVideoLink() {
+        const video = selectedVideoRef.current;
+        const link = buildYoutubeWatchUrl(video?.id);
+
+        if (!link) {
+            setStatus("Select a YouTube video first, then copy its link.");
+            return;
+        }
+
+        try {
+            if (!navigator?.clipboard?.writeText) {
+                throw new Error("Clipboard API unavailable");
+            }
+
+            await navigator.clipboard.writeText(link);
+            setStatus("Copied the current YouTube video link.");
+        } catch {
+            setStatus(`Copy this YouTube link: ${link}`);
+        }
     }
 
     function renderVideoCard(video, source = "browse", index = -1) {
@@ -1746,6 +2300,7 @@ export default function YoutubePage() {
                         {source === "playlist" && (
                             <Tooltip title="Remove from playlist">
                                 <IconButton
+                                    aria-label="Remove video from playlist"
                                     size="small"
                                     onClick={(event) => {
                                         event.stopPropagation();
@@ -1843,11 +2398,305 @@ export default function YoutubePage() {
                 </DialogActions>
             </Dialog>
 
+
+            <Drawer
+                anchor="right"
+                open={settingsOpen}
+                onClose={() => setSettingsOpen(false)}
+                PaperProps={{
+                    sx: {
+                        width: { xs: "100%", sm: 430 },
+                        background: "linear-gradient(180deg, #0f172a, #070a13)",
+                        color: "#fff",
+                        borderLeft: "1px solid rgba(255,255,255,0.12)",
+                        p: 2.2,
+                    },
+                }}
+            >
+                <Stack spacing={2.2} role="region" aria-label="YouTube browser settings">
+                    <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2}>
+                        <Box>
+                            <Typography variant="h5" sx={{ fontWeight: 950, letterSpacing: "-0.035em" }}>
+                                Settings
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.62)", mt: 0.4 }}>
+                                Advanced controls are here so the main page stays easier to use.
+                            </Typography>
+                        </Box>
+
+                        <IconButton
+                            aria-label="Close settings"
+                            onClick={() => setSettingsOpen(false)}
+                            sx={{ color: "#fff", border: "1px solid rgba(255,255,255,0.12)" }}
+                        >
+                            <DeleteRoundedIcon />
+                        </IconButton>
+                    </Stack>
+
+                    <Alert
+                        severity="info"
+                        icon={<AutoAwesomeRoundedIcon />}
+                        sx={{
+                            borderRadius: 3,
+                            background: "rgba(103,232,249,0.1)",
+                            color: "#dff9ff",
+                            border: "1px solid rgba(103,232,249,0.18)",
+                            "& .MuiAlert-icon": { color: "#67e8f9" },
+                        }}
+                    >
+                        The smart input accepts searches, YouTube videos, Shorts, Live links, Music YouTube links,
+                        playlist links, and multiple pasted video links.
+                    </Alert>
+
+                    <Box sx={{ p: 2, borderRadius: 4, background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <Stack spacing={1.4}>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                                <ShuffleRoundedIcon sx={{ color: "#67e8f9" }} />
+                                <Typography sx={{ fontWeight: 950 }}>Auto playlist</Typography>
+                            </Stack>
+
+                            <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.6 }}>
+                                Use the main smart input to type one search or mix searches with |, then build a playlist from those terms.
+                            </Typography>
+
+                            <TextField
+                                value={autoPlaylistLimit}
+                                onChange={(event) => {
+                                    const nextValue = Number(event.target.value);
+                                    if (Number.isFinite(nextValue)) {
+                                        setAutoPlaylistLimit(Math.min(25, Math.max(3, nextValue)));
+                                    }
+                                }}
+                                label="Videos per query"
+                                type="number"
+                                variant="filled"
+                                disabled={autoPlaylistLoading}
+                                InputLabelProps={{ sx: { color: "rgba(255,255,255,0.62)" } }}
+                                inputProps={{ min: 3, max: 25, step: 1, "aria-label": "Videos per query for auto playlist" }}
+                                InputProps={{
+                                    sx: {
+                                        color: "#fff",
+                                        borderRadius: 3,
+                                        background: "rgba(255,255,255,0.08)",
+                                    },
+                                }}
+                            />
+
+                            <Stack direction="row" flexWrap="wrap" gap={1}>
+                                <Button
+                                    variant="contained"
+                                    startIcon={
+                                        autoPlaylistLoading ? (
+                                            <CircularProgress size={18} sx={{ color: "#06111e" }} />
+                                        ) : (
+                                            <ShuffleRoundedIcon />
+                                        )
+                                    }
+                                    onClick={createAutoPlaylistFromQuery}
+                                    disabled={autoPlaylistLoading || loading || loadingMore}
+                                    sx={{
+                                        borderRadius: 999,
+                                        minHeight: 44,
+                                        fontWeight: 950,
+                                        color: "#06111e",
+                                        background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                    }}
+                                >
+                                    Build auto playlist
+                                </Button>
+
+                                <Button
+                                    variant="outlined"
+                                    startIcon={<HelpOutlineRoundedIcon />}
+                                    onClick={() => setHelpOpen(true)}
+                                    sx={{ borderRadius: 999, minHeight: 44, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Help
+                                </Button>
+                            </Stack>
+                        </Stack>
+                    </Box>
+
+                    <Box sx={{ p: 2, borderRadius: 4, background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <Stack spacing={1.4}>
+                            <Typography sx={{ fontWeight: 950 }}>Saved search discovery</Typography>
+                            <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.62)" }}>
+                                Optional cookie-based feed using only searches from this site.
+                            </Typography>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
+                                <Typography sx={{ fontWeight: 900 }}>
+                                    {useSavedQueryRecommendations ? "Saved search feed on" : "Saved search feed off"}
+                                </Typography>
+                                <Switch
+                                    checked={useSavedQueryRecommendations}
+                                    onChange={toggleSavedQueryRecommendations}
+                                    inputProps={{ "aria-label": "Toggle saved search recommendations from settings" }}
+                                />
+                            </Stack>
+
+                            <Stack direction="row" flexWrap="wrap" gap={0.75}>
+                                {savedRecommendationQueries.length ? (
+                                    savedRecommendationQueries.slice(0, 10).map((savedQuery) => (
+                                        <Chip key={savedQuery} size="small" label={savedQuery} sx={{ color: "#fff", background: "rgba(255,255,255,0.08)" }} />
+                                    ))
+                                ) : (
+                                    <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.58)" }}>
+                                        No saved searches yet.
+                                    </Typography>
+                                )}
+                            </Stack>
+
+                            <Stack direction="row" flexWrap="wrap" gap={1}>
+                                <Button
+                                    variant="outlined"
+                                    disabled={!savedRecommendationQueries.length || recommendedLoading}
+                                    onClick={() => loadRecommendedVideos(false)}
+                                    sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Refresh feed
+                                </Button>
+
+                                <Button
+                                    variant="text"
+                                    disabled={!savedRecommendationQueries.length}
+                                    onClick={clearSavedRecommendationQueries}
+                                    sx={{ borderRadius: 999, color: "rgba(255,255,255,0.72)", fontWeight: 900 }}
+                                >
+                                    Clear saved
+                                </Button>
+                            </Stack>
+                        </Stack>
+                    </Box>
+
+                    <Box sx={{ p: 2, borderRadius: 4, background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <Stack spacing={1.4}>
+                            <Typography sx={{ fontWeight: 950 }}>Discover privacy</Typography>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
+                                <Box>
+                                    <Typography sx={{ fontWeight: 900 }}>Local interest discovery</Typography>
+                                    <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.62)" }}>
+                                        Uses only this browser. No cross-site cookie reading.
+                                    </Typography>
+                                </Box>
+                                <Switch
+                                    checked={useInterestDiscovery}
+                                    onChange={toggleInterestDiscovery}
+                                    inputProps={{ "aria-label": "Toggle local interest discovery from settings" }}
+                                />
+                            </Stack>
+
+                            <Stack direction="row" flexWrap="wrap" gap={0.75}>
+                                {interestQueries.length ? (
+                                    interestQueries.slice(0, 10).map((interest) => (
+                                        <Chip key={interest} size="small" label={interest} sx={{ color: "#fff", background: "rgba(255,255,255,0.08)" }} />
+                                    ))
+                                ) : (
+                                    <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.58)" }}>
+                                        No local interests stored yet.
+                                    </Typography>
+                                )}
+                            </Stack>
+
+                            <Button
+                                variant="outlined"
+                                startIcon={<ClearAllRoundedIcon />}
+                                disabled={!interestQueries.length}
+                                onClick={clearInterestDiscoveryProfile}
+                                sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                            >
+                                Clear local interests
+                            </Button>
+                        </Stack>
+                    </Box>
+
+                    <Box sx={{ p: 2, borderRadius: 4, background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <Stack spacing={1.4}>
+                            <Typography sx={{ fontWeight: 950 }}>Playback</Typography>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center">
+                                <Typography sx={{ fontWeight: 900 }}>Repeat current video</Typography>
+                                <Switch checked={repeatVideo} onChange={(event) => setRepeatVideo(event.target.checked)} inputProps={{ "aria-label": "Toggle repeat video from settings" }} />
+                            </Stack>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center">
+                                <Typography sx={{ fontWeight: 900 }}>Loop playlist</Typography>
+                                <Switch checked={loopPlaylist} onChange={(event) => setLoopPlaylist(event.target.checked)} inputProps={{ "aria-label": "Toggle playlist loop from settings" }} />
+                            </Stack>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center">
+                                <Typography sx={{ fontWeight: 900 }}>Endless loading</Typography>
+                                <Switch checked={autoLoadMore} onChange={(event) => setAutoLoadMore(event.target.checked)} inputProps={{ "aria-label": "Toggle endless loading from settings" }} />
+                            </Stack>
+
+                            <Stack direction="row" justifyContent="space-between" alignItems="center">
+                                <Typography sx={{ fontWeight: 900 }}>No Dim / screen awake</Typography>
+                                <Switch checked={keepAwakeEnabled} disabled={!keepAwakeSupported} onChange={toggleScreenWakeLock} inputProps={{ "aria-label": "Toggle no dim mode from settings" }} />
+                            </Stack>
+
+                            <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                            <Stack direction="row" flexWrap="wrap" gap={1}>
+                                <Button
+                                    variant="outlined"
+                                    startIcon={<RepeatRoundedIcon />}
+                                    onClick={playSelectedAsBrowse}
+                                    disabled={!selectedVideo}
+                                    sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Browse mode
+                                </Button>
+
+                                <Button
+                                    variant="outlined"
+                                    startIcon={<QueueMusicRoundedIcon />}
+                                    onClick={switchToPlaylistPlayback}
+                                    disabled={!playlist.length}
+                                    sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Playlist mode
+                                </Button>
+
+                                <Button
+                                    variant="outlined"
+                                    startIcon={<SkipNextRoundedIcon />}
+                                    onClick={() => {
+                                        if (playbackModeRef.current === "playlist") {
+                                            playNextPlaylistVideo(false);
+                                        } else {
+                                            playNextBrowseVideoFromCurrentList();
+                                        }
+                                    }}
+                                    sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Next
+                                </Button>
+                            </Stack>
+                        </Stack>
+                    </Box>
+
+                    <Box sx={{ p: 2, borderRadius: 4, background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <Stack spacing={1.4}>
+                            <Typography sx={{ fontWeight: 950 }}>Player size</Typography>
+                            <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.62)" }}>
+                                Width {Math.round(playerMainColumn)}% • Height {Math.round(playerHeight)}px
+                            </Typography>
+                            <Slider value={playerMainColumn} min={45} max={86} step={1} onChange={(_, nextValue) => setPlayerColumnPercent(Array.isArray(nextValue) ? nextValue[0] : nextValue)} />
+                            <Slider value={playerHeight} min={300} max={900} step={10} onChange={(_, nextValue) => setPlayerHeight(Array.isArray(nextValue) ? nextValue[0] : nextValue)} />
+                            <Button variant="outlined" onClick={resetPlayerSize} sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}>
+                                Reset player size
+                            </Button>
+                        </Stack>
+                    </Box>
+                </Stack>
+            </Drawer>
+
             <Helmet>
-                <title>YouTube Browser</title>
+                <title>YouTube Smart Browser</title>
                 <meta
                     name="description"
-                    content="Browse YouTube results with endless loading, real no-query recommended videos from YouTube, optional saved-query cookie recommendations, collapsible controls, manual playlists, auto playlists, a resizable official YouTube embed player, and optional No Dim mode."
+                    content="Browse YouTube with one smart input for searches, direct links, Shorts, Live links, Music YouTube links, playlist links, multiple pasted links, local organic interest discovery, accessible controls, playlists, a resizable official embed player, and optional No Dim mode."
                 />
             </Helmet>
 
@@ -1867,8 +2716,8 @@ export default function YoutubePage() {
                             elevation={0}
                             sx={{
                                 borderRadius: 5,
-                                background: "rgba(255,255,255,0.075)",
-                                border: "1px solid rgba(255,255,255,0.12)",
+                                background: "rgba(15,23,42,0.72)",
+                                border: "1px solid rgba(148,163,184,0.16)",
                                 color: "#fff",
                             }}
                         >
@@ -1914,7 +2763,7 @@ export default function YoutubePage() {
                                             fontSize: { xs: "2rem", md: "3.4rem" },
                                         }}
                                     >
-                                        Search stays open. Everything else collapses.
+                                        Search YouTube, paste a link, or build a playlist.
                                     </Typography>
 
                                     <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
@@ -1924,11 +2773,11 @@ export default function YoutubePage() {
                                             onChange={(event) => setQuery(event.target.value)}
                                             onKeyDown={(event) => {
                                                 if (event.key === "Enter") {
-                                                    handleSearch();
+                                                    handleSmartSubmit();
                                                 }
                                             }}
-                                            label="Search YouTube"
-                                            placeholder="Leave empty for real YouTube recommended videos, or search music, podcasts, tutorials..."
+                                            label="Search YouTube or paste a link"
+                                            placeholder="Search music, paste a YouTube link, shorts link, playlist link, or multiple video links..."
                                             variant="filled"
                                             InputLabelProps={{
                                                 sx: { color: "rgba(255,255,255,0.62)" },
@@ -1946,7 +2795,7 @@ export default function YoutubePage() {
                                             variant="contained"
                                             startIcon={<SearchRoundedIcon />}
                                             disabled={loading || loadingMore || recommendedLoading}
-                                            onClick={handleSearch}
+                                            onClick={handleSmartSubmit}
                                             sx={{
                                                 minWidth: { xs: "100%", md: 170 },
                                                 borderRadius: 3,
@@ -1955,7 +2804,7 @@ export default function YoutubePage() {
                                                 background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
                                             }}
                                         >
-                                            {query.trim() ? "Search" : "Recommend"}
+                                            {query.trim() ? "Go" : "Discover"}
                                         </Button>
 
                                         <Button
@@ -1971,483 +2820,27 @@ export default function YoutubePage() {
                                         >
                                             Clear
                                         </Button>
+
+                                        <Button
+                                            variant="outlined"
+                                            startIcon={<SettingsRoundedIcon />}
+                                            onClick={() => setSettingsOpen(true)}
+                                            sx={{
+                                                minWidth: { xs: "100%", md: 150 },
+                                                borderRadius: 3,
+                                                color: "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                            }}
+                                        >
+                                            Settings
+                                        </Button>
                                     </Stack>
                                 </Stack>
                             </CardContent>
                         </Card>
 
                         {(loading || loadingMore || autoPlaylistLoading || recommendedLoading) && <LinearProgress />}
-
-                        {renderPanel(
-                            "controls",
-                            <ViewListRoundedIcon />,
-                            "Collapsed tools and playback controls",
-                            "Paste links, make auto playlists, resize the player, toggle repeat, loop, endless loading, and No Dim mode.",
-                            <Stack spacing={2.5}>
-                                <Box
-                                    sx={{
-                                        display: "grid",
-                                        gridTemplateColumns: { xs: "1fr", md: "1fr auto auto" },
-                                        gap: 1.5,
-                                        alignItems: "stretch",
-                                        p: 1.5,
-                                        borderRadius: 4,
-                                        background:
-                                            "linear-gradient(135deg, rgba(103,232,249,0.09), rgba(167,139,250,0.08))",
-                                        border: "1px solid rgba(255,255,255,0.1)",
-                                    }}
-                                >
-                                    <Box>
-                                        <Stack direction="row" alignItems="center" spacing={1}>
-                                            <AutoAwesomeRoundedIcon sx={{ color: "#67e8f9" }} />
-                                            <Typography sx={{ fontWeight: 950 }}>
-                                                Auto playlist from query
-                                            </Typography>
-                                        </Stack>
-
-                                        <Typography
-                                            variant="body2"
-                                            sx={{ color: "rgba(255,255,255,0.62)", mt: 0.5, lineHeight: 1.6 }}
-                                        >
-                                            Use <strong>|</strong> to mix multiple searches. Example: Playboi Carti | Trippie Redd.
-                                            Browse and recommended videos can still be played directly without saving them.
-                                        </Typography>
-                                    </Box>
-
-                                    <TextField
-                                        value={autoPlaylistLimit}
-                                        onChange={(event) => {
-                                            const nextValue = Number(event.target.value);
-                                            if (Number.isFinite(nextValue)) {
-                                                setAutoPlaylistLimit(Math.min(25, Math.max(3, nextValue)));
-                                            }
-                                        }}
-                                        label="Per query"
-                                        type="number"
-                                        variant="filled"
-                                        disabled={autoPlaylistLoading}
-                                        InputLabelProps={{
-                                            sx: { color: "rgba(255,255,255,0.62)" },
-                                        }}
-                                        inputProps={{
-                                            min: 3,
-                                            max: 25,
-                                            step: 1,
-                                        }}
-                                        InputProps={{
-                                            sx: {
-                                                width: { xs: "100%", md: 132 },
-                                                color: "#fff",
-                                                borderRadius: 3,
-                                                background: "rgba(255,255,255,0.08)",
-                                            },
-                                        }}
-                                    />
-
-                                    <Stack direction="row" spacing={1}>
-                                        <Button
-                                            variant="contained"
-                                            startIcon={
-                                                autoPlaylistLoading ? (
-                                                    <CircularProgress size={18} sx={{ color: "#06111e" }} />
-                                                ) : (
-                                                    <ShuffleRoundedIcon />
-                                                )
-                                            }
-                                            onClick={createAutoPlaylistFromQuery}
-                                            disabled={autoPlaylistLoading || loading || loadingMore}
-                                            sx={{
-                                                minWidth: { xs: "100%", md: 190 },
-                                                borderRadius: 3,
-                                                fontWeight: 950,
-                                                color: "#06111e",
-                                                background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            }}
-                                        >
-                                            Auto playlist
-                                        </Button>
-
-                                        <Tooltip title="How | mixed queries work">
-                                            <IconButton
-                                                onClick={() => setHelpOpen(true)}
-                                                sx={{
-                                                    color: "#fff",
-                                                    border: "1px solid rgba(255,255,255,0.14)",
-                                                    borderRadius: 3,
-                                                }}
-                                            >
-                                                <HelpOutlineRoundedIcon />
-                                            </IconButton>
-                                        </Tooltip>
-                                    </Stack>
-                                </Box>
-
-                                <Box
-                                    sx={{
-                                        display: "grid",
-                                        gridTemplateColumns: { xs: "1fr", lg: "1fr auto" },
-                                        gap: 1.5,
-                                        alignItems: "center",
-                                        p: 1.5,
-                                        borderRadius: 4,
-                                        background: useSavedQueryRecommendations
-                                            ? "linear-gradient(135deg, rgba(103,232,249,0.12), rgba(167,139,250,0.12))"
-                                            : "rgba(255,255,255,0.045)",
-                                        border: useSavedQueryRecommendations
-                                            ? "1px solid rgba(103,232,249,0.24)"
-                                            : "1px solid rgba(255,255,255,0.09)",
-                                    }}
-                                >
-                                    <Box>
-                                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.7 }}>
-                                            <RecommendRoundedIcon
-                                                sx={{
-                                                    color: useSavedQueryRecommendations
-                                                        ? "#67e8f9"
-                                                        : "rgba(255,255,255,0.54)",
-                                                }}
-                                            />
-                                            <Typography sx={{ fontWeight: 950 }}>
-                                                Saved-query recommendations
-                                            </Typography>
-                                        </Stack>
-
-                                        <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.6 }}>
-                                            Default off. When turned on, the no-query Recommended videos section uses searches
-                                            saved in this site's cookie and mixes real YouTube results from those queries instead
-                                            of the general popular feed.
-                                        </Typography>
-
-                                        <Stack direction="row" flexWrap="wrap" gap={0.75} sx={{ mt: 1.2 }}>
-                                            {savedRecommendationQueries.length ? (
-                                                savedRecommendationQueries.map((savedQuery) => (
-                                                    <Chip
-                                                        key={savedQuery}
-                                                        size="small"
-                                                        label={savedQuery}
-                                                        sx={{
-                                                            color: "#fff",
-                                                            background: "rgba(255,255,255,0.08)",
-                                                            border: "1px solid rgba(255,255,255,0.1)",
-                                                            fontWeight: 850,
-                                                        }}
-                                                    />
-                                                ))
-                                            ) : (
-                                                <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.54)" }}>
-                                                    No saved queries yet. Search YouTube once and the query will be saved here.
-                                                </Typography>
-                                            )}
-                                        </Stack>
-                                    </Box>
-
-                                    <Stack spacing={1} alignItems={{ xs: "stretch", lg: "flex-end" }}>
-                                        <Stack direction="row" alignItems="center" spacing={1.2} justifyContent={{ xs: "space-between", lg: "flex-end" }}>
-                                            <Typography sx={{ fontWeight: 900 }}>
-                                                {useSavedQueryRecommendations ? "Cookie query feed on" : "Cookie query feed off"}
-                                            </Typography>
-                                            <Switch
-                                                checked={useSavedQueryRecommendations}
-                                                onChange={toggleSavedQueryRecommendations}
-                                            />
-                                        </Stack>
-
-                                        <Stack direction="row" spacing={1} flexWrap="wrap" justifyContent={{ xs: "flex-start", lg: "flex-end" }}>
-                                            <Button
-                                                size="small"
-                                                variant="outlined"
-                                                disabled={!savedRecommendationQueries.length || recommendedLoading}
-                                                onClick={() => loadRecommendedVideos(false)}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    color: "#fff",
-                                                    borderColor: "rgba(255,255,255,0.18)",
-                                                    fontWeight: 900,
-                                                }}
-                                            >
-                                                Refresh feed
-                                            </Button>
-
-                                            <Button
-                                                size="small"
-                                                variant="text"
-                                                disabled={!savedRecommendationQueries.length}
-                                                onClick={clearSavedRecommendationQueries}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    color: "rgba(255,255,255,0.72)",
-                                                    fontWeight: 900,
-                                                }}
-                                            >
-                                                Clear saved
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-                                </Box>
-
-                                <Box
-                                    sx={{
-                                        display: "grid",
-                                        gridTemplateColumns: { xs: "1fr", lg: "1fr 1fr auto" },
-                                        gap: 1.5,
-                                        alignItems: "center",
-                                        p: 1.5,
-                                        borderRadius: 4,
-                                        background: "rgba(255,255,255,0.045)",
-                                        border: "1px solid rgba(255,255,255,0.09)",
-                                    }}
-                                >
-                                    <Box>
-                                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.7 }}>
-                                            <AspectRatioRoundedIcon sx={{ color: "#67e8f9" }} />
-                                            <Typography sx={{ fontWeight: 950 }}>
-                                                Resizable YouTube window
-                                            </Typography>
-                                        </Stack>
-
-                                        <Typography variant="body2" sx={{ color: "rgba(255,255,255,0.6)", lineHeight: 1.6 }}>
-                                            Drag the resize handle on the video corner, or use these controls.
-                                            The browse and playlist panels reflow as the video gets wider.
-                                        </Typography>
-                                    </Box>
-
-                                    <Box>
-                                        <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.4 }}>
-                                            <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.66)", fontWeight: 850 }}>
-                                                Window width
-                                            </Typography>
-                                            <Typography variant="caption" sx={{ color: "#67e8f9", fontWeight: 950 }}>
-                                                {Math.round(playerMainColumn)}%
-                                            </Typography>
-                                        </Stack>
-
-                                        <Slider
-                                            value={playerMainColumn}
-                                            min={45}
-                                            max={86}
-                                            step={1}
-                                            onChange={(_, nextValue) => {
-                                                const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-                                                setPlayerColumnPercent(cleanValue);
-                                            }}
-                                            sx={{
-                                                color: "#67e8f9",
-                                                "& .MuiSlider-rail": {
-                                                    color: "rgba(255,255,255,0.18)",
-                                                },
-                                            }}
-                                        />
-
-                                        <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.4, mt: 1 }}>
-                                            <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.66)", fontWeight: 850 }}>
-                                                Video height
-                                            </Typography>
-                                            <Typography variant="caption" sx={{ color: "#67e8f9", fontWeight: 950 }}>
-                                                {Math.round(playerHeight)}px
-                                            </Typography>
-                                        </Stack>
-
-                                        <Slider
-                                            value={playerHeight}
-                                            min={300}
-                                            max={900}
-                                            step={10}
-                                            onChange={(_, nextValue) => {
-                                                const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-                                                setPlayerHeight(cleanValue);
-                                            }}
-                                            sx={{
-                                                color: "#a78bfa",
-                                                "& .MuiSlider-rail": {
-                                                    color: "rgba(255,255,255,0.18)",
-                                                },
-                                            }}
-                                        />
-                                    </Box>
-
-                                    <Stack spacing={1}>
-                                        <Button
-                                            variant={theaterMode ? "contained" : "outlined"}
-                                            onClick={() => setTheaterMode((current) => !current)}
-                                            sx={{
-                                                borderRadius: 999,
-                                                color: theaterMode ? "#06111e" : "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 900,
-                                                background: theaterMode
-                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                    : "transparent",
-                                            }}
-                                        >
-                                            {theaterMode ? "Theater on" : "Theater mode"}
-                                        </Button>
-
-                                        <Button
-                                            variant="text"
-                                            onClick={resetPlayerSize}
-                                            sx={{
-                                                borderRadius: 999,
-                                                color: "rgba(255,255,255,0.72)",
-                                                fontWeight: 900,
-                                            }}
-                                        >
-                                            Reset size
-                                        </Button>
-                                    </Stack>
-                                </Box>
-
-                                <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-                                    <TextField
-                                        fullWidth
-                                        value={urlInput}
-                                        onChange={(event) => setUrlInput(event.target.value)}
-                                        label="Paste YouTube link"
-                                        placeholder="https://www.youtube.com/watch?v=..."
-                                        variant="filled"
-                                        InputLabelProps={{
-                                            sx: { color: "rgba(255,255,255,0.62)" },
-                                        }}
-                                        InputProps={{
-                                            sx: {
-                                                color: "#fff",
-                                                borderRadius: 3,
-                                                background: "rgba(255,255,255,0.08)",
-                                            },
-                                        }}
-                                    />
-
-                                    <Button
-                                        variant="outlined"
-                                        startIcon={<PlayArrowRoundedIcon />}
-                                        onClick={handleLoadUrl}
-                                        disabled={loading || loadingMore}
-                                        sx={{
-                                            minWidth: { xs: "100%", md: 170 },
-                                            borderRadius: 3,
-                                            color: "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
-                                        }}
-                                    >
-                                        Load link
-                                    </Button>
-                                </Stack>
-
-                                <Box
-                                    sx={{
-                                        display: "grid",
-                                        gridTemplateColumns: { xs: "1fr", md: "1fr 1fr 1fr" },
-                                        gap: 1.5,
-                                    }}
-                                >
-                                    <Button
-                                        variant={playbackMode === "browse" ? "contained" : "outlined"}
-                                        startIcon={<TravelExploreRoundedIcon />}
-                                        onClick={playSelectedAsBrowse}
-                                        sx={{
-                                            borderRadius: 4,
-                                            py: 1.2,
-                                            color: playbackMode === "browse" ? "#06111e" : "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
-                                            background:
-                                                playbackMode === "browse"
-                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                    : "transparent",
-                                        }}
-                                    >
-                                        Browse playback
-                                    </Button>
-
-                                    <Button
-                                        variant={playbackMode === "playlist" ? "contained" : "outlined"}
-                                        startIcon={<QueueMusicRoundedIcon />}
-                                        onClick={switchToPlaylistPlayback}
-                                        sx={{
-                                            borderRadius: 4,
-                                            py: 1.2,
-                                            color: playbackMode === "playlist" ? "#06111e" : "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
-                                            background:
-                                                playbackMode === "playlist"
-                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                    : "transparent",
-                                        }}
-                                    >
-                                        Playlist playback
-                                    </Button>
-
-                                    <Button
-                                        variant="outlined"
-                                        startIcon={<SkipNextRoundedIcon />}
-                                        onClick={() => playNextPlaylistVideo(false)}
-                                        disabled={!playlist.length}
-                                        sx={{
-                                            borderRadius: 4,
-                                            py: 1.2,
-                                            color: "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
-                                        }}
-                                    >
-                                        Next in playlist
-                                    </Button>
-                                </Box>
-
-                                <Stack direction="row" flexWrap="wrap" gap={2}>
-                                    <Stack direction="row" alignItems="center" spacing={1}>
-                                        <RepeatRoundedIcon sx={{ color: repeatVideo ? "#67e8f9" : "rgba(255,255,255,0.45)" }} />
-                                        <Typography sx={{ fontWeight: 900 }}>Repeat current video</Typography>
-                                        <Switch
-                                            checked={repeatVideo}
-                                            onChange={(event) => setRepeatVideo(event.target.checked)}
-                                        />
-                                    </Stack>
-
-                                    <Stack direction="row" alignItems="center" spacing={1}>
-                                        <QueueMusicRoundedIcon sx={{ color: loopPlaylist ? "#67e8f9" : "rgba(255,255,255,0.45)" }} />
-                                        <Typography sx={{ fontWeight: 900 }}>Loop playlist</Typography>
-                                        <Switch
-                                            checked={loopPlaylist}
-                                            onChange={(event) => setLoopPlaylist(event.target.checked)}
-                                        />
-                                    </Stack>
-
-                                    <Stack direction="row" alignItems="center" spacing={1}>
-                                        <ViewListRoundedIcon sx={{ color: autoLoadMore ? "#67e8f9" : "rgba(255,255,255,0.45)" }} />
-                                        <Typography sx={{ fontWeight: 900 }}>Endless browse loading</Typography>
-                                        <Switch
-                                            checked={autoLoadMore}
-                                            onChange={(event) => setAutoLoadMore(event.target.checked)}
-                                        />
-                                    </Stack>
-
-                                    <Stack direction="row" alignItems="center" spacing={1}>
-                                        <LightModeRoundedIcon sx={{ color: keepAwakeEnabled ? "#67e8f9" : "rgba(255,255,255,0.45)" }} />
-                                        <Typography sx={{ fontWeight: 900 }}>No Dim / screen awake</Typography>
-                                        <Switch
-                                            checked={keepAwakeEnabled}
-                                            disabled={!keepAwakeSupported}
-                                            onChange={toggleScreenWakeLock}
-                                        />
-                                    </Stack>
-                                </Stack>
-
-                                <Box
-                                    sx={{
-                                        borderRadius: 4,
-                                        p: 2,
-                                        background: "rgba(103,232,249,0.1)",
-                                        border: "1px solid rgba(103,232,249,0.18)",
-                                    }}
-                                >
-                                    <Typography sx={{ color: "rgba(255,255,255,0.82)" }}>
-                                        {status}
-                                    </Typography>
-                                </Box>
-                            </Stack>
-                        )}
 
                         <Box
                             sx={{
@@ -2609,6 +3002,50 @@ export default function YoutubePage() {
                                                         {selectedVideo.title}
                                                     </Typography>
 
+                                                    <Stack
+                                                        direction={{ xs: "column", sm: "row" }}
+                                                        spacing={1}
+                                                        alignItems={{ xs: "stretch", sm: "center" }}
+                                                        sx={{ mt: 0.75 }}
+                                                    >
+                                                        <Stack direction="row" spacing={0.75} alignItems="center" sx={{ flex: 1, minWidth: 0 }}>
+                                                            <LinkRoundedIcon sx={{ color: "#67e8f9", flexShrink: 0 }} fontSize="small" />
+                                                            <Typography
+                                                                component="a"
+                                                                href={buildYoutubeWatchUrl(selectedVideo.id)}
+                                                                target="_blank"
+                                                                rel="noopener noreferrer"
+                                                                variant="body2"
+                                                                sx={{
+                                                                    color: "#67e8f9",
+                                                                    wordBreak: "break-all",
+                                                                    textDecoration: "none",
+                                                                    userSelect: "all",
+                                                                    minWidth: 0,
+                                                                    '&:hover': { textDecoration: "underline" },
+                                                                }}
+                                                            >
+                                                                {buildYoutubeWatchUrl(selectedVideo.id)}
+                                                            </Typography>
+                                                        </Stack>
+
+                                                        <Button
+                                                            size="small"
+                                                            variant="outlined"
+                                                            startIcon={<ContentCopyRoundedIcon />}
+                                                            onClick={copySelectedVideoLink}
+                                                            sx={{
+                                                                borderRadius: 999,
+                                                                color: "#fff",
+                                                                borderColor: "rgba(255,255,255,0.18)",
+                                                                fontWeight: 900,
+                                                                alignSelf: { xs: "flex-start", sm: "center" },
+                                                            }}
+                                                        >
+                                                            Copy link
+                                                        </Button>
+                                                    </Stack>
+
                                                     <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
                                                         {selectedVideo.channelTitle}
                                                         {selectedVideo.duration ? ` • ${selectedVideo.duration}` : ""}
@@ -2675,8 +3112,10 @@ export default function YoutubePage() {
                                     browseTitle,
                                     showingRecommendations
                                         ? savedQueryRecommendationsReady
-                                            ? "No query is active, so Browse is mixing real videos from saved cookie queries."
-                                            : "No query is active, so this same Browse container shows real organic videos from YouTube."
+                                            ? "No query is active, so Discover is mixing real videos from saved searches."
+                                            : organicInterestReady
+                                                ? "No query is active, so Discover is mixing local interests with real YouTube videos."
+                                                : "No query is active, so Discover shows real popular videos from YouTube."
                                         : `Active query: ${activeQuery}`,
                                     <Stack spacing={2}>
                                         <Stack

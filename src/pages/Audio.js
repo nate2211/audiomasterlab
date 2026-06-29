@@ -2,8 +2,13 @@ import React, { useEffect, useRef, useState } from "react";
 import {
     Box,
     Button,
+    Chip,
     Divider,
+    FormControl,
+    InputLabel,
     LinearProgress,
+    MenuItem,
+    Select,
     Slider,
     Stack,
     TextField,
@@ -66,6 +71,257 @@ const DEFAULT_SETTINGS = {
     outputGain: 0,
 };
 
+const HUMAN_SAFE_LIMITS = {
+    baseVolume: { min: 0, max: 1.35 },
+
+    clarityAmount: { min: 0, max: 0.85 },
+    demudAmount: { min: 0, max: 0.85 },
+    deEssAmount: { min: 0, max: 0.85 },
+    deEssFrequency: { min: 4000, max: 11000 },
+
+    lowGain: { min: -12, max: 10 },
+    midGain: { min: -12, max: 8 },
+    highGain: { min: -12, max: 6 },
+    highPass: { min: 20, max: 1000 },
+    lowPass: { min: 2000, max: 20000 },
+
+    pan: { min: -1, max: 1 },
+
+    reverbMix: { min: 0, max: 0.65 },
+    reverbSeconds: { min: 0.15, max: 5 },
+
+    delayMix: { min: 0, max: 0.55 },
+    delayTime: { min: 0, max: 1.25 },
+    delayFeedback: { min: 0, max: 0.62 },
+
+    speed: { min: 0.8, max: 1.25 },
+    pitchSemitones: { min: -7, max: 7 },
+
+    compressorThreshold: { min: -48, max: -2 },
+    compressorRatio: { min: 1, max: 8 },
+    outputGain: { min: -18, max: 6 },
+};
+
+const MIXER_PRESETS = [
+    {
+        key: "flat",
+        label: "Clean default",
+        shortLabel: "Clean",
+        description:
+            "Neutral playback with the safe limiter ranges active. Best starting point before manual edits.",
+        settings: DEFAULT_SETTINGS,
+    },
+    {
+        key: "halftime-85",
+        label: "85% halftime bounce",
+        shortLabel: "85% halftime",
+        description:
+            "Safe 0.85x halftime feel with light pitch drop, body, and room. It will never go below 0.80x.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            speed: 0.85,
+            pitchSemitones: -2,
+            lowGain: 2,
+            midGain: -1.5,
+            highGain: 1,
+            lowPass: 16000,
+            reverbMix: 0.18,
+            reverbSeconds: 2.4,
+            delayMix: 0.08,
+            delayTime: 0.33,
+            delayFeedback: 0.18,
+            compressorThreshold: -20,
+            compressorRatio: 3,
+            outputGain: -2,
+        },
+    },
+    {
+        key: "slowed-reverb",
+        label: "Slowed + reverb",
+        shortLabel: "Slowed reverb",
+        description:
+            "Classic slowed/reverb sound without unsafe speed, harsh treble, or excessive wet mix.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            speed: 0.88,
+            pitchSemitones: -1.5,
+            lowGain: 2.5,
+            midGain: -2,
+            highGain: 0.75,
+            highPass: 30,
+            lowPass: 14500,
+            reverbMix: 0.38,
+            reverbSeconds: 3.2,
+            delayMix: 0.11,
+            delayTime: 0.42,
+            delayFeedback: 0.24,
+            compressorThreshold: -22,
+            compressorRatio: 3.5,
+            outputGain: -2.5,
+        },
+    },
+    {
+        key: "dream-room",
+        label: "Dream room",
+        shortLabel: "Dream",
+        description:
+            "More atmosphere than the slowed preset, with a safer low-pass and controlled high gain.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            speed: 0.92,
+            pitchSemitones: -1,
+            lowGain: 1.5,
+            midGain: -1,
+            highGain: 1.25,
+            highPass: 42,
+            lowPass: 13200,
+            reverbMix: 0.48,
+            reverbSeconds: 4.2,
+            delayMix: 0.16,
+            delayTime: 0.5,
+            delayFeedback: 0.32,
+            compressorThreshold: -24,
+            compressorRatio: 3.2,
+            outputGain: -3,
+        },
+    },
+    {
+        key: "warm-master",
+        label: "Warm safe master",
+        shortLabel: "Warm",
+        description:
+            "Gentle mastering preset for fuller lows, less mud, and controlled final output.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.25,
+            demudAmount: 0.35,
+            deEssAmount: 0.2,
+            lowGain: 1.5,
+            midGain: -1,
+            highGain: 1.5,
+            highPass: 28,
+            lowPass: 19000,
+            compressorThreshold: -18,
+            compressorRatio: 3.5,
+            outputGain: -1,
+        },
+    },
+    {
+        key: "vocal-clarity",
+        label: "Vocal clarity",
+        shortLabel: "Vocal",
+        description:
+            "Brings speech and vocals forward while keeping sibilance and high EQ in a safer range.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.5,
+            demudAmount: 0.5,
+            deEssAmount: 0.48,
+            deEssFrequency: 7200,
+            lowGain: -1,
+            midGain: 1.5,
+            highGain: 2.5,
+            highPass: 85,
+            lowPass: 18000,
+            compressorThreshold: -21,
+            compressorRatio: 3,
+            outputGain: -1.5,
+        },
+    },
+    {
+        key: "bass-safe",
+        label: "Bass-safe boost",
+        shortLabel: "Bass safe",
+        description:
+            "Adds bass weight without letting low EQ or output gain run into easy clipping territory.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            demudAmount: 0.22,
+            lowGain: 4,
+            midGain: -1,
+            highGain: 0.5,
+            highPass: 35,
+            lowPass: 18000,
+            compressorThreshold: -20,
+            compressorRatio: 4.2,
+            outputGain: -2,
+        },
+    },
+    {
+        key: "phone-speaker",
+        label: "Phone speaker safe",
+        shortLabel: "Phone",
+        description:
+            "Cuts deep lows and adds controlled presence so small speakers stay more readable.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.42,
+            demudAmount: 0.42,
+            deEssAmount: 0.32,
+            lowGain: -2,
+            midGain: 1.5,
+            highGain: 2.25,
+            highPass: 120,
+            lowPass: 15000,
+            compressorThreshold: -20,
+            compressorRatio: 4,
+            outputGain: -2,
+        },
+    },
+    {
+        key: "night-energy",
+        label: "Night energy",
+        shortLabel: "Energy",
+        description:
+            "Small speed and pitch lift for energy, still inside human-safe playback and gain limits.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            speed: 1.1,
+            pitchSemitones: 1.5,
+            clarityAmount: 0.28,
+            lowGain: 0.5,
+            midGain: 0.5,
+            highGain: 1.75,
+            highPass: 35,
+            lowPass: 19000,
+            reverbMix: 0.08,
+            reverbSeconds: 1.4,
+            compressorThreshold: -18,
+            compressorRatio: 3,
+            outputGain: -1.5,
+        },
+    },
+    {
+        key: "wide-clean",
+        label: "Wide clean space",
+        shortLabel: "Wide clean",
+        description:
+            "A wider, polished mix with light pan-safe space, controlled air, and no risky treble boost.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.34,
+            demudAmount: 0.24,
+            deEssAmount: 0.25,
+            lowGain: 0.75,
+            midGain: -0.75,
+            highGain: 2,
+            highPass: 32,
+            lowPass: 17500,
+            pan: 0,
+            reverbMix: 0.22,
+            reverbSeconds: 2.2,
+            delayMix: 0.07,
+            delayTime: 0.28,
+            delayFeedback: 0.16,
+            compressorThreshold: -19,
+            compressorRatio: 3.2,
+            outputGain: -1.5,
+        },
+    },
+];
+
+
+
 const STREAMING_MANIFEST_EXTENSIONS = [".m3u8", ".mpd", ".ism", ".f4m"];
 
 const MEDIA_EXTENSION_HINTS = [
@@ -103,6 +359,21 @@ function numberOrDefault(value, fallback) {
     return Number.isFinite(number) ? number : fallback;
 }
 
+function limitSettingValue(key, value, fallback = DEFAULT_SETTINGS[key]) {
+    const limit = HUMAN_SAFE_LIMITS[key];
+    const safeNumber = numberOrDefault(value, fallback);
+
+    if (!limit) {
+        return safeNumber;
+    }
+
+    return clamp(safeNumber, limit.min, limit.max);
+}
+
+function getMixerPreset(key) {
+    return MIXER_PRESETS.find((preset) => preset.key === key) || MIXER_PRESETS[0];
+}
+
 function normalizeSettings(value) {
     const merged = {
         ...DEFAULT_SETTINGS,
@@ -110,42 +381,37 @@ function normalizeSettings(value) {
     };
 
     return {
-        baseVolume: clamp(numberOrDefault(merged.baseVolume, 1), 0, 2),
+        baseVolume: limitSettingValue("baseVolume", merged.baseVolume),
 
-        clarityAmount: clamp(numberOrDefault(merged.clarityAmount, 0), 0, 1),
-        demudAmount: clamp(numberOrDefault(merged.demudAmount, 0), 0, 1),
-        deEssAmount: clamp(numberOrDefault(merged.deEssAmount, 0), 0, 1),
-        deEssFrequency: clamp(
-            numberOrDefault(merged.deEssFrequency, 6500),
-            4000,
-            11000
+        clarityAmount: limitSettingValue("clarityAmount", merged.clarityAmount),
+        demudAmount: limitSettingValue("demudAmount", merged.demudAmount),
+        deEssAmount: limitSettingValue("deEssAmount", merged.deEssAmount),
+        deEssFrequency: limitSettingValue("deEssFrequency", merged.deEssFrequency),
+
+        lowGain: limitSettingValue("lowGain", merged.lowGain),
+        midGain: limitSettingValue("midGain", merged.midGain),
+        highGain: limitSettingValue("highGain", merged.highGain),
+        highPass: limitSettingValue("highPass", merged.highPass),
+        lowPass: limitSettingValue("lowPass", merged.lowPass),
+
+        pan: limitSettingValue("pan", merged.pan),
+
+        reverbMix: limitSettingValue("reverbMix", merged.reverbMix),
+        reverbSeconds: limitSettingValue("reverbSeconds", merged.reverbSeconds),
+
+        delayMix: limitSettingValue("delayMix", merged.delayMix),
+        delayTime: limitSettingValue("delayTime", merged.delayTime),
+        delayFeedback: limitSettingValue("delayFeedback", merged.delayFeedback),
+
+        speed: limitSettingValue("speed", merged.speed),
+        pitchSemitones: limitSettingValue("pitchSemitones", merged.pitchSemitones),
+
+        compressorThreshold: limitSettingValue(
+            "compressorThreshold",
+            merged.compressorThreshold
         ),
-
-        lowGain: clamp(numberOrDefault(merged.lowGain, 0), -18, 18),
-        midGain: clamp(numberOrDefault(merged.midGain, 0), -18, 18),
-        highGain: clamp(numberOrDefault(merged.highGain, 0), -18, 18),
-        highPass: clamp(numberOrDefault(merged.highPass, 20), 20, 1000),
-        lowPass: clamp(numberOrDefault(merged.lowPass, 20000), 2000, 20000),
-
-        pan: clamp(numberOrDefault(merged.pan, 0), -1, 1),
-
-        reverbMix: clamp(numberOrDefault(merged.reverbMix, 0), 0, 1),
-        reverbSeconds: clamp(numberOrDefault(merged.reverbSeconds, 1.8), 0.15, 6),
-
-        delayMix: clamp(numberOrDefault(merged.delayMix, 0), 0, 1),
-        delayTime: clamp(numberOrDefault(merged.delayTime, 0.25), 0, 2),
-        delayFeedback: clamp(numberOrDefault(merged.delayFeedback, 0.25), 0, 0.88),
-
-        speed: clamp(numberOrDefault(merged.speed, 1), 0.25, 4),
-        pitchSemitones: clamp(numberOrDefault(merged.pitchSemitones, 0), -24, 24),
-
-        compressorThreshold: clamp(
-            numberOrDefault(merged.compressorThreshold, -18),
-            -60,
-            0
-        ),
-        compressorRatio: clamp(numberOrDefault(merged.compressorRatio, 3), 1, 20),
-        outputGain: clamp(numberOrDefault(merged.outputGain, 0), -24, 12),
+        compressorRatio: limitSettingValue("compressorRatio", merged.compressorRatio),
+        outputGain: limitSettingValue("outputGain", merged.outputGain),
     };
 }
 
@@ -1301,6 +1567,7 @@ export default function Audio() {
     const [playlist, setPlaylist] = useState([]);
     const [activePlaylistIndex, setActivePlaylistIndex] = useState(-1);
     const [repeatEnabled, setRepeatEnabled] = useState(false);
+    const [activePresetKey, setActivePresetKey] = useState("flat");
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
@@ -1318,6 +1585,11 @@ export default function Audio() {
         playlist.length,
         activePlaylistIndex
     );
+    const selectedPreset = getMixerPreset(activePresetKey);
+    const selectedPresetDescription =
+        activePresetKey === "custom"
+            ? "Manual custom safe mix. Your edits still stay inside the human-safe speed, EQ, feedback, and output limits."
+            : selectedPreset.description;
 
     useEffect(() => {
         document.title = "Audio Tool | AudioBufferSourceNode Mixer";
@@ -2502,6 +2774,8 @@ export default function Audio() {
 
         if (!Number.isFinite(cleanValue)) return;
 
+        setActivePresetKey("custom");
+
         setSettings((previous) => {
             const nextSettings = normalizeSettings({
                 ...previous,
@@ -2551,6 +2825,43 @@ export default function Audio() {
         });
     }
 
+    function applyMixerPreset(presetKey) {
+        const preset = getMixerPreset(presetKey);
+        const nextSettings = normalizeSettings(preset.settings);
+        const currentOffset = playingRef.current ? getCurrentOffset() : position;
+
+        latestSettingsRef.current = nextSettings;
+        currentEffectiveRateRef.current = getEffectivePlaybackRate(nextSettings);
+
+        if (playingRef.current && activeSourceRef.current && audioContextRef.current) {
+            const context = audioContextRef.current;
+
+            startedOffsetRef.current = currentOffset;
+            startedAtContextTimeRef.current = context.currentTime;
+
+            applySourcePlaybackSettings(
+                activeSourceRef.current,
+                nextSettings,
+                context.currentTime
+            );
+
+            setPosition(currentOffset);
+        }
+
+        setSettings(nextSettings);
+        setActivePresetKey(preset.key);
+
+        if (liveNodesRef.current && audioContextRef.current) {
+            applySettingsToNodes(
+                liveNodesRef.current,
+                nextSettings,
+                audioContextRef.current.currentTime
+            );
+        }
+
+        setInfo(`Applied preset: ${preset.label}. ${preset.description}`);
+    }
+
     function resetMixer() {
         const currentOffset = playingRef.current ? getCurrentOffset() : position;
 
@@ -2573,6 +2884,7 @@ export default function Audio() {
         }
 
         setSettings(DEFAULT_SETTINGS);
+        setActivePresetKey("flat");
 
         if (liveNodesRef.current && audioContextRef.current) {
             applySettingsToNodes(
@@ -3577,8 +3889,9 @@ export default function Audio() {
                                                             <Slider
                                                                 value={settingsView.baseVolume}
                                                                 min={0}
-                                                                max={2}
+                                                                max={HUMAN_SAFE_LIMITS.baseVolume.max}
                                                                 step={0.01}
+                                                                aria-label="Safe base volume"
                                                                 disabled={isRendering || isLoading}
                                                                 onChange={(_, value) =>
                                                                     updateSetting(
@@ -3827,6 +4140,169 @@ export default function Audio() {
 
                             <Box
                                 sx={{
+                                    p: 2,
+                                    borderRadius: 4,
+                                    border: "1px solid rgba(103,232,249,0.18)",
+                                    background:
+                                        "linear-gradient(135deg, rgba(103,232,249,0.08), rgba(167,139,250,0.08))",
+                                }}
+                            >
+                                <Stack spacing={2}>
+                                    <Stack
+                                        direction={{ xs: "column", md: "row" }}
+                                        spacing={2}
+                                        alignItems={{ xs: "stretch", md: "center" }}
+                                    >
+                                        <FormControl
+                                            fullWidth
+                                            disabled={isRendering || isLoading}
+                                            sx={{
+                                                "& .MuiInputLabel-root": {
+                                                    color: "rgba(255,255,255,0.72)",
+                                                },
+                                                "& .MuiOutlinedInput-root": {
+                                                    color: "#fff",
+                                                    borderRadius: 3,
+                                                    background: "rgba(7,10,19,0.66)",
+                                                    "& fieldset": {
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                    },
+                                                    "&:hover fieldset": {
+                                                        borderColor: "rgba(103,232,249,0.5)",
+                                                    },
+                                                },
+                                                "& .MuiSvgIcon-root": {
+                                                    color: "#67e8f9",
+                                                },
+                                            }}
+                                        >
+                                            <InputLabel id="mixer-preset-label">
+                                                Mixer preset
+                                            </InputLabel>
+                                            <Select
+                                                labelId="mixer-preset-label"
+                                                id="mixer-preset-select"
+                                                value={activePresetKey}
+                                                label="Mixer preset"
+                                                onChange={(event) =>
+                                                    applyMixerPreset(event.target.value)
+                                                }
+                                                inputProps={{
+                                                    "aria-label": "Choose a safe mixer preset",
+                                                }}
+                                            >
+                                                {activePresetKey === "custom" && (
+                                                    <MenuItem value="custom" disabled>
+                                                        Custom safe mix
+                                                    </MenuItem>
+                                                )}
+
+                                                {MIXER_PRESETS.map((preset) => (
+                                                    <MenuItem key={preset.key} value={preset.key}>
+                                                        {preset.label}
+                                                    </MenuItem>
+                                                ))}
+                                            </Select>
+                                        </FormControl>
+
+                                        <Stack
+                                            direction="row"
+                                            spacing={1}
+                                            flexWrap="wrap"
+                                            useFlexGap
+                                            aria-label="Preset safety limits"
+                                        >
+                                            <Chip
+                                                size="small"
+                                                label="Min speed 0.80x"
+                                                sx={{
+                                                    color: "#67e8f9",
+                                                    borderColor: "rgba(103,232,249,0.35)",
+                                                    fontWeight: 900,
+                                                }}
+                                                variant="outlined"
+                                            />
+                                            <Chip
+                                                size="small"
+                                                label="High EQ max +6 dB"
+                                                sx={{
+                                                    color: "#a78bfa",
+                                                    borderColor: "rgba(167,139,250,0.35)",
+                                                    fontWeight: 900,
+                                                }}
+                                                variant="outlined"
+                                            />
+                                            <Chip
+                                                size="small"
+                                                label="Output max +6 dB"
+                                                sx={{
+                                                    color: "#fff",
+                                                    borderColor: "rgba(255,255,255,0.22)",
+                                                    fontWeight: 900,
+                                                }}
+                                                variant="outlined"
+                                            />
+                                        </Stack>
+                                    </Stack>
+
+                                    <Typography
+                                        variant="body2"
+                                        sx={{ color: "rgba(255,255,255,0.68)", lineHeight: 1.65 }}
+                                    >
+                                        {selectedPresetDescription}
+                                    </Typography>
+
+                                    <Box
+                                        role="list"
+                                        aria-label="Quick mixer preset buttons"
+                                        sx={{
+                                            display: "grid",
+                                            gridTemplateColumns: {
+                                                xs: "1fr",
+                                                sm: "1fr 1fr",
+                                                lg: "repeat(4, 1fr)",
+                                            },
+                                            gap: 1,
+                                        }}
+                                    >
+                                        {MIXER_PRESETS.map((preset) => {
+                                            const selected = activePresetKey === preset.key;
+
+                                            return (
+                                                <Button
+                                                    key={preset.key}
+                                                    role="listitem"
+                                                    type="button"
+                                                    variant={selected ? "contained" : "outlined"}
+                                                    aria-pressed={selected}
+                                                    onClick={() => applyMixerPreset(preset.key)}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        justifyContent: "flex-start",
+                                                        borderRadius: 3,
+                                                        px: 1.4,
+                                                        py: 1,
+                                                        color: selected ? "#06111e" : "#fff",
+                                                        borderColor: "rgba(255,255,255,0.16)",
+                                                        fontWeight: 950,
+                                                        background: selected
+                                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                            : "rgba(255,255,255,0.03)",
+                                                        textAlign: "left",
+                                                    }}
+                                                >
+                                                    {preset.shortLabel || preset.label}
+                                                </Button>
+                                            );
+                                        })}
+                                    </Box>
+                                </Stack>
+                            </Box>
+
+                            <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                            <Box
+                                sx={{
                                     display: "grid",
                                     gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
                                     gap: 2.5,
@@ -3846,8 +4322,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Convolution reverb"
                                     value={settingsView.reverbMix}
-                                    min={0}
-                                    max={1}
+                                    min={HUMAN_SAFE_LIMITS.reverbMix.min}
+                                    max={HUMAN_SAFE_LIMITS.reverbMix.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3857,8 +4333,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Reverb size"
                                     value={settingsView.reverbSeconds}
-                                    min={0.15}
-                                    max={6}
+                                    min={HUMAN_SAFE_LIMITS.reverbSeconds.min}
+                                    max={HUMAN_SAFE_LIMITS.reverbSeconds.max}
                                     step={0.05}
                                     unit=" sec"
                                     disabled={isRendering || isLoading}
@@ -3868,8 +4344,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Delay mix"
                                     value={settingsView.delayMix}
-                                    min={0}
-                                    max={1}
+                                    min={HUMAN_SAFE_LIMITS.delayMix.min}
+                                    max={HUMAN_SAFE_LIMITS.delayMix.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3879,8 +4355,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Delay time"
                                     value={settingsView.delayTime}
-                                    min={0}
-                                    max={2}
+                                    min={HUMAN_SAFE_LIMITS.delayTime.min}
+                                    max={HUMAN_SAFE_LIMITS.delayTime.max}
                                     step={0.01}
                                     unit=" sec"
                                     disabled={isRendering || isLoading}
@@ -3890,8 +4366,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Delay feedback"
                                     value={settingsView.delayFeedback}
-                                    min={0}
-                                    max={0.88}
+                                    min={HUMAN_SAFE_LIMITS.delayFeedback.min}
+                                    max={HUMAN_SAFE_LIMITS.delayFeedback.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3901,8 +4377,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="ClarityChain"
                                     value={settingsView.clarityAmount}
-                                    min={0}
-                                    max={1}
+                                    min={HUMAN_SAFE_LIMITS.clarityAmount.min}
+                                    max={HUMAN_SAFE_LIMITS.clarityAmount.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3912,8 +4388,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Demudder"
                                     value={settingsView.demudAmount}
-                                    min={0}
-                                    max={1}
+                                    min={HUMAN_SAFE_LIMITS.demudAmount.min}
+                                    max={HUMAN_SAFE_LIMITS.demudAmount.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3923,8 +4399,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="De-esser"
                                     value={settingsView.deEssAmount}
-                                    min={0}
-                                    max={1}
+                                    min={HUMAN_SAFE_LIMITS.deEssAmount.min}
+                                    max={HUMAN_SAFE_LIMITS.deEssAmount.max}
                                     step={0.01}
                                     unit=""
                                     disabled={isRendering || isLoading}
@@ -3945,8 +4421,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Low EQ"
                                     value={settingsView.lowGain}
-                                    min={-18}
-                                    max={18}
+                                    min={HUMAN_SAFE_LIMITS.lowGain.min}
+                                    max={HUMAN_SAFE_LIMITS.lowGain.max}
                                     step={0.5}
                                     unit=" dB"
                                     disabled={isRendering || isLoading}
@@ -3956,8 +4432,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Mid EQ"
                                     value={settingsView.midGain}
-                                    min={-18}
-                                    max={18}
+                                    min={HUMAN_SAFE_LIMITS.midGain.min}
+                                    max={HUMAN_SAFE_LIMITS.midGain.max}
                                     step={0.5}
                                     unit=" dB"
                                     disabled={isRendering || isLoading}
@@ -3967,8 +4443,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="High EQ"
                                     value={settingsView.highGain}
-                                    min={-18}
-                                    max={18}
+                                    min={HUMAN_SAFE_LIMITS.highGain.min}
+                                    max={HUMAN_SAFE_LIMITS.highGain.max}
                                     step={0.5}
                                     unit=" dB"
                                     disabled={isRendering || isLoading}
@@ -4000,8 +4476,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Speed playbackRate"
                                     value={settingsView.speed}
-                                    min={0.5}
-                                    max={2}
+                                    min={HUMAN_SAFE_LIMITS.speed.min}
+                                    max={HUMAN_SAFE_LIMITS.speed.max}
                                     step={0.01}
                                     unit="x"
                                     disabled={isRendering || isLoading}
@@ -4011,8 +4487,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Pitch detune"
                                     value={settingsView.pitchSemitones}
-                                    min={-12}
-                                    max={12}
+                                    min={HUMAN_SAFE_LIMITS.pitchSemitones.min}
+                                    max={HUMAN_SAFE_LIMITS.pitchSemitones.max}
                                     step={0.1}
                                     unit=" st"
                                     disabled={isRendering || isLoading}
@@ -4022,8 +4498,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Compressor threshold"
                                     value={settingsView.compressorThreshold}
-                                    min={-60}
-                                    max={0}
+                                    min={HUMAN_SAFE_LIMITS.compressorThreshold.min}
+                                    max={HUMAN_SAFE_LIMITS.compressorThreshold.max}
                                     step={1}
                                     unit=" dB"
                                     disabled={isRendering || isLoading}
@@ -4035,8 +4511,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Compressor ratio"
                                     value={settingsView.compressorRatio}
-                                    min={1}
-                                    max={20}
+                                    min={HUMAN_SAFE_LIMITS.compressorRatio.min}
+                                    max={HUMAN_SAFE_LIMITS.compressorRatio.max}
                                     step={0.5}
                                     unit=":1"
                                     disabled={isRendering || isLoading}
@@ -4046,8 +4522,8 @@ export default function Audio() {
                                 <ControlSlider
                                     label="Output gain"
                                     value={settingsView.outputGain}
-                                    min={-24}
-                                    max={12}
+                                    min={HUMAN_SAFE_LIMITS.outputGain.min}
+                                    max={HUMAN_SAFE_LIMITS.outputGain.max}
                                     step={0.5}
                                     unit=" dB"
                                     disabled={isRendering || isLoading}
@@ -4084,10 +4560,12 @@ export default function Audio() {
                             >
                                 Best support: MP3, WAV, OGG/Opus, WebM audio/video,
                                 M4A, MP4, MOV, AAC, CAF, and browser-supported containers.
-                                iPhone files from iCloud Drive, Google Drive, Proton Drive,
-                                Dropbox, and other providers may need to be downloaded locally
-                                first. HLS/DASH manifests, DRM streams, and normal streaming pages
-                                are not direct decodable files.
+                                Mixer knobs are clamped to human-safe ranges: speed cannot go
+                                below 0.80x, high EQ cannot exceed +6 dB, and output gain cannot
+                                exceed +6 dB. iPhone files from iCloud Drive, Google Drive, Proton
+                                Drive, Dropbox, and other providers may need to be downloaded
+                                locally first. HLS/DASH manifests, DRM streams, and normal
+                                streaming pages are not direct decodable files.
                             </Typography>
 
                             {mixerEnabled && (

@@ -27,7 +27,9 @@ import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import AudiotrackRoundedIcon from "@mui/icons-material/AudiotrackRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
-
+import MicRoundedIcon from "@mui/icons-material/MicRounded";
+import SubtitlesRoundedIcon from "@mui/icons-material/SubtitlesRounded";
+import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
 export function NavBar() {
     const location = useLocation();
 
@@ -48,10 +50,27 @@ export function NavBar() {
             icon: <YouTubeIcon fontSize="small" />,
         },
         {
+            label: "Archive",
+            path: "/archive",
+            icon: <AudioFileRoundedIcon fontSize="small" />,
+        },
+        {
+            label: "Recorder",
+            path: "/recorder",
+            icon: <MicRoundedIcon fontSize="small" />,
+        },
+        {
             label: "Editor",
             path: "/editor",
             icon: <TimelineRoundedIcon fontSize="small" />,
         },
+
+        {
+            label: "Transcripe",
+            path: "/transcripe",
+            icon: <SubtitlesRoundedIcon fontSize="small" />,
+        },
+
     ];
 
     return (
