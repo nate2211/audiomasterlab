@@ -1,7 +1,11 @@
 https://audiomasterlab.com/
 https://audiomasterlab.com/audio
 https://audiomasterlab.com/editor
-https://audiomasterlab.com/youtube
 https://audiomasterlab.com/recorder
-https://audiomasterlab.com/transcripe
-https://audiomasterlab.com/archive
+https://audiomasterlab.com/transcribe
+https://audiomasterlab.com/help
+https://audiomasterlab.com/about
+https://audiomasterlab.com/contact
+https://audiomasterlab.com/privacy
+https://audiomasterlab.com/terms
+https://audiomasterlab.com/copyright

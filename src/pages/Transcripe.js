@@ -15,6 +15,7 @@ import {
     TextField,
     Typography,
     FormControlLabel,
+    useMediaQuery,
 } from "@mui/material";
 
 import CloudUploadRoundedIcon from "@mui/icons-material/CloudUploadRounded";
@@ -25,10 +26,26 @@ import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
+import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
+import SaveRoundedIcon from "@mui/icons-material/SaveRounded";
+import PhoneIphoneRoundedIcon from "@mui/icons-material/PhoneIphoneRounded";
+import StorageRoundedIcon from "@mui/icons-material/StorageRounded";
 
 import { GlassCard, PageShell, StatusBanner } from "../components/Components.js";
 
 let transformersModulePromise = null;
+
+const MODEL_ID = "onnx-community/whisper-tiny.en";
+const MAX_FILE_SIZE_MB = 90;
+const LONG_AUDIO_WARNING_SECONDS = 12 * 60;
+
+const PROGRESS_COOKIE_NAME = "aml_transcribe_model_progress_v3";
+const SETTINGS_COOKIE_NAME = "aml_transcribe_settings_v3";
+const TRANSCRIPT_STORAGE_KEY = "aml_transcribe_transcript_draft_v3";
+const CHUNKS_STORAGE_KEY = "aml_transcribe_chunks_draft_v3";
+const FILE_META_STORAGE_KEY = "aml_transcribe_file_meta_v3";
+
+const COOKIE_MAX_AGE_DAYS = 30;
 
 async function loadTransformers() {
     if (!transformersModulePromise) {
@@ -41,15 +58,102 @@ async function loadTransformers() {
     env.allowRemoteModels = true;
     env.useBrowserCache = true;
 
-    // Use the hosted WASM binaries unless you decide to self-host them later.
-    // Hugging Face documents that Transformers.js uses hosted pretrained models
-    // and precompiled WASM binaries by default.
     return { pipeline };
 }
 
-const MODEL_ID = "onnx-community/whisper-tiny.en";
-const MAX_FILE_SIZE_MB = 90;
-const LONG_AUDIO_WARNING_SECONDS = 12 * 60;
+function canUseBrowserStorage() {
+    return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
+
+function setCookieValue(name, value, maxAgeDays = COOKIE_MAX_AGE_DAYS) {
+    if (typeof document === "undefined") return;
+
+    const maxAgeSeconds = Math.max(1, maxAgeDays) * 24 * 60 * 60;
+
+    document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(
+        value
+    )}; max-age=${maxAgeSeconds}; path=/; SameSite=Lax`;
+}
+
+function getCookieValue(name) {
+    if (typeof document === "undefined") return "";
+
+    const encodedName = encodeURIComponent(name);
+    const parts = document.cookie ? document.cookie.split(";") : [];
+
+    for (const part of parts) {
+        const [rawKey, ...rawValue] = part.trim().split("=");
+
+        if (rawKey === encodedName) {
+            return decodeURIComponent(rawValue.join("=") || "");
+        }
+    }
+
+    return "";
+}
+
+function deleteCookieValue(name) {
+    if (typeof document === "undefined") return;
+
+    document.cookie = `${encodeURIComponent(name)}=; max-age=0; path=/; SameSite=Lax`;
+}
+
+function readJsonCookie(name, fallback) {
+    const raw = getCookieValue(name);
+
+    if (!raw) return fallback;
+
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function writeJsonCookie(name, value, maxAgeDays = COOKIE_MAX_AGE_DAYS) {
+    try {
+        const json = JSON.stringify(value || {});
+        setCookieValue(name, json, maxAgeDays);
+    } catch {
+        // Ignore cookie write failures.
+    }
+}
+
+function readLocalJson(key, fallback) {
+    if (!canUseBrowserStorage()) return fallback;
+
+    try {
+        const raw = window.localStorage.getItem(key);
+
+        if (!raw) return fallback;
+
+        const parsed = JSON.parse(raw);
+        return parsed ?? fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function writeLocalJson(key, value) {
+    if (!canUseBrowserStorage()) return;
+
+    try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+        // Storage can fail on private browsing or full storage.
+    }
+}
+
+function deleteLocalValue(key) {
+    if (!canUseBrowserStorage()) return;
+
+    try {
+        window.localStorage.removeItem(key);
+    } catch {
+        // Safe cleanup.
+    }
+}
 
 function formatBytes(size) {
     const bytes = Number(size);
@@ -168,7 +272,26 @@ function isMissingScaleError(error) {
     );
 }
 
+function getSavedProgressSummary() {
+    const savedProgress = readJsonCookie(PROGRESS_COOKIE_NAME, null);
+    const savedSettings = readJsonCookie(SETTINGS_COOKIE_NAME, null);
+    const savedFileMeta = readLocalJson(FILE_META_STORAGE_KEY, null);
+    const savedTranscript = canUseBrowserStorage()
+        ? window.localStorage.getItem(TRANSCRIPT_STORAGE_KEY) || ""
+        : "";
+
+    return {
+        savedProgress,
+        savedSettings,
+        savedFileMeta,
+        hasTranscriptDraft: Boolean(savedTranscript),
+    };
+}
+
 export default function Transcripe() {
+    const isMobile = useMediaQuery("(max-width:700px)");
+    const isTablet = useMediaQuery("(max-width:1100px)");
+
     const transcriberRef = useRef(null);
     const objectUrlRef = useRef("");
 
@@ -177,8 +300,10 @@ export default function Transcripe() {
     const [duration, setDuration] = useState(0);
 
     const [withTimestamps, setWithTimestamps] = useState(false);
+    const [restoreLoaded, setRestoreLoaded] = useState(false);
 
     const [busy, setBusy] = useState(false);
+    const [modelReady, setModelReady] = useState(false);
     const [progress, setProgress] = useState(0);
     const [status, setStatus] = useState(
         "Upload an audio file, then press Transcribe Audio."
@@ -187,15 +312,55 @@ export default function Transcripe() {
 
     const [transcript, setTranscript] = useState("");
     const [chunks, setChunks] = useState([]);
+    const [savedFileMeta, setSavedFileMeta] = useState(null);
 
     const fileTooLarge = file?.size > MAX_FILE_SIZE_MB * 1024 * 1024;
     const longAudioWarning = duration > LONG_AUDIO_WARNING_SECONDS;
-    const baseFileName = makeBaseName(file?.name);
+    const baseFileName = makeBaseName(file?.name || savedFileMeta?.name);
     const wordCount = getWordCount(transcript);
 
     const srtText = useMemo(() => buildSrt(chunks), [chunks]);
 
+    const savedSummary = useMemo(() => getSavedProgressSummary(), [restoreLoaded]);
+
     useEffect(() => {
+        const savedSettings = readJsonCookie(SETTINGS_COOKIE_NAME, {});
+        const savedProgress = readJsonCookie(PROGRESS_COOKIE_NAME, {});
+        const nextTranscript = canUseBrowserStorage()
+            ? window.localStorage.getItem(TRANSCRIPT_STORAGE_KEY) || ""
+            : "";
+        const nextChunks = readLocalJson(CHUNKS_STORAGE_KEY, []);
+        const nextFileMeta = readLocalJson(FILE_META_STORAGE_KEY, null);
+
+        if (typeof savedSettings.withTimestamps === "boolean") {
+            setWithTimestamps(savedSettings.withTimestamps);
+        }
+
+        if (nextTranscript) {
+            setTranscript(nextTranscript);
+        }
+
+        if (Array.isArray(nextChunks)) {
+            setChunks(nextChunks);
+        }
+
+        if (nextFileMeta && typeof nextFileMeta === "object") {
+            setSavedFileMeta(nextFileMeta);
+        }
+
+        if (savedProgress?.status) {
+            setStatus(
+                savedProgress.completed
+                    ? "Restored your last transcript draft. Upload the same audio again if you want to re-run transcription."
+                    : savedProgress.status
+            );
+            setTone(savedProgress.tone || "info");
+            setProgress(Number(savedProgress.progress || 0));
+            setModelReady(Boolean(savedProgress.modelReady));
+        }
+
+        setRestoreLoaded(true);
+
         return () => {
             if (objectUrlRef.current) {
                 URL.revokeObjectURL(objectUrlRef.current);
@@ -203,10 +368,76 @@ export default function Transcripe() {
         };
     }, []);
 
+    useEffect(() => {
+        writeJsonCookie(SETTINGS_COOKIE_NAME, {
+            withTimestamps,
+            updatedAt: Date.now(),
+        });
+    }, [withTimestamps]);
+
+    useEffect(() => {
+        if (!restoreLoaded) return;
+
+        writeJsonCookie(PROGRESS_COOKIE_NAME, {
+            modelId: MODEL_ID,
+            progress: Math.max(0, Math.min(100, Number(progress) || 0)),
+            status: String(status || "").slice(0, 360),
+            tone,
+            modelReady,
+            busy,
+            completed: Boolean(transcript && progress >= 100),
+            wordCount,
+            chunksCount: chunks.length,
+            updatedAt: Date.now(),
+        });
+    }, [restoreLoaded, progress, status, tone, modelReady, busy, transcript, wordCount, chunks.length]);
+
+    useEffect(() => {
+        if (!restoreLoaded) return;
+
+        if (transcript) {
+            try {
+                window.localStorage.setItem(TRANSCRIPT_STORAGE_KEY, transcript);
+            } catch {
+                // Ignore storage failures.
+            }
+        } else {
+            deleteLocalValue(TRANSCRIPT_STORAGE_KEY);
+        }
+    }, [restoreLoaded, transcript]);
+
+    useEffect(() => {
+        if (!restoreLoaded) return;
+
+        if (chunks.length > 0) {
+            writeLocalJson(CHUNKS_STORAGE_KEY, chunks);
+        } else {
+            deleteLocalValue(CHUNKS_STORAGE_KEY);
+        }
+    }, [restoreLoaded, chunks]);
+
     function resetOutputOnly() {
         setTranscript("");
         setChunks([]);
         setProgress(0);
+        deleteLocalValue(TRANSCRIPT_STORAGE_KEY);
+        deleteLocalValue(CHUNKS_STORAGE_KEY);
+    }
+
+    function saveFileMeta(nextFile, nextDuration = duration) {
+        if (!nextFile) return;
+
+        const meta = {
+            name: nextFile.name,
+            size: nextFile.size,
+            type: nextFile.type,
+            lastModified: nextFile.lastModified,
+            duration: Number.isFinite(nextDuration) ? nextDuration : 0,
+            updatedAt: Date.now(),
+        };
+
+        setSavedFileMeta(meta);
+        writeLocalJson(FILE_META_STORAGE_KEY, meta);
     }
 
     function handleFileSelect(nextFile) {
@@ -223,6 +454,7 @@ export default function Transcripe() {
         setFile(nextFile);
         setAudioUrl(nextUrl);
         setDuration(0);
+        saveFileMeta(nextFile, 0);
         resetOutputOnly();
 
         if (nextFile.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
@@ -237,6 +469,21 @@ export default function Transcripe() {
 
         setTone("info");
         setStatus("Audio loaded. Press Transcribe Audio to convert it to text.");
+    }
+
+    function clearSavedProgress() {
+        deleteCookieValue(PROGRESS_COOKIE_NAME);
+        deleteCookieValue(SETTINGS_COOKIE_NAME);
+        deleteLocalValue(TRANSCRIPT_STORAGE_KEY);
+        deleteLocalValue(CHUNKS_STORAGE_KEY);
+        deleteLocalValue(FILE_META_STORAGE_KEY);
+        setSavedFileMeta(null);
+        setTranscript("");
+        setChunks([]);
+        setProgress(0);
+        setModelReady(false);
+        setTone("info");
+        setStatus("Saved transcript and model progress were cleared.");
     }
 
     function clearAll() {
@@ -254,17 +501,24 @@ export default function Transcripe() {
         setChunks([]);
         setProgress(0);
         setBusy(false);
+        setModelReady(false);
         setTone("info");
         setStatus("Upload an audio file, then press Transcribe Audio.");
+
+        clearSavedProgress();
     }
 
     async function getTranscriber() {
         if (transcriberRef.current) {
+            setModelReady(true);
             return transcriberRef.current;
         }
 
+        setModelReady(false);
         setProgress(2);
-        setStatus("Loading Whisper model. First load can take time.");
+        setStatus(
+            "Loading Whisper model. First load can take time; future loads may reuse the browser model cache."
+        );
 
         const { pipeline } = await loadTransformers();
 
@@ -284,18 +538,26 @@ export default function Transcripe() {
                 const eventStatus = event?.status || "loading";
                 const eventFile = event?.file || event?.name || "";
 
-                setStatus(eventFile ? `Model ${eventStatus}: ${eventFile}` : `Model ${eventStatus}...`);
+                setStatus(
+                    eventFile
+                        ? `Model ${eventStatus}: ${eventFile}`
+                        : `Model ${eventStatus}...`
+                );
             },
         });
 
         transcriberRef.current = instance;
+        setModelReady(true);
+        setProgress((previous) => Math.max(previous, 95));
+        setStatus("Model ready. Starting transcription.");
+
         return instance;
     }
 
     async function handleTranscribe() {
         if (!audioUrl || !file) {
             setTone("error");
-            setStatus("Upload an audio file first.");
+            setStatus("Upload an audio file first. A selected file cannot be restored after a page refresh.");
             return;
         }
 
@@ -316,12 +578,12 @@ export default function Transcripe() {
         try {
             const transcriber = await getTranscriber();
 
-            setStatus("Transcribing audio. Keep this tab open.");
+            setStatus("Transcribing audio. Keep this tab open until the result appears.");
             setProgress((previous) => Math.max(previous, 25));
 
             const options = {
-                chunk_length_s: 30,
-                stride_length_s: 5,
+                chunk_length_s: isMobile ? 20 : 30,
+                stride_length_s: isMobile ? 4 : 5,
             };
 
             if (withTimestamps) {
@@ -339,22 +601,23 @@ export default function Transcripe() {
 
             if (nextText) {
                 setTone("info");
-                setStatus("Done. You can edit, copy, or download the transcript.");
+                setStatus("Done. Your transcript draft is saved locally and can be copied or downloaded.");
             } else {
                 setTone("error");
                 setStatus(
-                    "Finished, but no clear speech was detected. Try cleaner vocals, a shorter file, or less background music."
+                    "Finished, but no clear speech was detected. Try cleaner speech, a shorter file, or less background noise."
                 );
             }
         } catch (error) {
             console.error(error);
 
             transcriberRef.current = null;
+            setModelReady(false);
 
             if (isMissingScaleError(error)) {
                 setTone("error");
                 setStatus(
-                    "The browser loaded a broken cached quantized model. Clear this site's browser storage, restart the dev server, then retry. This file now forces fp32 WASM to avoid that qdq scale error."
+                    "The browser loaded a broken cached quantized model. Clear this site's browser storage, restart the page, then retry. This file forces fp32 WASM to avoid that missing-scale error."
                 );
             } else {
                 setTone("error");
@@ -383,77 +646,125 @@ export default function Transcripe() {
         }
     }
 
+    const uploadButtonText = isMobile ? "Choose file" : "Choose audio file";
+
     return (
         <>
             <Helmet>
                 <title>Audio Transcribe</title>
                 <meta
                     name="description"
-                    content="Upload audio and transcribe speech to text directly in the browser with AudioMaster Lab."
+                    content="Upload supported audio and create a browser-based speech transcript with AudioMaster Lab. Transcript drafts and model progress can be saved locally across refreshes."
                 />
-                <meta
-                    name="keywords"
-                    content="audio transcription, speech to text, browser transcription, whisper transcription, audio to text, audio lyrics transcription"
-                />
+                <link rel="canonical" href="https://audiomasterlab.com/transcribe" />
             </Helmet>
 
             <PageShell>
-                <Stack spacing={4}>
+                <Stack spacing={{ xs: 3, md: 4 }}>
                     <Box>
-                        <Chip
-                            icon={<SubtitlesRoundedIcon />}
-                            label="Browser-only audio transcription"
-                            sx={{
-                                mb: 2,
-                                color: "#dffaff",
-                                background: "rgba(103,232,249,0.12)",
-                                border: "1px solid rgba(103,232,249,0.24)",
-                                fontWeight: 850,
-                            }}
-                        />
+                        <Stack direction="row" flexWrap="wrap" gap={1} sx={{ mb: 2 }}>
+                            <Chip
+                                icon={<SubtitlesRoundedIcon />}
+                                label="Browser audio transcription"
+                                sx={{
+                                    color: "#dffaff",
+                                    background: "rgba(103,232,249,0.12)",
+                                    border: "1px solid rgba(103,232,249,0.24)",
+                                    fontWeight: 850,
+                                }}
+                            />
+
+                            <Chip
+                                icon={<StorageRoundedIcon />}
+                                label={modelReady ? "Model ready" : "Model cache supported"}
+                                sx={{
+                                    color: "#fff",
+                                    background: "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.1)",
+                                    fontWeight: 850,
+                                }}
+                            />
+
+                            {isMobile && (
+                                <Chip
+                                    icon={<PhoneIphoneRoundedIcon />}
+                                    label="Mobile optimized"
+                                    sx={{
+                                        color: "#fff",
+                                        background: "rgba(167,139,250,0.12)",
+                                        border: "1px solid rgba(167,139,250,0.22)",
+                                        fontWeight: 850,
+                                    }}
+                                />
+                            )}
+                        </Stack>
 
                         <Typography
                             variant="h1"
                             sx={{
                                 fontWeight: 950,
-                                letterSpacing: "-0.075em",
-                                lineHeight: 0.95,
-                                fontSize: { xs: "2.5rem", md: "4.8rem" },
+                                letterSpacing: { xs: "-0.055em", md: "-0.075em" },
+                                lineHeight: { xs: 1.02, md: 0.95 },
+                                fontSize: { xs: "2.3rem", sm: "3.1rem", md: "4.8rem" },
                                 maxWidth: 980,
                                 mb: 2,
                             }}
                         >
-                            Transcribe audio to text directly in the browser.
+                            Transcribe audio to text in the browser.
                         </Typography>
 
                         <Typography
-                            variant="h6"
+                            variant={isMobile ? "body1" : "h6"}
                             sx={{
                                 color: "rgba(255,255,255,0.68)",
                                 lineHeight: 1.7,
-                                maxWidth: 860,
+                                maxWidth: 900,
                             }}
                         >
-                            Upload MP3, WAV, M4A, OGG, WebM, MP4, or another
-                            browser-supported media file. This version forces fp32 WASM to
-                            avoid the broken quantized model path that caused the missing
-                            scale session error.
+                            Upload a supported audio or video file, load the speech model,
+                            and create a text transcript. Progress, settings, and transcript
+                            drafts are saved locally so a refresh does not wipe your result.
                         </Typography>
                     </Box>
+
+                    {(savedSummary.hasTranscriptDraft || savedSummary.savedFileMeta || savedSummary.savedProgress) && (
+                        <Alert
+                            severity="info"
+                            sx={{
+                                borderRadius: 4,
+                                background: "rgba(103,232,249,0.09)",
+                                color: "#e0f2fe",
+                                border: "1px solid rgba(103,232,249,0.22)",
+                                "& .MuiAlert-icon": { color: "#67e8f9" },
+                            }}
+                        >
+                            Saved local progress found
+                            {savedFileMeta?.name ? ` for ${savedFileMeta.name}` : ""}.
+                            The transcript and settings can be restored, but browsers do
+                            not let this page restore the original selected file after a
+                            refresh. Re-select the file to transcribe again.
+                        </Alert>
+                    )}
 
                     <Box
                         sx={{
                             display: "grid",
-                            gridTemplateColumns: { xs: "1fr", lg: "0.86fr 1.14fr" },
-                            gap: 3,
+                            gridTemplateColumns: {
+                                xs: "1fr",
+                                lg: "0.86fr 1.14fr",
+                            },
+                            gap: { xs: 2.25, md: 3 },
                             alignItems: "start",
                         }}
                     >
-                        <Stack spacing={3}>
+                        <Stack spacing={{ xs: 2.25, md: 3 }}>
                             <GlassCard>
-                                <Stack spacing={2.4}>
+                                <Stack spacing={{ xs: 2, md: 2.4 }}>
                                     <Box>
-                                        <Typography variant="h5" sx={{ fontWeight: 950 }}>
+                                        <Typography
+                                            variant={isMobile ? "h6" : "h5"}
+                                            sx={{ fontWeight: 950 }}
+                                        >
                                             Upload audio
                                         </Typography>
 
@@ -464,9 +775,8 @@ export default function Transcripe() {
                                                 mt: 0.7,
                                             }}
                                         >
-                                            Clear voice recordings work best. Full songs can work,
-                                            but loud beats, bass, reverb, and layered vocals can
-                                            reduce accuracy.
+                                            Clear voice recordings work best. Shorter files are
+                                            safer on phones because transcription uses memory and CPU.
                                         </Typography>
                                     </Box>
 
@@ -474,6 +784,7 @@ export default function Transcripe() {
                                         component="label"
                                         variant="contained"
                                         size="large"
+                                        fullWidth={isMobile}
                                         startIcon={<CloudUploadRoundedIcon />}
                                         disabled={busy}
                                         sx={{
@@ -491,7 +802,7 @@ export default function Transcripe() {
                                             },
                                         }}
                                     >
-                                        Choose audio file
+                                        {uploadButtonText}
                                         <input
                                             hidden
                                             type="file"
@@ -516,10 +827,15 @@ export default function Transcripe() {
                                                 }`}
                                                 sx={{
                                                     justifyContent: "flex-start",
+                                                    maxWidth: "100%",
                                                     color: "#fff",
                                                     background: "rgba(255,255,255,0.08)",
                                                     border: "1px solid rgba(255,255,255,0.08)",
                                                     fontWeight: 800,
+                                                    "& .MuiChip-label": {
+                                                        overflow: "hidden",
+                                                        textOverflow: "ellipsis",
+                                                    },
                                                 }}
                                             />
 
@@ -527,12 +843,14 @@ export default function Transcripe() {
                                                 component="audio"
                                                 src={audioUrl}
                                                 controls
+                                                preload="metadata"
                                                 onLoadedMetadata={(event) => {
                                                     const nextDuration =
                                                         event.currentTarget.duration;
 
                                                     if (Number.isFinite(nextDuration)) {
                                                         setDuration(nextDuration);
+                                                        saveFileMeta(file, nextDuration);
                                                     }
                                                 }}
                                                 sx={{
@@ -542,6 +860,24 @@ export default function Transcripe() {
                                                 }}
                                             />
                                         </Stack>
+                                    )}
+
+                                    {!file && savedFileMeta?.name && (
+                                        <Alert
+                                            severity="info"
+                                            sx={{
+                                                borderRadius: 3,
+                                                background: "rgba(255,255,255,0.06)",
+                                                color: "#fff",
+                                                border: "1px solid rgba(255,255,255,0.1)",
+                                            }}
+                                        >
+                                            Last file: {savedFileMeta.name} •{" "}
+                                            {formatBytes(savedFileMeta.size)}
+                                            {savedFileMeta.duration
+                                                ? ` • ${formatTime(savedFileMeta.duration)}`
+                                                : ""}
+                                        </Alert>
                                     )}
 
                                     {fileTooLarge && (
@@ -577,8 +913,8 @@ export default function Transcripe() {
                                                 },
                                             }}
                                         >
-                                            This audio is longer than 12 minutes. It may work, but
-                                            slower devices can freeze or run out of memory.
+                                            This audio is longer than 12 minutes. It may work,
+                                            but slower phones can freeze or run out of memory.
                                         </Alert>
                                     )}
 
@@ -596,9 +932,8 @@ export default function Transcripe() {
                                             },
                                         }}
                                     >
-                                        Stable mode enabled: onnx-community/whisper-tiny.en,
-                                        WASM runtime, fp32 encoder, fp32 decoder. This avoids the
-                                        qdq MatMulNBits missing-scale crash.
+                                        Stable mode: {MODEL_ID}, WASM runtime, fp32 encoder,
+                                        fp32 decoder, and browser model cache enabled.
                                     </Alert>
 
                                     <FormControlLabel
@@ -616,32 +951,55 @@ export default function Transcripe() {
                                         sx={{
                                             color: "rgba(255,255,255,0.78)",
                                             fontWeight: 800,
+                                            ml: 0,
                                         }}
                                     />
 
-                                    <Button
-                                        size="large"
-                                        variant="contained"
-                                        startIcon={<AutoAwesomeRoundedIcon />}
-                                        disabled={!audioUrl || busy || fileTooLarge}
-                                        onClick={handleTranscribe}
-                                        sx={{
-                                            borderRadius: 999,
-                                            py: 1.55,
-                                            fontWeight: 950,
-                                            color: "#06111e",
-                                            background:
-                                                "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            boxShadow: "0 18px 46px rgba(103,232,249,0.2)",
-                                            "&:hover": {
+                                    <Stack
+                                        direction={{ xs: "column", sm: "row" }}
+                                        spacing={1}
+                                    >
+                                        <Button
+                                            size="large"
+                                            variant="contained"
+                                            startIcon={<AutoAwesomeRoundedIcon />}
+                                            fullWidth={isMobile}
+                                            disabled={!audioUrl || busy || fileTooLarge}
+                                            onClick={handleTranscribe}
+                                            sx={{
+                                                borderRadius: 999,
+                                                py: 1.55,
+                                                fontWeight: 950,
+                                                color: "#06111e",
                                                 background:
                                                     "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                                filter: "brightness(1.04)",
-                                            },
-                                        }}
-                                    >
-                                        {busy ? "Transcribing..." : "Transcribe Audio"}
-                                    </Button>
+                                                boxShadow: "0 18px 46px rgba(103,232,249,0.2)",
+                                                "&:hover": {
+                                                    background:
+                                                        "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                    filter: "brightness(1.04)",
+                                                },
+                                            }}
+                                        >
+                                            {busy ? "Transcribing..." : "Transcribe Audio"}
+                                        </Button>
+
+                                        <Button
+                                            variant="outlined"
+                                            startIcon={<RestartAltRoundedIcon />}
+                                            fullWidth={isMobile}
+                                            disabled={busy}
+                                            onClick={clearSavedProgress}
+                                            sx={{
+                                                borderRadius: 999,
+                                                color: "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 900,
+                                            }}
+                                        >
+                                            Clear saved
+                                        </Button>
+                                    </Stack>
 
                                     <Button
                                         variant="text"
@@ -654,7 +1012,7 @@ export default function Transcripe() {
                                             fontWeight: 850,
                                         }}
                                     >
-                                        Clear
+                                        Clear all
                                     </Button>
                                 </Stack>
                             </GlassCard>
@@ -669,6 +1027,10 @@ export default function Transcripe() {
                                         borderRadius: 4,
                                         background: "rgba(255,255,255,0.055)",
                                         border: "1px solid rgba(255,255,255,0.08)",
+                                        position: { xs: "sticky", md: "static" },
+                                        bottom: { xs: 12, md: "auto" },
+                                        zIndex: { xs: 5, md: "auto" },
+                                        backdropFilter: "blur(16px)",
                                     }}
                                 >
                                     <Stack spacing={1}>
@@ -724,7 +1086,10 @@ export default function Transcripe() {
                                     spacing={1.5}
                                 >
                                     <Box>
-                                        <Typography variant="h5" sx={{ fontWeight: 950 }}>
+                                        <Typography
+                                            variant={isMobile ? "h6" : "h5"}
+                                            sx={{ fontWeight: 950 }}
+                                        >
                                             Transcript output
                                         </Typography>
 
@@ -736,14 +1101,15 @@ export default function Transcripe() {
                                             }}
                                         >
                                             Edit the result before copying or downloading it.
+                                            Drafts save locally as you type.
                                         </Typography>
                                     </Box>
 
                                     <Chip
-                                        icon={<GraphicEqRoundedIcon />}
+                                        icon={transcript ? <SaveRoundedIcon /> : <GraphicEqRoundedIcon />}
                                         label={
                                             transcript
-                                                ? `${wordCount} word${wordCount === 1 ? "" : "s"}`
+                                                ? `${wordCount} word${wordCount === 1 ? "" : "s"} saved`
                                                 : "No transcript yet"
                                         }
                                         sx={{
@@ -761,7 +1127,7 @@ export default function Transcripe() {
                                     onChange={(event) => setTranscript(event.target.value)}
                                     placeholder="Your transcribed audio text will appear here..."
                                     multiline
-                                    minRows={18}
+                                    minRows={isMobile ? 10 : isTablet ? 14 : 18}
                                     fullWidth
                                     InputProps={{
                                         sx: {
@@ -769,7 +1135,7 @@ export default function Transcripe() {
                                             borderRadius: 4,
                                             background: "rgba(255,255,255,0.08)",
                                             alignItems: "flex-start",
-                                            fontSize: 15,
+                                            fontSize: { xs: 14.5, md: 15 },
                                             lineHeight: 1.7,
                                         },
                                     }}
@@ -784,6 +1150,7 @@ export default function Transcripe() {
                                         variant="outlined"
                                         startIcon={<ContentCopyRoundedIcon />}
                                         disabled={!transcript}
+                                        fullWidth={isMobile}
                                         onClick={copyTranscript}
                                         sx={{
                                             borderRadius: 999,
@@ -799,6 +1166,7 @@ export default function Transcripe() {
                                         variant="outlined"
                                         startIcon={<FileDownloadRoundedIcon />}
                                         disabled={!transcript}
+                                        fullWidth={isMobile}
                                         onClick={() =>
                                             downloadText(
                                                 `${baseFileName}-transcript.txt`,
@@ -820,6 +1188,7 @@ export default function Transcripe() {
                                         variant="outlined"
                                         startIcon={<FileDownloadRoundedIcon />}
                                         disabled={!srtText}
+                                        fullWidth={isMobile}
                                         onClick={() =>
                                             downloadText(
                                                 `${baseFileName}-captions.srt`,
@@ -851,7 +1220,7 @@ export default function Transcripe() {
                                             </Typography>
 
                                             <Stack spacing={1}>
-                                                {chunks.slice(0, 12).map((chunk, index) => {
+                                                {chunks.slice(0, isMobile ? 6 : 12).map((chunk, index) => {
                                                     const timestamps =
                                                         chunk.timestamp || chunk.timestamps || [];
                                                     const start = Number(timestamps[0]);
@@ -900,15 +1269,15 @@ export default function Transcripe() {
                                                     );
                                                 })}
 
-                                                {chunks.length > 12 && (
+                                                {chunks.length > (isMobile ? 6 : 12) && (
                                                     <Typography
                                                         sx={{
                                                             color: "rgba(255,255,255,0.55)",
                                                             fontSize: 13,
                                                         }}
                                                     >
-                                                        Showing first 12 chunks. Download SRT to
-                                                        save all timestamp chunks.
+                                                        Showing first {isMobile ? 6 : 12} chunks.
+                                                        Download SRT to save all timestamp chunks.
                                                     </Typography>
                                                 )}
                                             </Stack>

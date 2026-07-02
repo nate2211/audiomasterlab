@@ -1,48 +1,81 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+
     <url>
         <loc>https://audiomasterlab.com/</loc>
-        <lastmod>2026-06-28</lastmod>
+        <lastmod>2026-07-02</lastmod>
         <changefreq>weekly</changefreq>
-        <priority>1.0</priority>
+        <priority>1.00</priority>
     </url>
 
     <url>
         <loc>https://audiomasterlab.com/audio</loc>
-        <lastmod>2026-06-28</lastmod>
+        <lastmod>2026-07-02</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.95</priority>
     </url>
 
     <url>
         <loc>https://audiomasterlab.com/editor</loc>
-        <lastmod>2026-06-28</lastmod>
+        <lastmod>2026-07-02</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.95</priority>
     </url>
 
     <url>
-        <loc>https://audiomasterlab.com/youtube</loc>
-        <lastmod>2026-06-28</lastmod>
-        <changefreq>weekly</changefreq>
-        <priority>0.90</priority>
-    </url>
-    <url>
         <loc>https://audiomasterlab.com/recorder</loc>
-        <lastmod>2026-06-28</lastmod>
+        <lastmod>2026-07-02</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.90</priority>
     </url>
+
     <url>
-        <loc>https://audiomasterlab.com/transcripe</loc>
-        <lastmod>2026-06-28</lastmod>
+        <loc>https://audiomasterlab.com/transcribe</loc>
+        <lastmod>2026-07-02</lastmod>
         <changefreq>weekly</changefreq>
         <priority>0.90</priority>
     </url>
+
     <url>
-        <loc>https://audiomasterlab.com/archive</loc>
-        <lastmod>2026-06-28</lastmod>
-        <changefreq>weekly</changefreq>
-        <priority>0.90</priority>
+        <loc>https://audiomasterlab.com/help</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.85</priority>
     </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/about</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.80</priority>
+    </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/contact</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.80</priority>
+    </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/privacy</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.75</priority>
+    </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/terms</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.75</priority>
+    </url>
+
+    <url>
+        <loc>https://audiomasterlab.com/copyright</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>monthly</changefreq>
+        <priority>0.75</priority>
+    </url>
+
 </urlset>

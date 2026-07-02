@@ -10,6 +10,7 @@ import Audio from "./pages/Audio.js";
 import Editor from "./pages/Editor.js";
 import Recorder from "./pages/Recorder.js";
 import ArchiveAudioBrowser from "./pages/Archive";
+import { Help, About, Contact, Privacy, Terms, Copyright } from "./pages/PolicyPages.js";
 const Transcripe = lazy(() => import("./pages/Transcripe.js"));
 const theme = createTheme({
   palette: {
@@ -75,8 +76,15 @@ export default function App() {
                   <Route path="/recorder" element={<Recorder />} />
                   <Route path="/editor" element={<Editor />} />
                   <Route path="/youtube" element={<YoutubePage />} />
-                  <Route path="/transcripe" element={<Transcripe />} />
+                  <Route path="/transcribe" element={<Transcripe />} />
+                  <Route path="/transcripe" element={<Navigate to="/transcribe" replace />} />
                   <Route path="/archive" element={<ArchiveAudioBrowser />} />
+                  <Route path="/help" element={<Help />} />
+                  <Route path="/about" element={<About />} />
+                  <Route path="/contact" element={<Contact />} />
+                  <Route path="/privacy" element={<Privacy />} />
+                  <Route path="/terms" element={<Terms />} />
+                  <Route path="/copyright" element={<Copyright />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Suspense>
