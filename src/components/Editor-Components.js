@@ -41,7 +41,8 @@ export const EDITOR_EFFECTS = [
         label: "Gain Boost/Cut",
         shortLabel: "GAIN",
         mode: "replace",
-        description: "Replaces the dry audio inside the block with a louder or quieter version.",
+        description:
+            "Replaces the dry audio inside the block with a louder or quieter version.",
         icon: <GraphicEqRoundedIcon fontSize="small" />,
         params: {
             gainDb: {
@@ -289,7 +290,8 @@ export const EDITOR_EFFECTS = [
         label: "Delay Echo",
         shortLabel: "DLY",
         mode: "send",
-        description: "Adds a loud echo send during the block while keeping the tail after the block.",
+        description:
+            "Adds a loud echo send during the block while keeping the tail after the block.",
         icon: <TimelineRoundedIcon fontSize="small" />,
         params: {
             delayTime: {
@@ -749,12 +751,12 @@ export function EffectToolbox({ selectedTool, onSelectTool, disabled }) {
             <Stack spacing={2}>
                 <Box>
                     <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.4 }}>
-                        Effect block tools
+                        Effect block guide
                     </Typography>
 
                     <Typography sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.65 }}>
-                        Pick an effect, then drag across the timeline. Most blocks now
-                        replace or heavily duck the dry audio, so the change is obvious.
+                        Each piano-roll row creates its own effect automatically. Use this panel
+                        as a guide, or click an effect to highlight it before editing.
                     </Typography>
                 </Box>
 
@@ -1043,7 +1045,7 @@ function getTimelineHit({ event, canvas, duration, blocks, laneHeight }) {
     const x = clamp(event.clientX - rect.left, 0, rect.width);
     const y = clamp(event.clientY - rect.top, 0, rect.height);
     const time = duration > 0 ? (x / rect.width) * duration : 0;
-    const laneIndex = Math.floor(y / laneHeight);
+    const laneIndex = clamp(Math.floor(y / laneHeight), 0, EDITOR_EFFECTS.length - 1);
 
     const hitBlock = [...blocks].reverse().find((block) => {
         const effectIndex = EDITOR_EFFECTS.findIndex((item) => item.id === block.type);
@@ -1081,7 +1083,16 @@ export function TimelineEditor({
 
     const laneHeight = 58;
     const timelineHeight = EDITOR_EFFECTS.length * laneHeight;
-    const selectedToolDefinition = getEffectDefinition(selectedTool);
+
+    function getEffectFromLaneIndex(laneIndex) {
+        const safeIndex = clamp(
+            Math.floor(Number(laneIndex)),
+            0,
+            EDITOR_EFFECTS.length - 1
+        );
+
+        return EDITOR_EFFECTS[safeIndex] || getEffectDefinition(selectedTool);
+    }
 
     useEffect(() => {
         const canvas = canvasRef.current;
@@ -1114,6 +1125,7 @@ export function TimelineEditor({
                     : effect.mode === "send"
                         ? "rgba(167,139,250,0.95)"
                         : "rgba(103,232,249,0.95)";
+
             context.font = "900 12px system-ui, -apple-system, Segoe UI, sans-serif";
             context.fillText(effect.shortLabel, 12, y + 22);
 
@@ -1226,20 +1238,21 @@ export function TimelineEditor({
             return;
         }
 
+        const laneEffect = getEffectFromLaneIndex(hit.laneIndex);
         const laneTime = clamp(hit.time, 0, duration);
 
         dragStateRef.current = {
             mode: "draw",
-            type: selectedTool,
+            type: laneEffect.id,
             start: laneTime,
         };
 
         setDraft({
             id: "draft-block",
-            type: selectedTool,
+            type: laneEffect.id,
             start: laneTime,
             end: clamp(laneTime + 0.35, 0, duration),
-            params: buildDefaultParams(selectedTool),
+            params: buildDefaultParams(laneEffect.id),
         });
 
         onSeek(laneTime);
@@ -1317,15 +1330,12 @@ export function TimelineEditor({
                 >
                     <Box>
                         <Typography variant="h5" sx={{ fontWeight: 950 }}>
-                            Timeline effect blocks
+                            Piano-roll effect timeline
                         </Typography>
 
                         <Typography sx={{ color: "rgba(255,255,255,0.62)", fontSize: 13 }}>
-                            Armed tool:{" "}
-                            <Box component="span" sx={{ color: "#67e8f9", fontWeight: 950 }}>
-                                {selectedToolDefinition.label}
-                            </Box>
-                            . Drag to draw. Click a block to select. Drag a selected block to move it.
+                            Drag directly on any effect row to create that effect. Click a block
+                            to select it. Drag a block to move it.
                         </Typography>
                     </Box>
 
@@ -1719,21 +1729,23 @@ export function EditorHelpPanel() {
         <EditorGlassCard>
             <Stack spacing={1.7}>
                 <Typography variant="h5" sx={{ fontWeight: 950 }}>
-                    What changed
+                    Piano-roll editing
                 </Typography>
 
                 <Typography sx={{ color: "rgba(255,255,255,0.65)", lineHeight: 1.7 }}>
-                    Insert-style blocks now duck or replace the dry signal instead of just
-                    adding a quiet parallel copy. Send effects like delay and reverb push
-                    louder wet signal and keep their tails. The Apply button renders the
-                    timeline into a new AudioBuffer, clears the blocks, redraws the waveform,
-                    and lets you edit the rendered audio again.
+                    You no longer need to select a filter before drawing. Each timeline row is
+                    its own effect lane. Drag on the Silence row to cut audio, drag on the
+                    Reverb row to add a reverb block, drag on the Delay row for echo, and so on.
+                    Send effects keep their tails, while insert effects duck or replace the dry
+                    signal inside the selected region.
                 </Typography>
 
                 <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
 
                 <Stack direction="row" flexWrap="wrap" gap={1}>
                     {[
+                        "Piano-roll lanes",
+                        "No filter preselect needed",
                         "Dry ducking",
                         "Insert replacement",
                         "Destructive apply",

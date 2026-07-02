@@ -207,7 +207,11 @@ function getMetadataText(item = {}, metadata = {}) {
         .map(String)
         .join(" ");
 }
-
+function buildServeUrl(identifier, fileName) {
+    return `https://archive.org/serve/${encodeURIComponent(
+        identifier
+    )}/${encodeArchivePath(fileName)}`;
+}
 function looksRightsSafer(item = {}, metadata = {}, selectedCollections = []) {
     const combined = getMetadataText(item, metadata);
 
@@ -324,17 +328,209 @@ function getPlayableFiles(identifier, files, allowZipInternalPaths) {
         .filter((file) => !hasBlockedTerm(file.name))
         .filter((file) => allowZipInternalPaths || !isZipInternalPath(file.name))
         .slice(0, 10)
-        .map((file) => ({
-            name: file.name,
-            format: file.format || "",
-            size: file.size || "",
-            length: file.length || "",
-            source: file.source || "",
-            url: buildDownloadUrl(identifier, file.name),
-            zipInternal: isZipInternalPath(file.name),
-        }));
+        .map((file) => {
+            const downloadUrl = buildDownloadUrl(identifier, file.name);
+            const serveUrl = buildServeUrl(identifier, file.name);
+
+            return {
+                name: file.name,
+                format: file.format || "",
+                size: file.size || "",
+                length: file.length || "",
+                source: file.source || "",
+                url: serveUrl,          // main player source
+                serveUrl,
+                downloadUrl,
+                zipInternal: isZipInternalPath(file.name),
+            };
+        });
+}
+function stripUrlPunctuation(value) {
+    return String(value || "").replace(/[),.;\]]+$/g, "");
 }
 
+function decodeArchivePathPart(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function extractUrls(value) {
+    const matches = String(value || "").match(/https?:\/\/[^\s<>"']+/gi);
+    return matches ? matches.map(stripUrlPunctuation) : [];
+}
+
+function parseArchiveAudioUrl(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        const host = url.hostname.toLowerCase();
+        const parts = url.pathname
+            .split("/")
+            .filter(Boolean)
+            .map(decodeArchivePathPart);
+
+        let identifier = "";
+        let fileName = "";
+
+        // archive.org/download/IDENTIFIER/file.mp3
+        // archive.org/serve/IDENTIFIER/file.mp3
+        if (
+            host === "archive.org" ||
+            host === "www.archive.org"
+        ) {
+            const mode = parts[0];
+
+            if ((mode === "download" || mode === "serve") && parts.length >= 3) {
+                identifier = parts[1];
+                fileName = parts.slice(2).join("/");
+            }
+        }
+
+        // ia801808.us.archive.org/11/items/IDENTIFIER/file.ogg
+        // ia801806.us.archive.org/3/items/IDENTIFIER/file.mp3
+        if (/^ia\d+\.us\.archive\.org$/.test(host)) {
+            const itemsIndex = parts.indexOf("items");
+
+            if (itemsIndex >= 0 && parts.length >= itemsIndex + 3) {
+                identifier = parts[itemsIndex + 1];
+                fileName = parts.slice(itemsIndex + 2).join("/");
+            }
+        }
+
+        if (!identifier || !fileName) {
+            return null;
+        }
+
+        if (!isAudioFile(fileName)) {
+            return null;
+        }
+
+        if (isSkipFile(fileName)) {
+            return null;
+        }
+
+        return {
+            identifier,
+            fileName,
+            originalUrl: rawUrl,
+            serveUrl: buildServeUrl(identifier, fileName),
+            downloadUrl: buildDownloadUrl(identifier, fileName),
+            detailsUrl: buildDetailsUrl(identifier),
+            zipInternal: isZipInternalPath(fileName),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function extractArchiveAudioLinks(value) {
+    const seen = new Set();
+
+    return extractUrls(value)
+        .map(parseArchiveAudioUrl)
+        .filter(Boolean)
+        .filter((item) => {
+            const key = `${item.identifier}/${item.fileName}`;
+
+            if (seen.has(key)) {
+                return false;
+            }
+
+            seen.add(key);
+            return true;
+        });
+}
+async function loadDirectArchiveAudioLinks({
+                                               query,
+                                               selectedCollections,
+                                               allowZipInternalPaths,
+                                           }) {
+    const links = extractArchiveAudioLinks(query);
+
+    if (!links.length) {
+        return null;
+    }
+
+    const grouped = new Map();
+
+    for (const link of links) {
+        if (!allowZipInternalPaths && link.zipInternal) {
+            continue;
+        }
+
+        if (!grouped.has(link.identifier)) {
+            grouped.set(link.identifier, []);
+        }
+
+        grouped.get(link.identifier).push(link);
+    }
+
+    const results = [];
+
+    for (const [identifier, files] of grouped.entries()) {
+        try {
+            const metadataData = await fetchArchiveMetadata(identifier);
+            const metadata = metadataData.metadata || {};
+
+            const itemLike = {
+                identifier,
+                title: metadata.title || identifier,
+                creator: metadata.creator || "",
+                collection: metadata.collection || [],
+                description: metadata.description || "",
+                subject: metadata.subject || "",
+            };
+
+            const rightsSafer = looksRightsSafer(
+                itemLike,
+                metadata,
+                selectedCollections
+            );
+
+            if (!rightsSafer) {
+                continue;
+            }
+
+            results.push({
+                identifier,
+                title: metadata.title || identifier,
+                creator: metadata.creator || "",
+                date: metadata.date || "",
+                description: normalizeText(metadata.description || "")
+                    .replace(/<[^>]*>/g, "")
+                    .slice(0, 260),
+                collection: Array.from(
+                    new Set(getItemCollections(itemLike, metadata))
+                ),
+                license: getLicense(metadata),
+                downloads: "",
+                detailsUrl: buildDetailsUrl(identifier),
+                files: files.map((link) => ({
+                    name: link.fileName,
+                    format: "",
+                    size: "",
+                    length: "",
+                    source: "direct archive url",
+                    url: link.serveUrl,
+                    serveUrl: link.serveUrl,
+                    downloadUrl: link.downloadUrl,
+                    originalUrl: link.originalUrl,
+                    zipInternal: link.zipInternal,
+                })),
+            });
+        } catch {
+            // Skip malformed or unavailable Archive items.
+        }
+    }
+
+    return {
+        cursor: "",
+        results,
+        directLinkMode: true,
+    };
+}
 async function searchSafeAudio({
                                    query,
                                    cursor = "",
@@ -474,23 +670,35 @@ export default function ArchiveAudioBrowser() {
                     : "Searching safe Archive audio..."
             );
 
-            const data = await searchSafeAudio({
+            const directData = await loadDirectArchiveAudioLinks({
                 query,
-                cursor: loadMore ? nextCursor : "",
                 selectedCollections,
                 allowZipInternalPaths,
             });
 
+            const data =
+                directData ||
+                (await searchSafeAudio({
+                    query,
+                    cursor: loadMore ? nextCursor : "",
+                    selectedCollections,
+                    allowZipInternalPaths,
+                }));
+
             setNextCursor(data.cursor || "");
 
             setResults((current) =>
-                loadMore ? [...current, ...data.results] : data.results
+                loadMore && !data.directLinkMode
+                    ? [...current, ...data.results]
+                    : data.results
             );
 
             setStatus(
-                data.results.length
-                    ? `Found ${data.results.length} Archive item(s) with playable audio.`
-                    : "No safe playable audio files found for that query."
+                data.directLinkMode
+                    ? `Loaded ${data.results.length} rights-filtered direct Archive item(s).`
+                    : data.results.length
+                        ? `Found ${data.results.length} Archive item(s) with playable audio.`
+                        : "No safe playable audio files found for that query."
             );
         } catch (err) {
             setError(err?.message || "Archive search failed.");
@@ -828,23 +1036,43 @@ export default function ArchiveAudioBrowser() {
                                                         spacing={1}
                                                     >
                                                         <Button
-                                                            href={file.url}
+                                                            href={file.serveUrl || file.url}
                                                             target="_blank"
                                                             rel="noreferrer"
                                                             size="small"
                                                             variant="outlined"
                                                             endIcon={<OpenInNewRoundedIcon />}
                                                         >
-                                                            Open direct file
+                                                            Open serve link
+                                                        </Button>
+
+                                                        <Button
+                                                            href={file.downloadUrl || file.url}
+                                                            target="_blank"
+                                                            rel="noreferrer"
+                                                            size="small"
+                                                            variant="outlined"
+                                                            endIcon={<OpenInNewRoundedIcon />}
+                                                        >
+                                                            Open download link
                                                         </Button>
 
                                                         <Button
                                                             size="small"
                                                             variant="text"
                                                             startIcon={<ContentCopyRoundedIcon />}
-                                                            onClick={() => copyText(file.url)}
+                                                            onClick={() => copyText(file.serveUrl || file.url)}
                                                         >
-                                                            Copy direct link
+                                                            Copy serve link
+                                                        </Button>
+
+                                                        <Button
+                                                            size="small"
+                                                            variant="text"
+                                                            startIcon={<ContentCopyRoundedIcon />}
+                                                            onClick={() => copyText(file.downloadUrl || file.url)}
+                                                        >
+                                                            Copy download link
                                                         </Button>
                                                     </Stack>
                                                 </Stack>

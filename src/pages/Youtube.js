@@ -62,6 +62,8 @@ const MAX_INTEREST_QUERIES = 24;
 const ORGANIC_INTEREST_SEARCH_LIMIT = 8;
 const PLAYLIST_PAGE_SIZE = 50;
 const PLAYLIST_MAX_PAGES = 4;
+const YOUTUBE_LOCAL_SESSION_KEY = "aml_youtube_local_session_v3";
+const MAX_LOCAL_PLAYLIST_ITEMS = 300;
 
 
 function getCookieValue(name) {
@@ -443,6 +445,34 @@ function buildYoutubeWatchUrl(videoId) {
     return cleanId ? `https://www.youtube.com/watch?v=${cleanId}` : "";
 }
 
+function buildYoutubeEmbedUrl(videoId, startSeconds = 0, autoplay = false) {
+    const cleanId = String(videoId || "").trim();
+
+    if (!cleanId) return "";
+
+    const url = new URL(`https://www.youtube.com/embed/${cleanId}`);
+
+    url.searchParams.set("enablejsapi", "1");
+    url.searchParams.set("playsinline", "1");
+    url.searchParams.set("controls", "1");
+    url.searchParams.set("rel", "0");
+    url.searchParams.set("modestbranding", "1");
+
+    if (typeof window !== "undefined" && window.location?.origin) {
+        url.searchParams.set("origin", window.location.origin);
+    }
+
+    if (Number(startSeconds) > 0) {
+        url.searchParams.set("start", String(Math.floor(Number(startSeconds))));
+    }
+
+    if (autoplay) {
+        url.searchParams.set("autoplay", "1");
+    }
+
+    return url.toString();
+}
+
 function buildFallbackVideo(videoId, title = "") {
     return {
         id: videoId,
@@ -500,6 +530,114 @@ function uniqueVideosById(videos) {
     });
 
     return output;
+}
+
+function safeReadLocalStorageJson(key, fallback) {
+    if (typeof window === "undefined" || !window.localStorage) return fallback;
+
+    try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) return fallback;
+
+        const parsed = JSON.parse(raw);
+        return parsed ?? fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+function safeWriteLocalStorageJson(key, value) {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function normalizeStoredVideo(video) {
+    if (!video?.id) return null;
+
+    const cleanId = String(video.id || "").trim().slice(0, 32);
+
+    if (!cleanId) return null;
+
+    return {
+        id: cleanId,
+        title: String(video.title || `YouTube video ${cleanId}`).slice(0, 220),
+        channelTitle: String(video.channelTitle || "Unknown channel").slice(0, 160),
+        thumbnail:
+            video.thumbnail ||
+            `https://i.ytimg.com/vi/${cleanId}/mqdefault.jpg`,
+        highThumbnail:
+            video.highThumbnail ||
+            video.thumbnail ||
+            `https://i.ytimg.com/vi/${cleanId}/hqdefault.jpg`,
+        duration: String(video.duration || "").slice(0, 32),
+        viewCount: String(video.viewCount || "").slice(0, 32),
+        likeCount: String(video.likeCount || "").slice(0, 32),
+        publishedAt: String(video.publishedAt || "").slice(0, 64),
+        description: String(video.description || "").slice(0, 600),
+        embeddable: video.embeddable !== false,
+        playlistId: video.playlistId || makePlaylistId(),
+    };
+}
+
+function normalizeStoredPlaylist(playlist) {
+    return uniqueVideosById(
+        (Array.isArray(playlist) ? playlist : [])
+            .slice(0, MAX_LOCAL_PLAYLIST_ITEMS)
+            .map((video) => normalizeStoredVideo(video))
+            .filter(Boolean)
+    ).map((video) => ({
+        ...video,
+        playlistId: video.playlistId || makePlaylistId(),
+    }));
+}
+
+function readYoutubeLocalSession() {
+    const session = safeReadLocalStorageJson(YOUTUBE_LOCAL_SESSION_KEY, {});
+    const playlist = normalizeStoredPlaylist(session?.playlist);
+    const selectedVideo = normalizeStoredVideo(session?.selectedVideo);
+    const playbackMode = session?.playbackMode === "playlist" ? "playlist" : "browse";
+    const activePlaylistIndex = Number.isInteger(session?.activePlaylistIndex)
+        ? Math.min(Math.max(session.activePlaylistIndex, -1), playlist.length - 1)
+        : -1;
+
+    return {
+        query: String(session?.query || "").slice(0, 500),
+        activeQuery: String(session?.activeQuery || "").slice(0, 500),
+        selectedVideo,
+        playlist,
+        playbackMode,
+        activePlaylistIndex,
+        savedAt: Number(session?.savedAt || 0),
+    };
+}
+
+function writeYoutubeLocalSession({
+                                      query,
+                                      activeQuery,
+                                      selectedVideo,
+                                      playlist,
+                                      playbackMode,
+                                      activePlaylistIndex,
+                                  }) {
+    const cleanPlaylist = normalizeStoredPlaylist(playlist);
+
+    return safeWriteLocalStorageJson(YOUTUBE_LOCAL_SESSION_KEY, {
+        query: String(query || "").slice(0, 500),
+        activeQuery: String(activeQuery || "").slice(0, 500),
+        selectedVideo: normalizeStoredVideo(selectedVideo),
+        playlist: cleanPlaylist,
+        playbackMode: playbackMode === "playlist" ? "playlist" : "browse",
+        activePlaylistIndex: Number.isInteger(activePlaylistIndex)
+            ? Math.min(Math.max(activePlaylistIndex, -1), cleanPlaylist.length - 1)
+            : -1,
+        savedAt: Date.now(),
+    });
 }
 
 function splitAutoPlaylistQueries(value) {
@@ -799,16 +937,26 @@ async function fetchAutoPlaylistVideos(rawQuery, perQueryLimit = 12) {
 export default function YoutubePage() {
     const playerRef = useRef(null);
     const playerContainerRef = useRef(null);
+    const playerMountNodeRef = useRef(null);
     const playerShellRef = useRef(null);
     const loadMoreSentinelRef = useRef(null);
     const wakeLockRef = useRef(null);
+    const initialLocalSessionRef = useRef(readYoutubeLocalSession());
+    const restoredVideoCueRequestedRef = useRef(false);
+    const playerReadyRef = useRef(false);
+    const pendingPlayerCommandRef = useRef(null);
 
-    const videosRef = useRef([]);
+    const videosRef = useRef(
+        uniqueVideosById([
+            ...(initialLocalSessionRef.current.selectedVideo ? [initialLocalSessionRef.current.selectedVideo] : []),
+            ...(initialLocalSessionRef.current.playlist || []),
+        ])
+    );
     const recommendedVideosRef = useRef([]);
-    const playlistRef = useRef([]);
-    const selectedVideoRef = useRef(null);
-    const activePlaylistIndexRef = useRef(-1);
-    const playbackModeRef = useRef("browse");
+    const playlistRef = useRef(initialLocalSessionRef.current.playlist || []);
+    const selectedVideoRef = useRef(initialLocalSessionRef.current.selectedVideo || null);
+    const activePlaylistIndexRef = useRef(initialLocalSessionRef.current.activePlaylistIndex);
+    const playbackModeRef = useRef(initialLocalSessionRef.current.playbackMode || "browse");
     const repeatVideoRef = useRef(false);
     const loopPlaylistRef = useRef(true);
     const nextPageTokenRef = useRef("");
@@ -818,17 +966,17 @@ export default function YoutubePage() {
     );
     const savedRecommendationQueriesRef = useRef(readSavedRecommendationQueries());
     const loadingMoreRef = useRef(false);
-    const activeQueryRef = useRef("");
+    const activeQueryRef = useRef(initialLocalSessionRef.current.activeQuery || "");
     const keepAwakeWantedRef = useRef(false);
     const useInterestDiscoveryRef = useRef(
         readBooleanCookie(ORGANIC_INTERESTS_TOGGLE_COOKIE, true)
     );
 
-    const [query, setQuery] = useState("");
-    const [activeQuery, setActiveQuery] = useState("");
+    const [query, setQuery] = useState(() => initialLocalSessionRef.current.query || "");
+    const [activeQuery, setActiveQuery] = useState(() => initialLocalSessionRef.current.activeQuery || "");
     // The old separate URL field is intentionally replaced by one smart input.
 
-    const [videos, setVideos] = useState([]);
+    const [videos, setVideos] = useState(() => videosRef.current);
     const [recommendedVideos, setRecommendedVideos] = useState([]);
     const [nextPageToken, setNextPageToken] = useState("");
     const [recommendedNextPageToken, setRecommendedNextPageToken] = useState("");
@@ -846,19 +994,22 @@ export default function YoutubePage() {
     const [interestQueries, setInterestQueries] = useState(() => getTopInterestQueries(16));
     const [settingsOpen, setSettingsOpen] = useState(false);
 
-    const [selectedVideo, setSelectedVideo] = useState(null);
-    const [playlist, setPlaylist] = useState([]);
-    const [activePlaylistIndex, setActivePlaylistIndex] = useState(-1);
+    const [selectedVideo, setSelectedVideo] = useState(() => initialLocalSessionRef.current.selectedVideo || null);
+    const [playlist, setPlaylist] = useState(() => initialLocalSessionRef.current.playlist || []);
+    const [activePlaylistIndex, setActivePlaylistIndex] = useState(() => initialLocalSessionRef.current.activePlaylistIndex);
 
-    const [playbackMode, setPlaybackMode] = useState("browse");
+    const [playbackMode, setPlaybackMode] = useState(() => initialLocalSessionRef.current.playbackMode || "browse");
     const [repeatVideo, setRepeatVideo] = useState(false);
     const [loopPlaylist, setLoopPlaylist] = useState(true);
     const [autoLoadMore, setAutoLoadMore] = useState(true);
     const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(false);
     const [keepAwakeSupported, setKeepAwakeSupported] = useState(false);
+    const [playerIframeReady, setPlayerIframeReady] = useState(false);
 
-    const [status, setStatus] = useState(
-        "Search YouTube, or leave the search empty to browse real YouTube recommended videos from the official API."
+    const [status, setStatus] = useState(() =>
+        initialLocalSessionRef.current.selectedVideo || initialLocalSessionRef.current.playlist.length
+            ? "Restored your last query, current video, and playlist from this browser's localStorage."
+            : "Search YouTube, or leave the search empty to browse real YouTube recommended videos from the official API."
     );
 
     const [loading, setLoading] = useState(false);
@@ -921,6 +1072,17 @@ export default function YoutubePage() {
         if (!selectedVideo?.id) return false;
         return playlist.some((item) => item.id === selectedVideo.id);
     }, [playlist, selectedVideo]);
+
+    useEffect(() => {
+        writeYoutubeLocalSession({
+            query,
+            activeQuery,
+            selectedVideo,
+            playlist,
+            playbackMode,
+            activePlaylistIndex,
+        });
+    }, [query, activeQuery, selectedVideo, playlist, playbackMode, activePlaylistIndex]);
 
     useEffect(() => {
         videosRef.current = videos;
@@ -989,8 +1151,22 @@ export default function YoutubePage() {
     }, [activeQuery]);
 
     useEffect(() => {
+        function cueRestoredVideo() {
+            const restoredVideo = selectedVideoRef.current;
+
+            if (!restoredVideo?.id || restoredVideoCueRequestedRef.current) return;
+
+            restoredVideoCueRequestedRef.current = true;
+            createOrLoadPlayer(restoredVideo.id, false, 0);
+            setStatus(
+                `Restored ${restoredVideo.title || "your last YouTube video"}. Press play to continue from the saved session.`
+            );
+        }
+
         window.onYouTubeIframeAPIReady = () => {
             setStatus("YouTube player API is ready.");
+            cueRestoredVideo();
+            flushPendingPlayerCommand();
         };
 
         if (!window.YT) {
@@ -999,14 +1175,13 @@ export default function YoutubePage() {
             script.src = "https://www.youtube.com/iframe_api";
             script.async = true;
             document.body.appendChild(script);
+        } else if (window.YT?.Player) {
+            cueRestoredVideo();
+            flushPendingPlayerCommand();
         }
 
         return () => {
-            try {
-                playerRef.current?.destroy?.();
-            } catch {
-                // Safe cleanup.
-            }
+            destroyCurrentYoutubePlayer(false);
         };
     }, []);
 
@@ -1040,7 +1215,7 @@ export default function YoutubePage() {
     useEffect(() => {
         const player = playerRef.current;
 
-        if (!player?.setSize) return;
+        if (!isUsableYoutubePlayer(player) || typeof player.setSize !== "function") return;
 
         const width = Math.max(320, playerBoxSize.width || 720);
         const height = Math.max(280, playerHeight || 460);
@@ -1365,71 +1540,219 @@ export default function YoutubePage() {
         setStatus("YouTube player size reset.");
     }
 
+    function isUsableYoutubePlayer(player) {
+        if (
+            !player ||
+            typeof player.loadVideoById !== "function" ||
+            typeof player.cueVideoById !== "function" ||
+            typeof player.getIframe !== "function"
+        ) {
+            return false;
+        }
+
+        try {
+            const iframe = player.getIframe();
+            return Boolean(iframe && iframe.isConnected);
+        } catch {
+            return false;
+        }
+    }
+
+    function ensurePlayerMountNode(forceNew = false) {
+        const wrapper = playerContainerRef.current;
+
+        if (!wrapper) return null;
+
+        const existingMount = playerMountNodeRef.current;
+
+        if (!forceNew && existingMount?.isConnected) {
+            return existingMount;
+        }
+
+        // This wrapper is intentionally an empty host owned by the YouTube API.
+        // React placeholders are rendered as siblings, so clearing this host will
+        // not remove the visible fallback iframe or break the next render.
+        wrapper.innerHTML = "";
+
+        const mountNode = document.createElement("div");
+        mountNode.style.width = "100%";
+        mountNode.style.height = "100%";
+        mountNode.style.display = "block";
+        mountNode.setAttribute("data-aml-youtube-player-mount", "true");
+
+        wrapper.appendChild(mountNode);
+        playerMountNodeRef.current = mountNode;
+
+        return mountNode;
+    }
+
+    function destroyCurrentYoutubePlayer(resetMount = false) {
+        const player = playerRef.current;
+
+        try {
+            if (player && typeof player.destroy === "function") {
+                player.destroy();
+            }
+        } catch {
+            // A stale YouTube iframe can throw while being destroyed after tab visibility changes.
+        } finally {
+            playerRef.current = null;
+            playerReadyRef.current = false;
+            setPlayerIframeReady(false);
+        }
+
+        if (resetMount && playerContainerRef.current) {
+            ensurePlayerMountNode(true);
+        }
+    }
+
+    function runYoutubePlayerCommand(player, videoId, shouldPlay = true, startSeconds = 0) {
+        if (!isUsableYoutubePlayer(player)) {
+            throw new Error("The current YouTube iframe player is stale and must be rebuilt.");
+        }
+
+        const cleanVideoId = String(videoId || "").trim();
+        const cleanStartSeconds = Math.max(0, Number(startSeconds || 0));
+        const commandPayload = cleanStartSeconds > 0
+            ? { videoId: cleanVideoId, startSeconds: cleanStartSeconds }
+            : cleanVideoId;
+
+        applyIframePlaybackPermissions(player);
+        setPlayerIframeReady(true);
+
+        if (shouldPlay) {
+            player.loadVideoById(commandPayload);
+        } else {
+            player.cueVideoById(commandPayload);
+        }
+    }
+
+    function flushPendingPlayerCommand() {
+        const pendingCommand = pendingPlayerCommandRef.current;
+
+        if (!pendingCommand) return;
+
+        pendingPlayerCommandRef.current = null;
+        createOrLoadPlayer(
+            pendingCommand.videoId,
+            pendingCommand.shouldPlay,
+            pendingCommand.startSeconds
+        );
+    }
+
     function createOrLoadPlayer(videoId, shouldPlay = true, startSeconds = 0) {
-        if (!window.YT || !window.YT.Player) {
-            setStatus("YouTube player is still loading. Try again in a moment.");
+        const cleanVideoId = String(videoId || "").trim();
+        const cleanStartSeconds = Math.max(0, Number(startSeconds || 0));
+
+        if (!cleanVideoId) {
+            setStatus("Select or paste a valid YouTube video before starting playback.");
             return;
         }
 
-        if (playerRef.current) {
-            applyIframePlaybackPermissions(playerRef.current);
-
-            if (shouldPlay) {
-                if (startSeconds > 0) {
-                    playerRef.current.loadVideoById({ videoId, startSeconds });
-                } else {
-                    playerRef.current.loadVideoById(videoId);
-                }
-            } else {
-                if (startSeconds > 0) {
-                    playerRef.current.cueVideoById({ videoId, startSeconds });
-                } else {
-                    playerRef.current.cueVideoById(videoId);
-                }
-            }
-
+        if (!window.YT || !window.YT.Player) {
+            pendingPlayerCommandRef.current = {
+                videoId: cleanVideoId,
+                shouldPlay,
+                startSeconds: cleanStartSeconds,
+            };
+            setStatus("YouTube player is still loading. Playback will start when the iframe API is ready.");
             return;
+        }
+
+        const currentPlayer = playerRef.current;
+
+        if (currentPlayer && !isUsableYoutubePlayer(currentPlayer)) {
+            destroyCurrentYoutubePlayer(true);
+        }
+
+        if (isUsableYoutubePlayer(playerRef.current)) {
+            try {
+                runYoutubePlayerCommand(playerRef.current, cleanVideoId, shouldPlay, cleanStartSeconds);
+                return;
+            } catch {
+                destroyCurrentYoutubePlayer(true);
+            }
         }
 
         if (!playerContainerRef.current) {
-            setStatus("The YouTube player container is not ready yet.");
+            pendingPlayerCommandRef.current = {
+                videoId: cleanVideoId,
+                shouldPlay,
+                startSeconds: cleanStartSeconds,
+            };
+            setStatus("The YouTube player container is not ready yet. Playback will retry automatically.");
             return;
         }
 
-        playerRef.current = new window.YT.Player(playerContainerRef.current, {
-            width: "100%",
-            height: String(playerHeight),
-            videoId,
-            playerVars: {
-                playsinline: 1,
-                controls: 1,
-                rel: 0,
-                modestbranding: 1,
-                enablejsapi: 1,
-                origin: window.location.origin,
-            },
-            events: {
-                onReady: (event) => {
-                    applyIframePlaybackPermissions(event.target);
+        const mountNode = ensurePlayerMountNode(true);
 
-                    if (startSeconds > 0) {
-                        event.target.seekTo(startSeconds, true);
-                    }
+        if (!mountNode) {
+            pendingPlayerCommandRef.current = {
+                videoId: cleanVideoId,
+                shouldPlay,
+                startSeconds: cleanStartSeconds,
+            };
+            setStatus("The YouTube player mount node is not ready yet. Playback will retry automatically.");
+            return;
+        }
 
-                    if (shouldPlay) {
-                        event.target.playVideo();
-                    }
+        try {
+            playerReadyRef.current = false;
+            setPlayerIframeReady(false);
+
+            playerRef.current = new window.YT.Player(mountNode, {
+                width: "100%",
+                height: String(playerHeight),
+                videoId: cleanVideoId,
+                playerVars: {
+                    playsinline: 1,
+                    controls: 1,
+                    rel: 0,
+                    modestbranding: 1,
+                    enablejsapi: 1,
+                    origin: window.location.origin,
                 },
-                onStateChange: (event) => {
-                    if (event.data === window.YT.PlayerState.ENDED) {
-                        handleVideoEnded(event.target);
-                    }
+                events: {
+                    onReady: (event) => {
+                        playerRef.current = event.target;
+                        playerReadyRef.current = true;
+                        setPlayerIframeReady(true);
+                        applyIframePlaybackPermissions(event.target);
+
+                        try {
+                            runYoutubePlayerCommand(
+                                event.target,
+                                cleanVideoId,
+                                shouldPlay,
+                                cleanStartSeconds
+                            );
+                        } catch {
+                            setStatus("The YouTube iframe loaded, but playback could not start. Tap the video once, then try again.");
+                        }
+                    },
+                    onStateChange: (event) => {
+                        if (event.data === window.YT.PlayerState.ENDED) {
+                            handleVideoEnded(event.target);
+                        }
+                    },
+                    onError: () => {
+                        setPlayerIframeReady(false);
+                        setStatus("YouTube could not play this video in the embedded player. Try another video or open it on YouTube.");
+                    },
+                    onAutoplayBlocked: () => {
+                        setStatus("Playback was blocked by the browser. Tap Play on the YouTube player once, then try again.");
+                    },
                 },
-                onAutoplayBlocked: () => {
-                    setStatus("Playback was blocked by the browser. Tap Play on the YouTube player once, then try again.");
-                },
-            },
-        });
+            });
+        } catch {
+            destroyCurrentYoutubePlayer(true);
+            pendingPlayerCommandRef.current = {
+                videoId: cleanVideoId,
+                shouldPlay,
+                startSeconds: cleanStartSeconds,
+            };
+            setStatus("The YouTube iframe had to be rebuilt. Click Play again if it does not start automatically.");
+        }
     }
 
     function loadVideo(video, options = {}) {
@@ -2892,17 +3215,57 @@ export default function YoutubePage() {
                                             <Box
                                                 ref={playerContainerRef}
                                                 sx={{
+                                                    position: "absolute",
+                                                    inset: 0,
                                                     width: "100%",
                                                     height: "100%",
-                                                    display: "grid",
-                                                    placeItems: "center",
-                                                    background: "#000",
+                                                    zIndex: 2,
+                                                    background: "transparent",
+                                                    "& iframe": {
+                                                        width: "100% !important",
+                                                        height: "100% !important",
+                                                        display: "block",
+                                                        border: 0,
+                                                    },
                                                 }}
-                                            >
-                                                <Typography sx={{ color: "rgba(255,255,255,0.58)" }}>
-                                                    Select a YouTube video or start playlist playback.
-                                                </Typography>
-                                            </Box>
+                                            />
+
+                                            {!selectedVideo && (
+                                                <Box
+                                                    sx={{
+                                                        position: "absolute",
+                                                        inset: 0,
+                                                        display: "grid",
+                                                        placeItems: "center",
+                                                        zIndex: 1,
+                                                        pointerEvents: "none",
+                                                    }}
+                                                >
+                                                    <Typography sx={{ color: "rgba(255,255,255,0.58)", textAlign: "center", px: 2 }}>
+                                                        Select a YouTube video or start playlist playback.
+                                                    </Typography>
+                                                </Box>
+                                            )}
+
+                                            {selectedVideo?.id && !playerIframeReady && (
+                                                <Box
+                                                    component="iframe"
+                                                    key={`fallback-youtube-iframe-${selectedVideo.id}`}
+                                                    title={selectedVideo.title || "Current YouTube video"}
+                                                    src={buildYoutubeEmbedUrl(selectedVideo.id, 0, false)}
+                                                    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+                                                    allowFullScreen
+                                                    sx={{
+                                                        position: "absolute",
+                                                        inset: 0,
+                                                        width: "100%",
+                                                        height: "100%",
+                                                        border: 0,
+                                                        zIndex: 1,
+                                                        background: "#000",
+                                                    }}
+                                                />
+                                            )}
 
                                             <Tooltip title="Drag to resize the video window">
                                                 <Box

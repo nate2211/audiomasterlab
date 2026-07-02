@@ -350,6 +350,545 @@ const MEDIA_EXTENSION_HINTS = [
     ".amr",
 ];
 
+const STORAGE_KEYS = {
+    settings: "audiomasterlab.audio.settings.v4",
+    activePresetKey: "audiomasterlab.audio.activePresetKey.v4",
+    repeatEnabled: "audiomasterlab.audio.repeatEnabled.v4",
+    playlist: "audiomasterlab.audio.playlist.v4",
+    activePlaylistIndex: "audiomasterlab.audio.activePlaylistIndex.v4",
+    directLink: "audiomasterlab.audio.directLink.v4",
+    playlistLinkDraft: "audiomasterlab.audio.playlistLinkDraft.v4",
+    lastMedia: "audiomasterlab.audio.lastMedia.v4",
+    lastSession: "audiomasterlab.audio.lastSession.v4",
+};
+
+const COOKIE_NAMES = {
+    settingsSummary: "aml_audio_settings",
+    sessionSummary: "aml_audio_session",
+    playlistSummary: "aml_audio_playlist",
+};
+
+const MAX_PERSISTED_CURRENT_AUDIO_BYTES = 6 * 1024 * 1024;
+const MAX_PERSISTED_PLAYLIST_FILE_BYTES = 3 * 1024 * 1024;
+const MAX_COOKIE_VALUE_LENGTH = 3200;
+
+function storageAvailable() {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        const testKey = "__audiomasterlab_storage_test__";
+        window.localStorage.setItem(testKey, "1");
+        window.localStorage.removeItem(testKey);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function readStorageValue(key, fallback = null) {
+    if (!storageAvailable()) return fallback;
+
+    try {
+        const raw = window.localStorage.getItem(key);
+        return raw === null ? fallback : raw;
+    } catch {
+        return fallback;
+    }
+}
+
+function writeStorageValue(key, value) {
+    if (!storageAvailable()) return false;
+
+    try {
+        window.localStorage.setItem(key, value);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function removeStorageValue(key) {
+    if (!storageAvailable()) return false;
+
+    try {
+        window.localStorage.removeItem(key);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function readStorageJson(key, fallback) {
+    const raw = readStorageValue(key, "");
+
+    if (!raw) return fallback;
+
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return fallback;
+    }
+}
+
+function writeStorageJson(key, value) {
+    try {
+        return writeStorageValue(key, JSON.stringify(value));
+    } catch {
+        return false;
+    }
+}
+
+function encodeCookie(value) {
+    try {
+        return encodeURIComponent(JSON.stringify(value));
+    } catch {
+        return "";
+    }
+}
+
+function decodeCookie(value, fallback = null) {
+    try {
+        return JSON.parse(decodeURIComponent(value));
+    } catch {
+        return fallback;
+    }
+}
+
+function setCookieJson(name, value, days = 365) {
+    if (typeof document === "undefined") return false;
+
+    const encoded = encodeCookie(value);
+
+    if (!encoded || encoded.length > MAX_COOKIE_VALUE_LENGTH) return false;
+
+    const maxAge = Math.max(1, Math.floor(days * 24 * 60 * 60));
+    const secure = typeof window !== "undefined" && window.location?.protocol === "https:";
+
+    document.cookie = `${name}=${encoded}; Max-Age=${maxAge}; Path=/; SameSite=Lax${
+        secure ? "; Secure" : ""
+    }`;
+
+    return true;
+}
+
+function getCookieJson(name, fallback = null) {
+    if (typeof document === "undefined") return fallback;
+
+    const parts = String(document.cookie || "")
+        .split(";")
+        .map((part) => part.trim());
+
+    const match = parts.find((part) => part.startsWith(`${name}=`));
+
+    if (!match) return fallback;
+
+    return decodeCookie(match.slice(name.length + 1), fallback);
+}
+
+function deleteCookie(name) {
+    if (typeof document === "undefined") return;
+
+    document.cookie = `${name}=; Max-Age=0; Path=/; SameSite=Lax`;
+}
+
+function arrayBufferToBase64(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    const chunkSize = 0x8000;
+    let binary = "";
+
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+
+    return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+    const binary = atob(String(base64 || ""));
+    const bytes = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+
+    return bytes.buffer;
+}
+
+function arrayBufferToDataUrl(arrayBuffer, mimeType = "application/octet-stream") {
+    return `data:${mimeType || "application/octet-stream"};base64,${arrayBufferToBase64(
+        arrayBuffer
+    )}`;
+}
+
+function dataUrlToBlob(dataUrl, fallbackType = "application/octet-stream") {
+    const value = String(dataUrl || "");
+    const commaIndex = value.indexOf(",");
+
+    if (commaIndex < 0) {
+        throw new Error("Saved audio data is not a valid data URL.");
+    }
+
+    const header = value.slice(0, commaIndex);
+    const base64 = value.slice(commaIndex + 1);
+    const mimeMatch = header.match(/^data:([^;]+);base64$/i);
+    const mimeType = mimeMatch?.[1] || fallbackType;
+    const arrayBuffer = base64ToArrayBuffer(base64);
+
+    return new Blob([arrayBuffer], { type: mimeType });
+}
+
+function dataUrlToFile(dataUrl, fileName = "saved-audio-file", fallbackType = "audio/mpeg") {
+    const blob = dataUrlToBlob(dataUrl, fallbackType);
+
+    try {
+        return new File([blob], fileName, {
+            type: blob.type || fallbackType,
+            lastModified: Date.now(),
+        });
+    } catch {
+        blob.name = fileName;
+        blob.lastModified = Date.now();
+        return blob;
+    }
+}
+
+function getStoredItemSizeEstimate(value) {
+    try {
+        return new Blob([typeof value === "string" ? value : JSON.stringify(value)]).size;
+    } catch {
+        return 0;
+    }
+}
+
+function readPersistedSettings() {
+    const stored = readStorageJson(STORAGE_KEYS.settings, null);
+
+    if (stored) {
+        return normalizeSettings(stored);
+    }
+
+    const cookieSummary = getCookieJson(COOKIE_NAMES.settingsSummary, null);
+
+    if (cookieSummary?.settings) {
+        return normalizeSettings(cookieSummary.settings);
+    }
+
+    return DEFAULT_SETTINGS;
+}
+
+function readPersistedPresetKey() {
+    return (
+        readStorageValue(STORAGE_KEYS.activePresetKey, "") ||
+        getCookieJson(COOKIE_NAMES.settingsSummary, {})?.activePresetKey ||
+        "flat"
+    );
+}
+
+function readPersistedRepeatEnabled() {
+    const stored = readStorageValue(STORAGE_KEYS.repeatEnabled, "");
+
+    if (stored === "true") return true;
+    if (stored === "false") return false;
+
+    return Boolean(getCookieJson(COOKIE_NAMES.sessionSummary, {})?.repeatEnabled);
+}
+
+function readPersistedDirectLink() {
+    return readStorageValue(STORAGE_KEYS.directLink, "");
+}
+
+function readPersistedPlaylistLinkDraft() {
+    return readStorageValue(STORAGE_KEYS.playlistLinkDraft, "");
+}
+
+function sanitizePersistedPlaylistItem(item) {
+    if (!item || typeof item !== "object") return null;
+
+    if (item.kind === "url" && item.url) {
+        try {
+            const cleanUrl = validateDirectMediaUrl(item.url);
+
+            return {
+                id: item.id || makePlaylistId(),
+                kind: "url",
+                title: item.title || getPlaylistUrlTitle(cleanUrl),
+                url: cleanUrl,
+                size: 0,
+                type: "direct media URL",
+                addedAt: item.addedAt || new Date().toISOString(),
+                restoredFromStorage: true,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    if (item.kind === "file") {
+        let restoredFile = null;
+
+        if (item.dataUrl) {
+            try {
+                restoredFile = dataUrlToFile(
+                    item.dataUrl,
+                    item.title || "saved-audio-file",
+                    item.type || "audio/mpeg"
+                );
+            } catch {
+                restoredFile = null;
+            }
+        }
+
+        return {
+            id: item.id || makePlaylistId(),
+            kind: "file",
+            title: item.title || "Saved local file",
+            file: restoredFile,
+            dataUrl: item.dataUrl || "",
+            size: item.size || restoredFile?.size || 0,
+            type: item.type || restoredFile?.type || "unknown MIME type",
+            addedAt: item.addedAt || new Date().toISOString(),
+            persistedDataUrl: Boolean(item.dataUrl),
+            restoredFromStorage: true,
+            needsReselect: !restoredFile,
+        };
+    }
+
+    return null;
+}
+
+function readPersistedPlaylist() {
+    const stored = readStorageJson(STORAGE_KEYS.playlist, []);
+
+    if (!Array.isArray(stored)) return [];
+
+    return stored.map(sanitizePersistedPlaylistItem).filter(Boolean);
+}
+
+function serializePlaylistItemForStorage(item) {
+    if (!item || typeof item !== "object") return null;
+
+    if (item.kind === "url" && item.url) {
+        return {
+            id: item.id,
+            kind: "url",
+            title: item.title,
+            url: item.url,
+            size: 0,
+            type: "direct media URL",
+            addedAt: item.addedAt,
+        };
+    }
+
+    if (item.kind === "file") {
+        return {
+            id: item.id,
+            kind: "file",
+            title: item.title,
+            size: item.size || item.file?.size || 0,
+            type: item.type || item.file?.type || "unknown MIME type",
+            addedAt: item.addedAt,
+            dataUrl: item.dataUrl || "",
+            persistedDataUrl: Boolean(item.dataUrl),
+            needsReselect: !item.dataUrl,
+        };
+    }
+
+    return null;
+}
+
+function serializePlaylistForStorage(playlist) {
+    return Array.isArray(playlist)
+        ? playlist.map(serializePlaylistItemForStorage).filter(Boolean)
+        : [];
+}
+
+async function attachPersistedFileData(item, file, maxBytes = MAX_PERSISTED_PLAYLIST_FILE_BYTES) {
+    if (!file || !item || file.size > maxBytes) {
+        return {
+            ...item,
+            dataUrl: "",
+            persistedDataUrl: false,
+            needsReselect: true,
+            storageNote:
+                file && file.size > maxBytes
+                    ? `File metadata saved, but the file is too large for localStorage (${getReadableBytes(
+                        file.size
+                    )}).`
+                    : "File metadata saved. Re-select the file after refresh if needed.",
+        };
+    }
+
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+
+        return {
+            ...item,
+            dataUrl: arrayBufferToDataUrl(
+                arrayBuffer,
+                file.type || "application/octet-stream"
+            ),
+            persistedDataUrl: true,
+            needsReselect: false,
+            storageNote: `Saved small local file in localStorage (${getReadableBytes(
+                file.size
+            )}).`,
+        };
+    } catch {
+        return {
+            ...item,
+            dataUrl: "",
+            persistedDataUrl: false,
+            needsReselect: true,
+            storageNote: "Could not save this local file into localStorage.",
+        };
+    }
+}
+
+function persistCurrentFileSnapshot({ file, arrayBuffer, metadata }) {
+    if (!file || !arrayBuffer) return false;
+
+    const payloadBase = {
+        kind: "file",
+        title: file.name || metadata?.name || "Saved local audio",
+        type: file.type || metadata?.contentType || "application/octet-stream",
+        size: file.size || arrayBuffer.byteLength,
+        savedAt: new Date().toISOString(),
+    };
+
+    if (arrayBuffer.byteLength > MAX_PERSISTED_CURRENT_AUDIO_BYTES) {
+        writeStorageJson(STORAGE_KEYS.lastMedia, {
+            ...payloadBase,
+            dataUrl: "",
+            needsReselect: true,
+            note: `File metadata saved, but ${getReadableBytes(
+                arrayBuffer.byteLength
+            )} is too large for localStorage auto-restore.`,
+        });
+        return false;
+    }
+
+    const dataUrl = arrayBufferToDataUrl(arrayBuffer, payloadBase.type);
+    const saved = writeStorageJson(STORAGE_KEYS.lastMedia, {
+        ...payloadBase,
+        dataUrl,
+        needsReselect: false,
+    });
+
+    return saved;
+}
+
+function persistCurrentUrlSnapshot(urlValue) {
+    if (!urlValue) return false;
+
+    const title = getPlaylistUrlTitle(urlValue);
+
+    return writeStorageJson(STORAGE_KEYS.lastMedia, {
+        kind: "url",
+        title,
+        url: urlValue,
+        savedAt: new Date().toISOString(),
+    });
+}
+
+function readPersistedLastMedia() {
+    return readStorageJson(STORAGE_KEYS.lastMedia, null);
+}
+
+function persistSettingsToBrowser(settings, activePresetKey) {
+    const normalized = normalizeSettings(settings);
+
+    writeStorageJson(STORAGE_KEYS.settings, normalized);
+    writeStorageValue(STORAGE_KEYS.activePresetKey, activePresetKey || "flat");
+
+    setCookieJson(COOKIE_NAMES.settingsSummary, {
+        activePresetKey: activePresetKey || "flat",
+        settings: {
+            baseVolume: normalized.baseVolume,
+            speed: normalized.speed,
+            pitchSemitones: normalized.pitchSemitones,
+            outputGain: normalized.outputGain,
+        },
+        updatedAt: new Date().toISOString(),
+    });
+}
+
+function persistSessionToBrowser({
+                                     repeatEnabled,
+                                     directLink,
+                                     playlistLink,
+                                     activePlaylistIndex,
+                                     playlistLength,
+                                     hasMedia,
+                                     sourceKind,
+                                 }) {
+    writeStorageValue(STORAGE_KEYS.repeatEnabled, repeatEnabled ? "true" : "false");
+    writeStorageValue(STORAGE_KEYS.activePlaylistIndex, String(activePlaylistIndex ?? -1));
+    writeStorageValue(STORAGE_KEYS.directLink, directLink || "");
+    writeStorageValue(STORAGE_KEYS.playlistLinkDraft, playlistLink || "");
+
+    const summary = {
+        repeatEnabled: Boolean(repeatEnabled),
+        activePlaylistIndex: Number(activePlaylistIndex ?? -1),
+        playlistLength: Number(playlistLength || 0),
+        hasMedia: Boolean(hasMedia),
+        sourceKind: sourceKind || "",
+        updatedAt: new Date().toISOString(),
+    };
+
+    writeStorageJson(STORAGE_KEYS.lastSession, summary);
+    setCookieJson(COOKIE_NAMES.sessionSummary, summary);
+}
+
+function persistPlaylistToBrowser(playlist) {
+    const serializable = serializePlaylistForStorage(playlist);
+    const saved = writeStorageJson(STORAGE_KEYS.playlist, serializable);
+
+    setCookieJson(COOKIE_NAMES.playlistSummary, {
+        count: serializable.length,
+        urlCount: serializable.filter((item) => item.kind === "url").length,
+        savedFileCount: serializable.filter((item) => item.kind === "file" && item.dataUrl)
+            .length,
+        placeholderFileCount: serializable.filter(
+            (item) => item.kind === "file" && !item.dataUrl
+        ).length,
+        updatedAt: new Date().toISOString(),
+    });
+
+    return saved;
+}
+
+function clearPersistedBrowserSession() {
+    Object.values(STORAGE_KEYS).forEach(removeStorageValue);
+    Object.values(COOKIE_NAMES).forEach(deleteCookie);
+}
+
+function buildPersistenceInfo() {
+    const playlist = readStorageJson(STORAGE_KEYS.playlist, []);
+    const lastMedia = readPersistedLastMedia();
+    const settings = readStorageJson(STORAGE_KEYS.settings, null);
+
+    return {
+        localStorageEnabled: storageAvailable(),
+        settingsSaved: Boolean(settings),
+        playlistCount: Array.isArray(playlist) ? playlist.length : 0,
+        savedPlaylistFiles: Array.isArray(playlist)
+            ? playlist.filter((item) => item.kind === "file" && item.dataUrl).length
+            : 0,
+        placeholderPlaylistFiles: Array.isArray(playlist)
+            ? playlist.filter((item) => item.kind === "file" && !item.dataUrl).length
+            : 0,
+        hasSavedCurrentAudio: Boolean(lastMedia?.dataUrl || lastMedia?.url),
+        lastMediaKind: lastMedia?.kind || "",
+        lastMediaTitle: lastMedia?.title || "",
+        storageBytes: getStoredItemSizeEstimate({
+            settings,
+            playlist,
+            lastMedia,
+        }),
+    };
+}
+
+
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
@@ -1435,6 +1974,10 @@ function buildPlaylistItemFromFile(file) {
         kind: "file",
         title: file?.name || "Untitled audio file",
         file,
+        dataUrl: "",
+        persistedDataUrl: false,
+        needsReselect: false,
+        storageNote: "",
         size: file?.size || 0,
         type: file?.type || "unknown MIME type",
         addedAt: new Date().toISOString(),
@@ -1485,13 +2028,25 @@ function getPlaylistItemMeta(item) {
     if (item.kind === "url") {
         try {
             const parsed = new URL(item.url);
-            return `Direct media URL • ${parsed.hostname}`;
+            return `Direct media URL • ${parsed.hostname} • saved across refreshes`;
         } catch {
-            return "Direct media URL";
+            return "Direct media URL • saved across refreshes";
         }
     }
 
-    return `${item.type || "unknown MIME type"} • ${getReadableBytes(item.size)}`;
+    const baseMeta = `${item.type || "unknown MIME type"} • ${getReadableBytes(
+        item.size
+    )}`;
+
+    if (item.persistedDataUrl || item.dataUrl) {
+        return `${baseMeta} • saved in localStorage`;
+    }
+
+    if (item.needsReselect || !item.file) {
+        return `${baseMeta} • remembered placeholder, reselect file after refresh`;
+    }
+
+    return `${baseMeta} • available this session`;
 }
 
 function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
@@ -1508,6 +2063,134 @@ function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
     }
 
     return "Repeat is OFF. Playback will stop when the current song ends.";
+}
+
+function StoragePersistencePanel({ storageInfo, onClearSavedSession }) {
+    const savedAudioLabel = storageInfo?.hasSavedCurrentAudio
+        ? `Saved current ${storageInfo.lastMediaKind || "media"}`
+        : "No saved current audio";
+
+    return (
+        <GlassCard>
+            <Stack spacing={1.7}>
+                <Stack
+                    direction={{ xs: "column", md: "row" }}
+                    spacing={1.4}
+                    justifyContent="space-between"
+                    alignItems={{ xs: "stretch", md: "center" }}
+                >
+                    <Box>
+                        <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.4 }}>
+                            Saved browser session
+                        </Typography>
+
+                        <Typography sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.65 }}>
+                            Settings, preset choice, repeat mode, direct links, playlist metadata,
+                            and small uploaded audio files are saved with localStorage. Cookies keep
+                            a small backup summary for quick restore hints.
+                        </Typography>
+                    </Box>
+
+                    <Button
+                        variant="outlined"
+                        onClick={onClearSavedSession}
+                        sx={{
+                            alignSelf: { xs: "stretch", md: "center" },
+                            borderRadius: 999,
+                            color: "#fff",
+                            borderColor: "rgba(255,255,255,0.18)",
+                            fontWeight: 900,
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        Clear saved session
+                    </Button>
+                </Stack>
+
+                <Stack direction="row" flexWrap="wrap" gap={1}>
+                    <Chip
+                        label={
+                            storageInfo?.localStorageEnabled
+                                ? "localStorage ready"
+                                : "localStorage blocked"
+                        }
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: storageInfo?.localStorageEnabled
+                                ? "rgba(103,232,249,0.12)"
+                                : "rgba(248,113,113,0.13)",
+                            border: storageInfo?.localStorageEnabled
+                                ? "1px solid rgba(103,232,249,0.22)"
+                                : "1px solid rgba(248,113,113,0.25)",
+                        }}
+                    />
+
+                    <Chip
+                        label={storageInfo?.settingsSaved ? "settings saved" : "default settings"}
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: "rgba(255,255,255,0.08)",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                        }}
+                    />
+
+                    <Chip
+                        label={`${storageInfo?.playlistCount || 0} playlist item${
+                            storageInfo?.playlistCount === 1 ? "" : "s"
+                        } saved`}
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: "rgba(255,255,255,0.08)",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                        }}
+                    />
+
+                    <Chip
+                        label={`${storageInfo?.savedPlaylistFiles || 0} file${
+                            storageInfo?.savedPlaylistFiles === 1 ? "" : "s"
+                        } stored as audio`}
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: "rgba(255,255,255,0.08)",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                        }}
+                    />
+
+                    <Chip
+                        label={`${storageInfo?.placeholderPlaylistFiles || 0} large file placeholder${
+                            storageInfo?.placeholderPlaylistFiles === 1 ? "" : "s"
+                        }`}
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: "rgba(255,255,255,0.08)",
+                            border: "1px solid rgba(255,255,255,0.08)",
+                        }}
+                    />
+
+                    <Chip
+                        label={savedAudioLabel}
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: "rgba(167,139,250,0.1)",
+                            border: "1px solid rgba(167,139,250,0.2)",
+                        }}
+                    />
+                </Stack>
+
+                <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.54)", lineHeight: 1.6 }}>
+                    Current stored estimate: {getReadableBytes(storageInfo?.storageBytes || 0)}.
+                    Browsers usually limit localStorage to a few MB, so large uploaded files are
+                    remembered by name and size but must be selected again after refresh.
+                </Typography>
+            </Stack>
+        </GlassCard>
+    );
 }
 
 export default function Audio() {
@@ -1547,9 +2230,9 @@ export default function Audio() {
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
     const [inputFile, setInputFile] = useState(null);
-    const [directLink, setDirectLink] = useState("");
-    const [playlistLink, setPlaylistLink] = useState("");
-    const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+    const [directLink, setDirectLink] = useState(() => readPersistedDirectLink());
+    const [playlistLink, setPlaylistLink] = useState(() => readPersistedPlaylistLinkDraft());
+    const [settings, setSettings] = useState(() => readPersistedSettings());
     const [status, setStatus] = useState(
         "Upload MP3, WAV, OGG, WebM, M4A, MP4, MOV, or choose a file from iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another Files provider."
     );
@@ -1564,10 +2247,14 @@ export default function Audio() {
     const [position, setPosition] = useState(0);
     const [duration, setDuration] = useState(0);
     const [mediaInfo, setMediaInfo] = useState("");
-    const [playlist, setPlaylist] = useState([]);
-    const [activePlaylistIndex, setActivePlaylistIndex] = useState(-1);
-    const [repeatEnabled, setRepeatEnabled] = useState(false);
-    const [activePresetKey, setActivePresetKey] = useState("flat");
+    const [playlist, setPlaylist] = useState(() => readPersistedPlaylist());
+    const [activePlaylistIndex, setActivePlaylistIndex] = useState(() => {
+        const storedIndex = Number(readStorageValue(STORAGE_KEYS.activePlaylistIndex, "-1"));
+        return Number.isFinite(storedIndex) ? storedIndex : -1;
+    });
+    const [repeatEnabled, setRepeatEnabled] = useState(() => readPersistedRepeatEnabled());
+    const [activePresetKey, setActivePresetKey] = useState(() => readPersistedPresetKey());
+    const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
@@ -1618,6 +2305,37 @@ export default function Audio() {
     }, [settings]);
 
     useEffect(() => {
+        persistSettingsToBrowser(settings, activePresetKey);
+        setStorageInfo(buildPersistenceInfo());
+    }, [settings, activePresetKey]);
+
+    useEffect(() => {
+        persistPlaylistToBrowser(playlist);
+        setStorageInfo(buildPersistenceInfo());
+    }, [playlist]);
+
+    useEffect(() => {
+        persistSessionToBrowser({
+            repeatEnabled,
+            directLink,
+            playlistLink,
+            activePlaylistIndex,
+            playlistLength: playlist.length,
+            hasMedia,
+            sourceKind,
+        });
+        setStorageInfo(buildPersistenceInfo());
+    }, [
+        repeatEnabled,
+        directLink,
+        playlistLink,
+        activePlaylistIndex,
+        playlist.length,
+        hasMedia,
+        sourceKind,
+    ]);
+
+    useEffect(() => {
         playlistRef.current = playlist;
     }, [playlist]);
 
@@ -1651,6 +2369,11 @@ export default function Audio() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    useEffect(() => {
+        restorePersistedMediaOnBoot();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     function setPlayingState(nextValue) {
         playingRef.current = nextValue;
         setIsPlaying(nextValue);
@@ -1664,6 +2387,121 @@ export default function Audio() {
     function setError(message) {
         setStatus(message);
         setStatusTone("error");
+    }
+
+    function refreshStorageInfo() {
+        setStorageInfo(buildPersistenceInfo());
+    }
+
+    function clearSavedBrowserSession() {
+        clearPersistedBrowserSession();
+        refreshStorageInfo();
+        setInfo("Saved audio/session data cleared from localStorage and cookies. Current in-memory playback remains until you clear media or refresh.");
+    }
+
+    async function restorePersistedMediaOnBoot() {
+        const savedMedia = readPersistedLastMedia();
+
+        if (!savedMedia) {
+            if (playlistRef.current.length || readPersistedDirectLink()) {
+                setInfo("Restored saved settings, playlist, repeat mode, and direct-link drafts from localStorage/cookies.");
+            }
+
+            return;
+        }
+
+        if (savedMedia.kind === "file" && savedMedia.dataUrl) {
+            try {
+                setIsLoading(true);
+                resetDecodedState();
+                clearObjectUrl();
+
+                const restoredFile = dataUrlToFile(
+                    savedMedia.dataUrl,
+                    savedMedia.title || "saved-audio-file",
+                    savedMedia.type || "audio/mpeg"
+                );
+                const objectUrl = URL.createObjectURL(restoredFile);
+                const arrayBuffer = await restoredFile.arrayBuffer();
+
+                objectUrlRef.current = objectUrl;
+
+                setInputFile(restoredFile);
+                setSourceKind("file");
+                setSourceUrl(objectUrl);
+                setActivePlaylistIndex(-1);
+                activePlaylistIndexRef.current = -1;
+
+                const metadata = {
+                    name: restoredFile.name || savedMedia.title,
+                    sourceType: "localStorage",
+                    contentType: restoredFile.type || savedMedia.type,
+                    byteLength: restoredFile.size || arrayBuffer.byteLength,
+                    providerHint: "localStorage saved audio",
+                };
+
+                const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+
+                setInfo(
+                    `Restored saved local audio "${savedMedia.title}" from localStorage. Browser decoded ${formatTime(
+                        decodedBuffer.duration
+                    )}.`
+                );
+            } catch (error) {
+                setError(
+                    error?.message ||
+                    "Saved local audio could not be restored from localStorage. Upload it again."
+                );
+            } finally {
+                setIsLoading(false);
+                refreshStorageInfo();
+            }
+
+            return;
+        }
+
+        if (savedMedia.kind === "url" && savedMedia.url) {
+            try {
+                setIsLoading(true);
+                resetDecodedState();
+                clearObjectUrl();
+
+                const cleanLink = validateDirectMediaUrl(savedMedia.url);
+
+                setInputFile(null);
+                setSourceKind("url");
+                setSourceUrl(cleanLink);
+                setDirectLink(cleanLink);
+                setActivePlaylistIndex(-1);
+                activePlaylistIndexRef.current = -1;
+
+                const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
+                const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+
+                setInfo(
+                    `Restored saved direct media link "${savedMedia.title}". Browser decoded ${formatTime(
+                        decodedBuffer.duration
+                    )}.`
+                );
+            } catch (error) {
+                setDirectLink(savedMedia.url || "");
+                setError(
+                    error?.message ||
+                    "Saved direct media link could not be decoded automatically. Tap Load direct link to try again."
+                );
+            } finally {
+                setIsLoading(false);
+                refreshStorageInfo();
+            }
+
+            return;
+        }
+
+        if (savedMedia.kind === "file" && savedMedia.needsReselect) {
+            setInfo(
+                `Remembered "${savedMedia.title}", but it was too large for localStorage audio restore. Re-upload that file to play it again.`
+            );
+        }
     }
 
     function clearObjectUrl() {
@@ -2107,12 +2945,23 @@ export default function Audio() {
                 finalSourceLabel
             );
 
+            const savedCurrentAudio = persistCurrentFileSnapshot({
+                file,
+                arrayBuffer,
+                metadata,
+            });
+
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+            refreshStorageInfo();
 
             setInfo(
                 `Loaded ${file.name}. Browser decoded ${formatTime(
                     decodedBuffer.duration
-                )}. Source: ${pickedInfo}.`
+                )}. Source: ${pickedInfo}. ${
+                    savedCurrentAudio
+                        ? "This small audio file was saved in localStorage for refresh restore."
+                        : "File metadata was saved, but the file is too large for localStorage audio restore."
+                }`
             );
         } catch (error) {
             setError(error?.message || "Could not decode this media file.");
@@ -2135,13 +2984,16 @@ export default function Audio() {
             setActivePlaylistIndex(-1);
             activePlaylistIndexRef.current = -1;
 
+            persistCurrentUrlSnapshot(cleanLink);
+
             const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+            refreshStorageInfo();
 
             setInfo(
                 `Loaded direct media link. Browser decoded ${formatTime(
                     decodedBuffer.duration
-                )}.`
+                )}. This link was saved in localStorage/cookies for refresh restore.`
             );
         } catch (error) {
             setError(error?.message || "Could not load that direct media link.");
@@ -2160,13 +3012,15 @@ export default function Audio() {
         setDirectLink("");
         setActivePlaylistIndex(-1);
         activePlaylistIndexRef.current = -1;
+        removeStorageValue(STORAGE_KEYS.lastMedia);
+        refreshStorageInfo();
 
         setInfo(
-            "Media cleared. Use Upload media file for desktop files or iPhone Files providers, or paste a direct media link."
+            "Media cleared. Saved current-audio restore was removed. Playlist, settings, cookies, and direct-link drafts stay saved unless you clear saved session data."
         );
     }
 
-    function addFilesToPlaylist(files) {
+    async function addFilesToPlaylist(files) {
         const pickedFiles = Array.from(files || []).filter(Boolean);
 
         if (!pickedFiles.length) {
@@ -2185,15 +3039,35 @@ export default function Audio() {
             return;
         }
 
-        const nextItems = supportedFiles.map(buildPlaylistItemFromFile);
+        setIsLoading(true);
 
-        setPlaylist((current) => [...current, ...nextItems]);
+        try {
+            const nextItems = await Promise.all(
+                supportedFiles.map((file) =>
+                    attachPersistedFileData(
+                        buildPlaylistItemFromFile(file),
+                        file,
+                        MAX_PERSISTED_PLAYLIST_FILE_BYTES
+                    )
+                )
+            );
 
-        setInfo(
-            `Added ${nextItems.length} file(s) to the playlist${
-                skippedCount ? ` and skipped ${skippedCount} unsupported file(s)` : ""
-            }.`
-        );
+            setPlaylist((current) => [...current, ...nextItems]);
+
+            const savedCount = nextItems.filter((item) => item.persistedDataUrl).length;
+            const placeholderCount = nextItems.length - savedCount;
+
+            setInfo(
+                `Added ${nextItems.length} file(s) to the playlist${
+                    skippedCount ? ` and skipped ${skippedCount} unsupported file(s)` : ""
+                }. ${savedCount} small file(s) were saved in localStorage. ${placeholderCount} larger file(s) were remembered as metadata placeholders.`
+            );
+        } catch (error) {
+            setError(error?.message || "Could not add files to the playlist.");
+        } finally {
+            setIsLoading(false);
+            refreshStorageInfo();
+        }
     }
 
     function addDirectLinksToPlaylist() {
@@ -2235,10 +3109,33 @@ export default function Audio() {
         );
     }
 
-    function addCurrentMediaToPlaylist() {
+    async function addCurrentMediaToPlaylist() {
         if (sourceKind === "file" && inputFile) {
-            setPlaylist((current) => [...current, buildPlaylistItemFromFile(inputFile)]);
-            setInfo(`Added the currently loaded file "${inputFile.name}" to the playlist.`);
+            setIsLoading(true);
+
+            try {
+                const nextItem = await attachPersistedFileData(
+                    buildPlaylistItemFromFile(inputFile),
+                    inputFile,
+                    MAX_PERSISTED_PLAYLIST_FILE_BYTES
+                );
+
+                setPlaylist((current) => [...current, nextItem]);
+
+                setInfo(
+                    `Added the currently loaded file "${inputFile.name}" to the playlist. ${
+                        nextItem.persistedDataUrl
+                            ? "It was saved in localStorage for refresh restore."
+                            : "It was saved as a remembered placeholder because it is too large for localStorage."
+                    }`
+                );
+            } catch (error) {
+                setError(error?.message || "The currently loaded file could not be added.");
+            } finally {
+                setIsLoading(false);
+                refreshStorageInfo();
+            }
+
             return;
         }
 
@@ -2247,9 +3144,13 @@ export default function Audio() {
                 const nextItem = buildPlaylistItemFromUrl(sourceUrl);
 
                 setPlaylist((current) => [...current, nextItem]);
-                setInfo(`Added the currently loaded direct link "${nextItem.title}" to the playlist.`);
+                setInfo(
+                    `Added the currently loaded direct link "${nextItem.title}" to the playlist. Direct links restore automatically after refresh.`
+                );
             } catch (error) {
                 setError(error?.message || "The currently loaded link could not be added.");
+            } finally {
+                refreshStorageInfo();
             }
 
             return;
@@ -2277,11 +3178,15 @@ export default function Audio() {
                 setInputFile(null);
                 setSourceKind("url");
                 setSourceUrl(cleanLink);
+                setDirectLink(cleanLink);
                 setActivePlaylistIndex(index);
                 activePlaylistIndexRef.current = index;
 
+                persistCurrentUrlSnapshot(cleanLink);
+
                 const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
                 const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+                refreshStorageInfo();
 
                 setInfo(
                     `Loaded playlist link ${index + 1} of ${
@@ -2305,24 +3210,40 @@ export default function Audio() {
             return;
         }
 
-        if (!item.file) {
-            setError("That playlist file is no longer available. Add it again from your device.");
+        let playlistFile = item.file;
+
+        if (!playlistFile && item.dataUrl) {
+            try {
+                playlistFile = dataUrlToFile(
+                    item.dataUrl,
+                    item.title || "saved-playlist-audio",
+                    item.type || "audio/mpeg"
+                );
+            } catch {
+                playlistFile = null;
+            }
+        }
+
+        if (!playlistFile) {
+            setError(
+                "That playlist file was remembered after refresh, but the actual local file was too large for localStorage. Add it again from your device."
+            );
             return;
         }
 
-        const pickedInfo = buildPickedFileInfo(item.file, "Playlist file");
-        const pickedWarning = buildPickedFileWarning(item.file);
+        const pickedInfo = buildPickedFileInfo(playlistFile, "Playlist file");
+        const pickedWarning = buildPickedFileWarning(playlistFile);
 
         try {
             setIsLoading(true);
             resetDecodedState();
             clearObjectUrl();
 
-            const objectUrl = URL.createObjectURL(item.file);
+            const objectUrl = URL.createObjectURL(playlistFile);
 
             objectUrlRef.current = objectUrl;
 
-            setInputFile(item.file);
+            setInputFile(playlistFile);
             setSourceKind("file");
             setSourceUrl(objectUrl);
             setActivePlaylistIndex(index);
@@ -2334,18 +3255,31 @@ export default function Audio() {
             }
 
             const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
-                item.file,
-                "Playlist file"
+                playlistFile,
+                item.persistedDataUrl || item.dataUrl
+                    ? "Playlist file restored from localStorage"
+                    : "Playlist file"
             );
 
+            persistCurrentFileSnapshot({
+                file: playlistFile,
+                arrayBuffer,
+                metadata,
+            });
+
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+            refreshStorageInfo();
 
             setInfo(
                 `Loaded playlist file ${index + 1} of ${
                     playlistRef.current.length
                 }: "${item.title}". Browser decoded ${formatTime(
                     decodedBuffer.duration
-                )}. Source: ${pickedInfo}.`
+                )}. Source: ${pickedInfo}. ${
+                    item.persistedDataUrl || item.dataUrl
+                        ? "This playlist file was restored from localStorage."
+                        : "This playlist file is available for this browser session."
+                }`
             );
 
             if (autoplay) {
@@ -3114,7 +4048,12 @@ export default function Audio() {
                 <SectionTitle
                     eyebrow="Audio tool"
                     title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
-                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, and render the processed result to WAV."
+                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies."
+                />
+
+                <StoragePersistencePanel
+                    storageInfo={storageInfo}
+                    onClearSavedSession={clearSavedBrowserSession}
                 />
 
                 <GlassCard>
