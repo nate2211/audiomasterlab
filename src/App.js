@@ -64,6 +64,7 @@ export default function App() {
 
         <ThemeProvider theme={theme}>
           <CssBaseline />
+
           <BrowserRouter>
             <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
               <NavBar />
