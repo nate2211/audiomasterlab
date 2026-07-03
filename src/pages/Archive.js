@@ -24,7 +24,7 @@ import OpenInNewRoundedIcon from "@mui/icons-material/OpenInNewRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
-
+import { useNavigate } from "react-router-dom";
 const AUDIO_EXTENSIONS = [
     ".mp3",
     ".m4a",
@@ -96,8 +96,7 @@ const SAFE_COLLECTION_OPTIONS = [
     },
 ];
 
-const DEFAULT_SELECTED_COLLECTIONS = [
-];
+const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
 
 function normalizeText(value) {
     return String(value || "")
@@ -357,11 +356,182 @@ function decodeArchivePathPart(value) {
     }
 }
 
-function extractUrls(value) {
-    const matches = String(value || "").match(/https?:\/\/[^\s<>"']+/gi);
-    return matches ? matches.map(stripUrlPunctuation) : [];
+function splitJoinedUrls(value) {
+    return String(value || "")
+        .replace(/(https?:\/\/)/gi, " $1")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
+function extractUrls(value) {
+    const text = splitJoinedUrls(value);
+    const matches = text.match(/https?:\/\/[^\s<>"']+/gi);
+
+    return matches ? matches.map(stripUrlPunctuation) : [];
+}
+function isArchiveHost(host = "") {
+    const lower = String(host || "").toLowerCase();
+
+    return (
+        lower === "archive.org" ||
+        lower === "www.archive.org" ||
+        /^ia\d+\.us\.archive\.org$/.test(lower)
+    );
+}
+
+function normalizeAdvancedSearchQuery(value) {
+    return sanitizeArchiveQuery(
+        normalizeText(value)
+            // Remove Google-style site operators if someone pastes a Google/Bing query.
+            .replace(/\(?\s*site:archive\.org\s*\)?/gi, " ")
+            .replace(/-site:[^\s)]+/gi, " ")
+
+            // These terms are not useful once we already force mediatype:audio.
+            .replace(/\bofficial\s+audio\b/gi, " ")
+            .replace(/\bdownload\b/gi, " ")
+            .replace(/\bstream\b/gi, " ")
+            .replace(/\blisten\b/gi, " ")
+            .replace(/\baudio\b/gi, " ")
+
+            // Keep the human query words.
+            .replace(/\bOR\b/gi, " ")
+            .replace(/\bAND\b/gi, " ")
+            .replace(/[()"]/g, " ")
+    );
+}
+
+function parseArchiveTarget(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        const host = url.hostname.toLowerCase();
+
+        if (!isArchiveHost(host)) {
+            return null;
+        }
+
+        const parts = url.pathname
+            .split("/")
+            .filter(Boolean)
+            .map(decodeArchivePathPart);
+
+        // archive.org/advancedsearch.php?q=...
+        if (
+            (host === "archive.org" || host === "www.archive.org") &&
+            parts[0] === "advancedsearch.php"
+        ) {
+            const q = normalizeAdvancedSearchQuery(url.searchParams.get("q") || "");
+
+            if (!q) return null;
+
+            return {
+                type: "advancedSearch",
+                query: q,
+                originalUrl: rawUrl,
+            };
+        }
+
+        let identifier = "";
+        let fileName = "";
+
+        // archive.org/details/IDENTIFIER
+        if (
+            (host === "archive.org" || host === "www.archive.org") &&
+            parts[0] === "details" &&
+            parts[1]
+        ) {
+            identifier = parts[1];
+
+            return {
+                type: "item",
+                identifier,
+                originalUrl: rawUrl,
+                detailsUrl: buildDetailsUrl(identifier),
+            };
+        }
+
+        // archive.org/download/IDENTIFIER/file.mp3
+        // archive.org/serve/IDENTIFIER/file.mp3
+        if (
+            (host === "archive.org" || host === "www.archive.org") &&
+            (parts[0] === "download" || parts[0] === "serve") &&
+            parts.length >= 2
+        ) {
+            identifier = parts[1];
+            fileName = parts.slice(2).join("/");
+        }
+
+        // ia801607.us.archive.org/35/items/IDENTIFIER/file.ext
+        if (/^ia\d+\.us\.archive\.org$/.test(host)) {
+            const itemsIndex = parts.indexOf("items");
+
+            if (itemsIndex >= 0 && parts.length >= itemsIndex + 2) {
+                identifier = parts[itemsIndex + 1];
+                fileName = parts.slice(itemsIndex + 2).join("/");
+            }
+        }
+
+        if (!identifier) {
+            return null;
+        }
+
+        // If it is a direct playable audio file, load that exact file.
+        if (fileName && isAudioFile(fileName) && !isSkipFile(fileName)) {
+            return {
+                type: "audioFile",
+                identifier,
+                fileName,
+                originalUrl: rawUrl,
+                serveUrl: buildServeUrl(identifier, fileName),
+                downloadUrl: buildDownloadUrl(identifier, fileName),
+                detailsUrl: buildDetailsUrl(identifier),
+                zipInternal: isZipInternalPath(fileName),
+            };
+        }
+
+        // If it is a .gif/.jpg/.xml/etc inside an Archive item, use it as an item pointer.
+        return {
+            type: "item",
+            identifier,
+            originalUrl: rawUrl,
+            detailsUrl: buildDetailsUrl(identifier),
+        };
+    } catch {
+        return null;
+    }
+}
+
+function extractArchiveTargets(value) {
+    const seen = new Set();
+
+    return extractUrls(value)
+        .map(parseArchiveTarget)
+        .filter(Boolean)
+        .filter((target) => {
+            const key =
+                target.type === "advancedSearch"
+                    ? `search:${target.query}`
+                    : `${target.type}:${target.identifier}:${target.fileName || ""}`;
+
+            if (seen.has(key)) {
+                return false;
+            }
+
+            seen.add(key);
+            return true;
+        });
+}
+
+function getArchiveSearchTextFromInput(value) {
+    const advancedSearchTarget = extractArchiveTargets(value).find(
+        (target) => target.type === "advancedSearch"
+    );
+
+    if (advancedSearchTarget?.query) {
+        return advancedSearchTarget.query;
+    }
+
+    return value;
+}
 function parseArchiveAudioUrl(rawUrl) {
     try {
         const url = new URL(rawUrl);
@@ -442,86 +612,122 @@ function extractArchiveAudioLinks(value) {
             return true;
         });
 }
+async function buildArchiveResultFromMetadata({
+                                                  identifier,
+                                                  forcedFiles = [],
+                                                  selectedCollections,
+                                                  allowZipInternalPaths,
+                                              }) {
+    const metadataData = await fetchArchiveMetadata(identifier);
+    const metadata = metadataData.metadata || {};
+    const metadataFiles = Array.isArray(metadataData.files)
+        ? metadataData.files
+        : [];
+
+    const itemLike = {
+        identifier,
+        title: metadata.title || identifier,
+        creator: metadata.creator || "",
+        collection: metadata.collection || [],
+        description: metadata.description || "",
+        subject: metadata.subject || "",
+    };
+
+    const rightsSafer = looksRightsSafer(
+        itemLike,
+        metadata,
+        selectedCollections
+    );
+
+    if (!rightsSafer) {
+        return null;
+    }
+
+    const playableFiles = forcedFiles.length
+        ? forcedFiles
+        : getPlayableFiles(identifier, metadataFiles, allowZipInternalPaths);
+
+    if (!playableFiles.length) {
+        return null;
+    }
+
+    return {
+        identifier,
+        title: metadata.title || identifier,
+        creator: metadata.creator || "",
+        date: metadata.date || "",
+        description: normalizeText(metadata.description || "")
+            .replace(/<[^>]*>/g, "")
+            .slice(0, 260),
+        collection: Array.from(new Set(getItemCollections(itemLike, metadata))),
+        license: getLicense(metadata),
+        downloads: "",
+        detailsUrl: buildDetailsUrl(identifier),
+        files: playableFiles,
+    };
+}
+
 async function loadDirectArchiveAudioLinks({
                                                query,
                                                selectedCollections,
                                                allowZipInternalPaths,
                                            }) {
-    const links = extractArchiveAudioLinks(query);
+    const targets = extractArchiveTargets(query);
 
-    if (!links.length) {
+    const directTargets = targets.filter(
+        (target) => target.type === "audioFile" || target.type === "item"
+    );
+
+    if (!directTargets.length) {
         return null;
     }
 
     const grouped = new Map();
 
-    for (const link of links) {
-        if (!allowZipInternalPaths && link.zipInternal) {
-            continue;
+    for (const target of directTargets) {
+        if (!grouped.has(target.identifier)) {
+            grouped.set(target.identifier, {
+                identifier: target.identifier,
+                forcedFiles: [],
+            });
         }
 
-        if (!grouped.has(link.identifier)) {
-            grouped.set(link.identifier, []);
-        }
+        if (target.type === "audioFile") {
+            if (!allowZipInternalPaths && target.zipInternal) {
+                continue;
+            }
 
-        grouped.get(link.identifier).push(link);
+            grouped.get(target.identifier).forcedFiles.push({
+                name: target.fileName,
+                format: "",
+                size: "",
+                length: "",
+                source: "direct archive url",
+                url: target.serveUrl,
+                serveUrl: target.serveUrl,
+                downloadUrl: target.downloadUrl,
+                originalUrl: target.originalUrl,
+                zipInternal: target.zipInternal,
+            });
+        }
     }
 
     const results = [];
 
-    for (const [identifier, files] of grouped.entries()) {
+    for (const group of grouped.values()) {
         try {
-            const metadataData = await fetchArchiveMetadata(identifier);
-            const metadata = metadataData.metadata || {};
-
-            const itemLike = {
-                identifier,
-                title: metadata.title || identifier,
-                creator: metadata.creator || "",
-                collection: metadata.collection || [],
-                description: metadata.description || "",
-                subject: metadata.subject || "",
-            };
-
-            const rightsSafer = looksRightsSafer(
-                itemLike,
-                metadata,
-                selectedCollections
-            );
-
-            if (!rightsSafer) {
-                continue;
-            }
-
-            results.push({
-                identifier,
-                title: metadata.title || identifier,
-                creator: metadata.creator || "",
-                date: metadata.date || "",
-                description: normalizeText(metadata.description || "")
-                    .replace(/<[^>]*>/g, "")
-                    .slice(0, 260),
-                collection: Array.from(
-                    new Set(getItemCollections(itemLike, metadata))
-                ),
-                license: getLicense(metadata),
-                downloads: "",
-                detailsUrl: buildDetailsUrl(identifier),
-                files: files.map((link) => ({
-                    name: link.fileName,
-                    format: "",
-                    size: "",
-                    length: "",
-                    source: "direct archive url",
-                    url: link.serveUrl,
-                    serveUrl: link.serveUrl,
-                    downloadUrl: link.downloadUrl,
-                    originalUrl: link.originalUrl,
-                    zipInternal: link.zipInternal,
-                })),
+            const result = await buildArchiveResultFromMetadata({
+                identifier: group.identifier,
+                forcedFiles: group.forcedFiles,
+                selectedCollections,
+                allowZipInternalPaths,
             });
+
+            if (result) {
+                results.push(result);
+            }
         } catch {
-            // Skip malformed or unavailable Archive items.
+            // Skip bad Archive items so one broken URL does not crash the page.
         }
     }
 
@@ -537,7 +743,7 @@ async function searchSafeAudio({
                                    selectedCollections,
                                    allowZipInternalPaths,
                                }) {
-    const safeQuery = sanitizeArchiveQuery(query);
+    const safeQuery = sanitizeArchiveQuery(getArchiveSearchTextFromInput(query));
 
     if (!safeQuery) {
         throw new Error("Type a search query first.");
@@ -619,7 +825,7 @@ export default function ArchiveAudioBrowser() {
     const [status, setStatus] = useState("");
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
-
+    const navigate = useNavigate();
     const [selectedCollections, setSelectedCollections] = useState(
         DEFAULT_SELECTED_COLLECTIONS
     );
@@ -658,7 +864,37 @@ export default function ArchiveAudioBrowser() {
             setError("Could not copy to clipboard in this browser.");
         }
     }
+    function sendArchiveFileToAudioPage(file) {
+        const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
 
+        if (!selectedUrl) {
+            setError("No playable Archive audio link was found for this file.");
+            return;
+        }
+
+        const title = file?.name || "Archive audio";
+
+        try {
+            window.localStorage.setItem(
+                "audiomasterlab.audio.lastMedia.v4",
+                JSON.stringify({
+                    kind: "url",
+                    title,
+                    url: selectedUrl,
+                    savedAt: new Date().toISOString(),
+                })
+            );
+
+            window.localStorage.setItem(
+                "audiomasterlab.audio.directLink.v4",
+                selectedUrl
+            );
+        } catch {
+            // Query param still works even if localStorage is blocked.
+        }
+
+        navigate(`/audio?url=${encodeURIComponent(selectedUrl)}`);
+    }
     async function runSearch(loadMore = false) {
         try {
             setLoading(true);
@@ -1073,6 +1309,14 @@ export default function ArchiveAudioBrowser() {
                                                             onClick={() => copyText(file.downloadUrl || file.url)}
                                                         >
                                                             Copy download link
+                                                        </Button>
+                                                        <Button
+                                                            size="small"
+                                                            variant="contained"
+                                                            onClick={() => sendArchiveFileToAudioPage(file)}
+                                                            startIcon={<AudiotrackRoundedIcon />}
+                                                        >
+                                                            Load in Audio Page
                                                         </Button>
                                                     </Stack>
                                                 </Stack>

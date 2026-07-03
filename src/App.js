@@ -12,6 +12,7 @@ import Recorder from "./pages/Recorder.js";
 import ArchiveAudioBrowser from "./pages/Archive";
 import { Help, About, Contact, Privacy, Terms, Copyright } from "./pages/PolicyPages.js";
 const Transcripe = lazy(() => import("./pages/Transcripe.js"));
+const Visualizer = lazy(() => import("./pages/Visualizer.js"));
 const theme = createTheme({
   palette: {
     mode: "dark",
@@ -78,6 +79,7 @@ export default function App() {
                   <Route path="/youtube" element={<YoutubePage />} />
                   <Route path="/transcribe" element={<Transcripe />} />
                   <Route path="/transcripe" element={<Navigate to="/transcribe" replace />} />
+                  <Route path="/visualizer" element={<Visualizer />} />
                   <Route path="/archive" element={<ArchiveAudioBrowser />} />
                   <Route path="/help" element={<Help />} />
                   <Route path="/about" element={<About />} />

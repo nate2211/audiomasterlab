@@ -30,6 +30,7 @@ import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import MicRoundedIcon from "@mui/icons-material/MicRounded";
 import SubtitlesRoundedIcon from "@mui/icons-material/SubtitlesRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
+import ThreeDRotationRoundedIcon from "@mui/icons-material/ThreeDRotationRounded";
 export function NavBar() {
     const location = useLocation();
 
@@ -70,7 +71,11 @@ export function NavBar() {
             path: "/transcripe",
             icon: <SubtitlesRoundedIcon fontSize="small" />,
         },
-
+        {
+            label: "Visualizer",
+            path: "/visualizer",
+            icon: <ThreeDRotationRoundedIcon fontSize="small" />,
+        },
     ];
 
     return (

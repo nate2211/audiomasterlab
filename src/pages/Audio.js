@@ -30,6 +30,7 @@ import EqualizerRoundedIcon from "@mui/icons-material/EqualizerRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
 import { Helmet } from "react-helmet-async";
+import { useSearchParams } from "react-router-dom";
 import {
     GlassCard,
     MediaInputForm,
@@ -2277,7 +2278,7 @@ export default function Audio() {
         activePresetKey === "custom"
             ? "Manual custom safe mix. Your edits still stay inside the human-safe speed, EQ, feedback, and output limits."
             : selectedPreset.description;
-
+    const [searchParams, setSearchParams] = useSearchParams();
     useEffect(() => {
         document.title = "Audio Tool | AudioBufferSourceNode Mixer";
     }, []);
@@ -3001,7 +3002,52 @@ export default function Audio() {
             setIsLoading(false);
         }
     }
+    async function loadDirectUrlFromRoute(urlValue) {
+        try {
+            setIsLoading(true);
+            resetDecodedState();
+            clearObjectUrl();
 
+            const cleanLink = validateDirectMediaUrl(urlValue);
+
+            setInputFile(null);
+            setSourceKind("url");
+            setSourceUrl(cleanLink);
+            setDirectLink(cleanLink);
+            setActivePlaylistIndex(-1);
+            activePlaylistIndexRef.current = -1;
+
+            persistCurrentUrlSnapshot(cleanLink);
+
+            const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
+            const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+
+            refreshStorageInfo();
+
+            setInfo(
+                `Loaded Archive audio link. Browser decoded ${formatTime(
+                    decodedBuffer.duration
+                )}.`
+            );
+        } catch (error) {
+            setDirectLink(urlValue || "");
+            setError(error?.message || "Could not load the Archive audio link.");
+        } finally {
+            setIsLoading(false);
+        }
+    }
+    useEffect(() => {
+        const routeUrl = searchParams.get("url");
+
+        if (!routeUrl) return;
+
+        loadDirectUrlFromRoute(routeUrl);
+
+        // Clean the URL after loading so refresh restore uses localStorage.
+        setSearchParams({}, { replace: true });
+
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     function handleClearMedia() {
         resetDecodedState();
         clearObjectUrl();
