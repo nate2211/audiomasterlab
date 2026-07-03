@@ -94,6 +94,162 @@ const SAFE_COLLECTION_OPTIONS = [
         label: "Folksonomy Audio",
         description: "Tagged audio collections with broad public discovery.",
     },
+
+    // Music-heavy Archive.org collections
+    {
+        id: "audio_music",
+        label: "Music, Arts & Culture",
+        description: "Broad Archive music and arts audio. Use with license filtering because rights can vary.",
+    },
+    {
+        id: "netlabels",
+        label: "Netlabels",
+        description: "Independent netlabel releases, often Creative Commons or free-to-share music.",
+    },
+    {
+        id: "freemusicarchive",
+        label: "Free Music Archive",
+        description: "Music imported from Free Music Archive, including many Creative Commons-style releases.",
+    },
+    {
+        id: "78rpm",
+        label: "78 RPMs & Cylinder Recordings",
+        description: "Historic shellac/cylinder recordings for preservation and research.",
+    },
+    {
+        id: "georgeblood",
+        label: "Great 78 Project",
+        description: "Large historic 78 RPM preservation collection for old music discovery and research.",
+    },
+    {
+        id: "GratefulDead",
+        label: "Grateful Dead",
+        description: "Live Grateful Dead recordings from Archive’s live music archive.",
+    },
+    {
+        id: "ektoplazm",
+        label: "Ektoplazm",
+        description: "Electronic, psytrance, ambient, downtempo, and experimental free music releases.",
+    },
+    {
+        id: "monotonik",
+        label: "Monotonik",
+        description: "Classic netlabel collection with electronic, IDM, ambient, and tracker-era releases.",
+    },
+    {
+        id: "kahvi",
+        label: "Kahvi Collective",
+        description: "Electronic, ambient, IDM, chill, and melodic netlabel music.",
+    },
+    {
+        id: "petitejolie",
+        label: "Petite&Jolie",
+        description: "Netlabel music with electronic, cute-pop, toytronica, and experimental releases.",
+    },
+    {
+        id: "blocsonic",
+        label: "BlocSonic",
+        description: "Independent music label releases including hip-hop, electronic, and alternative projects.",
+    },
+    {
+        id: "comfortstand",
+        label: "Comfort Stand",
+        description: "Eclectic netlabel releases, experimental music, compilations, and independent audio.",
+    },
+    {
+        id: "camomille",
+        label: "Camomille Music",
+        description: "Ambient, electronic, acoustic, and experimental netlabel music.",
+    },
+    {
+        id: "thinner",
+        label: "Thinner",
+        description: "Minimal techno, dub techno, ambient, and electronic netlabel releases.",
+    },
+    {
+        id: "aerotone",
+        label: "Aerotone",
+        description: "Indie, folk, acoustic, ambient, and soft electronic netlabel music.",
+    },
+    {
+        id: "testtube",
+        label: "Test Tube",
+        description: "Experimental, electronic, ambient, and independent netlabel releases.",
+    },
+    {
+        id: "proc-records",
+        label: "Proc-Records",
+        description: "Independent netlabel music, experimental releases, and underground electronic audio.",
+    },
+    {
+        id: "bumpfoot",
+        label: "Bump Foot",
+        description: "Japanese netlabel with electronic, techno, ambient, house, and experimental music.",
+    },
+    {
+        id: "clinicalarchives",
+        label: "Clinical Archives",
+        description: "Avant-garde, jazz, experimental, electronic, and independent music releases.",
+    },
+    {
+        id: "miasmah",
+        label: "Miasmah",
+        description: "Ambient, experimental, modern classical, and atmospheric music releases.",
+    },
+    {
+        id: "basic_sounds",
+        label: "Basic Sounds",
+        description: "Electronic, ambient, minimal, and independent music releases.",
+    },
+    {
+        id: "phlow",
+        label: "Phlow",
+        description: "Creative Commons music, netaudio, electronic, indie, and music culture releases.",
+    },
+
+    // Radio, broadcast, and mixed audio collections
+    {
+        id: "audio_tech",
+        label: "Computers, Technology & Science",
+        description: "Tech talks, science audio, radio/technical recordings, and educational audio.",
+    },
+    {
+        id: "audio_news",
+        label: "News & Public Affairs",
+        description: "Historic news, speeches, interviews, and documentary-style audio.",
+    },
+    {
+        id: "radio",
+        label: "Radio News Archive",
+        description: "Historic radio news recordings and broadcast archives.",
+    },
+    {
+        id: "radioprograms",
+        label: "Radio Programs",
+        description: "Radio shows, airchecks, public broadcasts, and archived radio programs.",
+    },
+    {
+        id: "fmradioarchive",
+        label: "FM Radio Archive",
+        description: "FM/TV station broadcasts, live radio recordings, concerts, and airchecks.",
+    },
+    {
+        id: "dlarc",
+        label: "Amateur Radio & Communications",
+        description: "Ham radio, radio history, communications podcasts, broadcasts, and related media.",
+    },
+
+    // Spoken word / educational / cultural audio
+    {
+        id: "audio_religion",
+        label: "Spirituality & Religion",
+        description: "Religious, spiritual, lecture, sermon, and philosophy audio.",
+    },
+    {
+        id: "audio_foreign",
+        label: "Non-English Audio",
+        description: "Audio uploads in languages other than English.",
+    },
 ];
 
 const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
@@ -532,86 +688,7 @@ function getArchiveSearchTextFromInput(value) {
 
     return value;
 }
-function parseArchiveAudioUrl(rawUrl) {
-    try {
-        const url = new URL(rawUrl);
-        const host = url.hostname.toLowerCase();
-        const parts = url.pathname
-            .split("/")
-            .filter(Boolean)
-            .map(decodeArchivePathPart);
 
-        let identifier = "";
-        let fileName = "";
-
-        // archive.org/download/IDENTIFIER/file.mp3
-        // archive.org/serve/IDENTIFIER/file.mp3
-        if (
-            host === "archive.org" ||
-            host === "www.archive.org"
-        ) {
-            const mode = parts[0];
-
-            if ((mode === "download" || mode === "serve") && parts.length >= 3) {
-                identifier = parts[1];
-                fileName = parts.slice(2).join("/");
-            }
-        }
-
-        // ia801808.us.archive.org/11/items/IDENTIFIER/file.ogg
-        // ia801806.us.archive.org/3/items/IDENTIFIER/file.mp3
-        if (/^ia\d+\.us\.archive\.org$/.test(host)) {
-            const itemsIndex = parts.indexOf("items");
-
-            if (itemsIndex >= 0 && parts.length >= itemsIndex + 3) {
-                identifier = parts[itemsIndex + 1];
-                fileName = parts.slice(itemsIndex + 2).join("/");
-            }
-        }
-
-        if (!identifier || !fileName) {
-            return null;
-        }
-
-        if (!isAudioFile(fileName)) {
-            return null;
-        }
-
-        if (isSkipFile(fileName)) {
-            return null;
-        }
-
-        return {
-            identifier,
-            fileName,
-            originalUrl: rawUrl,
-            serveUrl: buildServeUrl(identifier, fileName),
-            downloadUrl: buildDownloadUrl(identifier, fileName),
-            detailsUrl: buildDetailsUrl(identifier),
-            zipInternal: isZipInternalPath(fileName),
-        };
-    } catch {
-        return null;
-    }
-}
-
-function extractArchiveAudioLinks(value) {
-    const seen = new Set();
-
-    return extractUrls(value)
-        .map(parseArchiveAudioUrl)
-        .filter(Boolean)
-        .filter((item) => {
-            const key = `${item.identifier}/${item.fileName}`;
-
-            if (seen.has(key)) {
-                return false;
-            }
-
-            seen.add(key);
-            return true;
-        });
-}
 async function buildArchiveResultFromMetadata({
                                                   identifier,
                                                   forcedFiles = [],
