@@ -24,6 +24,7 @@ import OpenInNewRoundedIcon from "@mui/icons-material/OpenInNewRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
+import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
 import { useNavigate } from "react-router-dom";
 const AUDIO_EXTENSIONS = [
     ".mp3",
@@ -254,6 +255,55 @@ const SAFE_COLLECTION_OPTIONS = [
 
 const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
 
+const AUDIO_PLAYLIST_STORAGE_KEY = "audiomasterlab.audio.playlist.v4";
+
+function makeArchivePlaylistId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function readAudioPlaylistFromStorage() {
+    if (typeof window === "undefined" || !window.localStorage) return [];
+
+    try {
+        const raw = window.localStorage.getItem(AUDIO_PLAYLIST_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function writeAudioPlaylistToStorage(playlist) {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        window.localStorage.setItem(
+            AUDIO_PLAYLIST_STORAGE_KEY,
+            JSON.stringify(playlist)
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getArchiveAudioPlaylistTitle(file) {
+    const name = file?.name || "";
+
+    if (name) return name;
+
+    const url = file?.serveUrl || file?.url || file?.downloadUrl || "";
+
+    try {
+        const parsed = new URL(url);
+        const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
+
+        return decodeURIComponent(lastPart || "Archive audio");
+    } catch {
+        return "Archive audio";
+    }
+}
 function normalizeText(value) {
     return String(value || "")
         .replace(/\s+/g, " ")
@@ -931,7 +981,54 @@ export default function ArchiveAudioBrowser() {
     function resetCollections() {
         setSelectedCollections(DEFAULT_SELECTED_COLLECTIONS);
     }
+    function addArchiveFileToAudioPlaylist(file) {
+        const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
 
+        if (!selectedUrl) {
+            setError("No playable Archive audio link was found for this file.");
+            return;
+        }
+
+        try {
+            const playlist = readAudioPlaylistFromStorage();
+
+            const alreadyExists = playlist.some(
+                (item) => item?.kind === "url" && item?.url === selectedUrl
+            );
+
+            if (alreadyExists) {
+                setStatus("That Archive song is already in your Audio playlist.");
+                setError("");
+                return;
+            }
+
+            const nextItem = {
+                id: makeArchivePlaylistId(),
+                kind: "url",
+                title: getArchiveAudioPlaylistTitle(file),
+                url: selectedUrl,
+                size: 0,
+                type: "direct media URL",
+                addedAt: new Date().toISOString(),
+                source: "archive.org",
+                archiveFileName: file?.name || "",
+                archiveServeUrl: file?.serveUrl || "",
+                archiveDownloadUrl: file?.downloadUrl || "",
+            };
+
+            const saved = writeAudioPlaylistToStorage([...playlist, nextItem]);
+
+            if (!saved) {
+                setError("Could not save to playlist. Browser storage may be blocked.");
+                return;
+            }
+
+            setError("");
+            setStatus("Added Archive song to your Audio playlist without leaving this page.");
+        } catch {
+            setError("Could not add this Archive song to your Audio playlist.");
+        }
+    }
     async function copyText(value) {
         try {
             await navigator.clipboard.writeText(value);
@@ -1394,6 +1491,14 @@ export default function ArchiveAudioBrowser() {
                                                             startIcon={<AudiotrackRoundedIcon />}
                                                         >
                                                             Load in Audio Page
+                                                        </Button>
+                                                        <Button
+                                                            size="small"
+                                                            variant="outlined"
+                                                            onClick={() => addArchiveFileToAudioPlaylist(file)}
+                                                            startIcon={<PlaylistAddRoundedIcon />}
+                                                        >
+                                                            Add song to playlist
                                                         </Button>
                                                     </Stack>
                                                 </Stack>
