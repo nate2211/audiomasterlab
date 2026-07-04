@@ -2962,6 +2962,8 @@ export default function Audio() {
     const lastOutputElementPlayEventAtRef = useRef(0);
     const mediaSessionPlayRestartTokenRef = useRef(0);
     const lastMediaSessionPlayRestartAtRef = useRef(0);
+    const iPhoneLockScreenOutputArmedRef = useRef(false);
+    const lastIPhoneOutputKeepAliveAtRef = useRef(0);
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3243,11 +3245,16 @@ export default function Audio() {
                 return;
             }
 
+            iPhoneLockScreenOutputArmedRef.current = false;
+
             if (playingRef.current) {
                 runMediaSessionAction("iOS lock-screen Pause", pauseFromMediaSession);
                 return;
             }
 
+            keepIPhoneOutputElementAliveForLockScreen(
+                "iOS paused the hidden output element while WebAudio was paused"
+            ).catch(() => {});
             updateMediaSessionState("paused");
         };
 
@@ -3448,10 +3455,89 @@ export default function Audio() {
         }
     }
 
-    function pauseOutputElementForAppAction() {
+    function isIPhoneOutputRouteArmed() {
+        if (!isIOSAudioDevice()) {
+            return true;
+        }
+
+        const context = audioContextRef.current;
+        const element = outputAudioRef.current;
+        const stream = mediaStreamDestinationRef.current?.stream || null;
+
+        return Boolean(
+            context &&
+            context.state === "running" &&
+            element &&
+            stream &&
+            element.srcObject === stream &&
+            !element.paused &&
+            !element.ended
+        );
+    }
+
+    async function keepIPhoneOutputElementAliveForLockScreen(reason = "iPhone lock-screen output keep-alive") {
+        if (!isIOSAudioDevice()) {
+            return true;
+        }
+
+        const now = Date.now();
+
+        if (now - lastIPhoneOutputKeepAliveAtRef.current < 220 && isIPhoneOutputRouteArmed()) {
+            return true;
+        }
+
+        lastIPhoneOutputKeepAliveAtRef.current = now;
+
+        try {
+            const { context } = ensureLiveGraph();
+
+            if (!context || context.state === "closed") {
+                iPhoneLockScreenOutputArmedRef.current = false;
+                return false;
+            }
+
+            if (context.state !== "running") {
+                await context.resume();
+            }
+
+            ensureIPhoneSilentKeepAlive(context, mediaStreamDestinationRef.current);
+            attachOutputElementToCurrentStream(outputAudioRef.current);
+
+            if (!isIPhoneOutputRouteArmed()) {
+                await unlockOutputElementForAppAction(outputAudioRef.current);
+            }
+
+            const armed = isIPhoneOutputRouteArmed();
+            iPhoneLockScreenOutputArmedRef.current = armed;
+
+            if (armed && carPlaySafeModeRef.current) {
+                setCarPlayOutputStatus(
+                    `${reason}: hidden iPhone stream is still alive, so lock-screen Play can restart the WebAudio effects graph without needing the page unlocked.`
+                );
+            }
+
+            return armed;
+        } catch {
+            iPhoneLockScreenOutputArmedRef.current = false;
+            return false;
+        }
+    }
+
+    function pauseOutputElementForAppAction(options = {}) {
         const element = outputAudioRef.current;
 
         if (!element || !isIOSAudioDevice()) {
+            return;
+        }
+
+        const shouldKeepAlive = options.keepAlive !== false;
+
+        if (shouldKeepAlive) {
+            keepIPhoneOutputElementAliveForLockScreen(
+                options.reason || "Paused WebAudio while keeping iPhone lock-screen output armed"
+            ).catch(() => {
+                iPhoneLockScreenOutputArmedRef.current = false;
+            });
             return;
         }
 
@@ -3461,6 +3547,8 @@ export default function Audio() {
             if (!element.paused) {
                 element.pause();
             }
+
+            iPhoneLockScreenOutputArmedRef.current = false;
         } catch {
             // Safe to ignore iOS media element pause issues.
         } finally {
@@ -3533,6 +3621,7 @@ export default function Audio() {
         const { context } = ensureLiveGraph();
 
         if (!context || context.state === "closed") {
+            iPhoneLockScreenOutputArmedRef.current = false;
             throw new Error("The iPhone audio context is closed. Tap the page Play button once to rebuild it.");
         }
 
@@ -3541,25 +3630,30 @@ export default function Audio() {
         }
 
         ensureIPhoneSilentKeepAlive(context, mediaStreamDestinationRef.current);
-
-        const element = outputAudioRef.current;
-        const attached = attachOutputElementToCurrentStream(
-            element,
+        attachOutputElementToCurrentStream(
+            outputAudioRef.current,
             mediaStreamDestinationRef.current?.stream || null
         );
 
-        if (!attached || !element?.srcObject) {
-            throw new Error("The hidden iPhone lock-screen audio stream could not be reattached.");
+        if (!isIPhoneOutputRouteArmed()) {
+            await unlockOutputElementForAppAction(outputAudioRef.current);
         }
 
-        await unlockOutputElementForAppAction(element);
+        const armed = isIPhoneOutputRouteArmed();
+        iPhoneLockScreenOutputArmedRef.current = armed;
+
+        if (!armed) {
+            throw new Error(
+                "The hidden iPhone audio stream is not actively playing. The WebAudio timer will not be allowed to run silently; open the page once, press Play, then lock the phone so the stream stays armed."
+            );
+        }
 
         if (mediaSessionPlayRestartTokenRef.current !== restartToken) {
             return false;
         }
 
         setCarPlayOutputStatus(
-            `${reason} restarted the hidden iPhone audio stream and re-armed lock-screen controls.`
+            `${reason} re-armed the hidden iPhone media stream, resumed the AudioContext, and is ready to rebuild the WebAudio effects source from the saved position.`
         );
 
         return true;
@@ -3828,12 +3922,10 @@ export default function Audio() {
                 }
             }
 
-            if (element && (playingRef.current || shouldForcePlay)) {
-                attachOutputElementToCurrentStream(element);
-
-                if (element.srcObject && (element.paused || element.readyState < 2)) {
-                    await unlockOutputElementForAppAction(element);
-                }
+            if (element && (playingRef.current || shouldForcePlay || iPhoneLockScreenOutputArmedRef.current)) {
+                await keepIPhoneOutputElementAliveForLockScreen(
+                    reason || "iOS audio route recovery"
+                );
             }
 
             if (
@@ -4059,6 +4151,7 @@ export default function Audio() {
     }
 
     function detachOutputAudioElement() {
+        iPhoneLockScreenOutputArmedRef.current = false;
         stopIPhoneSilentKeepAlive();
         clearCarPlayRecoveryTimer();
 
@@ -4385,7 +4478,10 @@ export default function Audio() {
         setPlayingState(false);
 
         if (resetToBeginning) {
-            pauseOutputElementForAppAction();
+            pauseOutputElementForAppAction({
+                keepAlive: true,
+                reason: "Stopped WebAudio while keeping iPhone lock-screen output armed",
+            });
             startedOffsetRef.current = 0;
             startedAtContextTimeRef.current = 0;
             setPosition(0);
@@ -5778,17 +5874,30 @@ export default function Audio() {
                 const preserveUnlockedOutput = shouldPreserveIPhonePlaylistOutput(options);
                 attachOutputElementToCurrentStream(outputAudioRef.current);
 
-                const elementUnlocked =
-                    options.outputAlreadyRestarted ||
-                    (preserveUnlockedOutput && isUnlockedIPhoneOutputStillPlaying())
-                        ? true
-                        : await unlockOutputElementForAppAction(outputAudioRef.current);
+                let elementUnlocked = isIPhoneOutputRouteArmed();
 
-                if (!elementUnlocked) {
-                    throw new Error(
-                        `The iPhone audio element did not unlock. ${buildMobileAudioHint()}`
+                if (!elementUnlocked && !options.outputAlreadyRestarted) {
+                    elementUnlocked = await unlockOutputElementForAppAction(outputAudioRef.current);
+                }
+
+                if (!elementUnlocked && options.outputAlreadyRestarted) {
+                    elementUnlocked = await keepIPhoneOutputElementAliveForLockScreen(
+                        "Lock-screen Play output verification"
                     );
                 }
+
+                if (!elementUnlocked && preserveUnlockedOutput) {
+                    elementUnlocked = isUnlockedIPhoneOutputStillPlaying();
+                }
+
+                if (!elementUnlocked || !isIPhoneOutputRouteArmed()) {
+                    iPhoneLockScreenOutputArmedRef.current = false;
+                    throw new Error(
+                        `The iPhone audio output route is not armed, so the WebAudio source was not started silently. ${buildMobileAudioHint()}`
+                    );
+                }
+
+                iPhoneLockScreenOutputArmedRef.current = true;
             }
 
             if (!unlocked || context.state !== "running") {
@@ -5870,7 +5979,7 @@ export default function Audio() {
                         carPlaySafeModeRef.current
                             ? "CarPlay / USB safe mode is active. "
                             : ""
-                    }Playing through the hidden iPhone media element output path. Lock-screen Play can restart that stream and create a fresh WebAudio source from the saved position, while playlist auto-next keeps the same unlocked output alive when the current track finishes.`
+                    }Playing through the hidden iPhone media element output path. Pause/stop keeps a near-silent stream alive so lock-screen Play can rebuild the WebAudio effects source from the saved position instead of advancing a silent timer.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
@@ -5901,7 +6010,10 @@ export default function Audio() {
         updateMediaSessionState("paused");
         stopPositionTimer();
         stopVisualizer();
-        pauseOutputElementForAppAction();
+        pauseOutputElementForAppAction({
+            keepAlive: true,
+            reason: "Paused WebAudio while keeping iPhone lock-screen output armed",
+        });
 
         setInfo("Playback paused. Press Play to create a new source from this position.");
     }
