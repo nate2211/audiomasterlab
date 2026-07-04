@@ -2761,6 +2761,15 @@ export default function Audio() {
     const playlistPreloadTokenRef = useRef(0);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
 
+    // Media Session / lock-screen refs keep hardware, CarPlay, Bluetooth,
+    // and lock-screen controls wired to the latest React state without stale
+    // closures after playlist, duration, or title changes.
+    const mediaTitleRef = useRef("AudioMaster Lab player");
+    const mediaDurationRef = useRef(0);
+    const mediaPositionRef = useRef(0);
+    const hasMediaRef = useRef(false);
+    const lastMediaSessionActionRef = useRef("");
+
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
     const [inputFile, setInputFile] = useState(null);
@@ -2808,6 +2817,11 @@ export default function Audio() {
         sourceUrl,
         activePlaylistItem?.title
     );
+
+    mediaTitleRef.current = mediaTitle;
+    mediaDurationRef.current = Number.isFinite(duration) ? duration : 0;
+    mediaPositionRef.current = Number.isFinite(position) ? position : 0;
+    hasMediaRef.current = Boolean(hasMedia);
 
     const progressValue =
         duration > 0 ? clamp((position / duration) * 100, 0, 100) : 0;
@@ -3061,21 +3075,83 @@ export default function Audio() {
         return typeof navigator !== "undefined" && "mediaSession" in navigator;
     }
 
+    function getMediaSessionDuration() {
+        const bufferDuration = Number(audioBufferRef.current?.duration);
+        const refDuration = Number(mediaDurationRef.current);
+
+        if (Number.isFinite(bufferDuration) && bufferDuration > 0) {
+            return bufferDuration;
+        }
+
+        if (Number.isFinite(refDuration) && refDuration > 0) {
+            return refDuration;
+        }
+
+        return 0;
+    }
+
+    function getMediaSessionPosition() {
+        const mediaDuration = getMediaSessionDuration();
+        const liveOffset = getCurrentOffset();
+        const refPosition = Number(mediaPositionRef.current);
+        const nextPosition = Number.isFinite(liveOffset) ? liveOffset : refPosition;
+
+        if (!mediaDuration) {
+            return Math.max(0, nextPosition || 0);
+        }
+
+        return clamp(nextPosition || 0, 0, mediaDuration);
+    }
+
+    function getMediaSessionTitle() {
+        const activeItem = playlistRef.current?.[activePlaylistIndexRef.current];
+        const activeItemTitle = String(activeItem?.title || "").trim();
+
+        if (activeItemTitle && !isPlaceholderProxyTitle(activeItemTitle)) {
+            return activeItemTitle;
+        }
+
+        const refTitle = String(mediaTitleRef.current || "").trim();
+
+        if (refTitle && refTitle !== "Decoded audio buffer" && !isPlaceholderProxyTitle(refTitle)) {
+            return refTitle;
+        }
+
+        const metadataName = String(lastDecodedMetadataRef.current?.name || "").trim();
+        const metadataTitle = cleanMediaFileTitle(getCanonicalArchiveMediaUrl(metadataName));
+
+        if (metadataTitle && !isPlaceholderProxyTitle(metadataTitle)) {
+            return metadataTitle;
+        }
+
+        return "AudioMaster Lab player";
+    }
+
+    function getMediaSessionAlbum() {
+        const list = playlistRef.current;
+        const activeIndex = activePlaylistIndexRef.current;
+
+        if (Array.isArray(list) && list.length && activeIndex >= 0) {
+            return `AudioMaster Lab Playlist • ${activeIndex + 1} of ${list.length}`;
+        }
+
+        return "AudioMaster Lab";
+    }
+
     function updateMediaSessionMetadata() {
         if (!canUseMediaSession()) {
             return;
         }
 
         try {
-            const safeTitle =
-                mediaTitle && mediaTitle !== "Decoded audio buffer"
-                    ? mediaTitle
-                    : "AudioMaster Lab player";
+            if (typeof window === "undefined" || typeof window.MediaMetadata !== "function") {
+                return;
+            }
 
             navigator.mediaSession.metadata = new window.MediaMetadata({
-                title: safeTitle,
+                title: getMediaSessionTitle(),
                 artist: "AudioMaster Lab",
-                album: activePlaylistIndexRef.current >= 0 ? "AudioMaster Lab Playlist" : "AudioMaster Lab",
+                album: getMediaSessionAlbum(),
                 artwork: [
                     {
                         src: "/social-preview.png",
@@ -3099,8 +3175,11 @@ export default function Audio() {
             return;
         }
 
+        const mediaDuration = getMediaSessionDuration();
+        const safeState = hasMediaRef.current || audioBufferRef.current ? nextState : "none";
+
         try {
-            navigator.mediaSession.playbackState = nextState;
+            navigator.mediaSession.playbackState = safeState;
         } catch {
             // playbackState is not supported in every browser.
         }
@@ -3108,13 +3187,12 @@ export default function Audio() {
         try {
             if (
                 typeof navigator.mediaSession.setPositionState === "function" &&
-                Number.isFinite(duration) &&
-                duration > 0
+                mediaDuration > 0
             ) {
                 navigator.mediaSession.setPositionState({
-                    duration,
+                    duration: mediaDuration,
                     playbackRate: currentEffectiveRateRef.current || 1,
-                    position: clamp(getCurrentOffset(), 0, duration),
+                    position: getMediaSessionPosition(),
                 });
             }
         } catch {
@@ -3135,6 +3213,135 @@ export default function Audio() {
         }
     }
 
+    async function runMediaSessionAction(actionLabel, action) {
+        lastMediaSessionActionRef.current = actionLabel || "lock-screen control";
+
+        try {
+            const result = await action();
+
+            updateMediaSessionMetadata();
+            updateMediaSessionState(playingRef.current ? "playing" : "paused");
+
+            return result;
+        } catch (error) {
+            updateMediaSessionState(playingRef.current ? "playing" : "paused");
+            setError(
+                `${actionLabel || "Lock-screen control"} failed. ${
+                    error?.message || "Tap the page Play button once to re-arm browser audio."
+                }`
+            );
+            return false;
+        }
+    }
+
+    async function playFromMediaSession() {
+        if (playingRef.current) {
+            updateMediaSessionState("playing");
+            return true;
+        }
+
+        if (audioBufferRef.current) {
+            return startBufferPlayback(false, {
+                fromMediaSession: true,
+                preserveUnlockedOutput: true,
+            });
+        }
+
+        const list = playlistRef.current;
+        const activeIndex = activePlaylistIndexRef.current;
+
+        if (Array.isArray(list) && list.length) {
+            const startIndex = activeIndex >= 0 ? activeIndex : 0;
+
+            return loadNextPlayablePlaylistItem(startIndex, {
+                autoplay: true,
+                reason: "Lock-screen play request",
+                preserveUnlockedOutput: true,
+            });
+        }
+
+        setError("Load a media source or playlist before using lock-screen Play.");
+        updateMediaSessionState("paused");
+        return false;
+    }
+
+    async function pauseFromMediaSession() {
+        if (playingRef.current) {
+            pausePlayback();
+            return true;
+        }
+
+        updateMediaSessionState("paused");
+        return true;
+    }
+
+    async function stopFromMediaSession() {
+        if (audioBufferRef.current || playingRef.current) {
+            stopPlayback(false);
+        }
+
+        updateMediaSessionState("paused");
+        return true;
+    }
+
+    async function nextTrackFromMediaSession() {
+        const list = playlistRef.current;
+
+        if (!Array.isArray(list) || !list.length) {
+            const mediaDuration = getMediaSessionDuration();
+
+            if (mediaDuration > 0) {
+                await seekTo(mediaDuration, false);
+            }
+
+            setInfo("No playlist is loaded, so lock-screen Next moved to the end of the current media.");
+            return true;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+        const nextIndex = getNextPlaylistIndex(currentIndex, list);
+
+        return loadNextPlayablePlaylistItem(nextIndex, {
+            autoplay: true,
+            reason: "Lock-screen next-track request",
+            preserveUnlockedOutput: true,
+        });
+    }
+
+    async function previousTrackFromMediaSession() {
+        const list = playlistRef.current;
+        const currentOffset = getMediaSessionPosition();
+        const wasPlaying = playingRef.current;
+
+        // Match native music-player behavior: if the current song has played for
+        // a few seconds, Previous restarts it. If already near the beginning,
+        // Previous moves to the prior playlist item.
+        if (currentOffset > 3 || !Array.isArray(list) || list.length <= 1) {
+            await seekTo(0, wasPlaying);
+            return true;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+        const previousIndex = getPreviousPlaylistIndex(currentIndex, list);
+
+        return loadNextPlayablePlaylistItem(previousIndex, {
+            autoplay: true,
+            reason: "Lock-screen previous-track request",
+            preserveUnlockedOutput: true,
+        });
+    }
+
+    async function seekFromMediaSession(targetSeconds, shouldResume = playingRef.current) {
+        const mediaDuration = getMediaSessionDuration();
+        const nextPosition = mediaDuration
+            ? clamp(numberOrDefault(targetSeconds, 0), 0, mediaDuration)
+            : Math.max(0, numberOrDefault(targetSeconds, 0));
+
+        await seekTo(nextPosition, shouldResume);
+        updateMediaSessionState(playingRef.current ? "playing" : "paused");
+        return true;
+    }
+
     function installMediaSessionHandlers() {
         if (!canUseMediaSession() || typeof navigator.mediaSession.setActionHandler !== "function") {
             return;
@@ -3149,43 +3356,47 @@ export default function Audio() {
         };
 
         safeSetAction("play", () => {
-            startBufferPlayback(false, {
-                fromMediaSession: true,
-                preserveUnlockedOutput: true,
-            });
+            return runMediaSessionAction("Lock-screen Play", playFromMediaSession);
         });
 
         safeSetAction("pause", () => {
-            pausePlayback();
+            return runMediaSessionAction("Lock-screen Pause", pauseFromMediaSession);
         });
 
         safeSetAction("stop", () => {
-            stopPlayback(false);
-            updateMediaSessionState("paused");
+            return runMediaSessionAction("Lock-screen Stop", stopFromMediaSession);
         });
 
         safeSetAction("nexttrack", () => {
-            playNextPlaylistItem();
+            return runMediaSessionAction("Lock-screen Next", nextTrackFromMediaSession);
         });
 
         safeSetAction("previoustrack", () => {
-            seekTo(0);
+            return runMediaSessionAction("Lock-screen Previous", previousTrackFromMediaSession);
         });
 
         safeSetAction("seekbackward", (details) => {
-            const seekSeconds = Number(details?.seekOffset) || 10;
-            seekTo(Math.max(0, getCurrentOffset() - seekSeconds));
+            return runMediaSessionAction("Lock-screen Seek Back", () => {
+                const seekSeconds = Number(details?.seekOffset) || 10;
+                return seekFromMediaSession(getMediaSessionPosition() - seekSeconds, playingRef.current);
+            });
         });
 
         safeSetAction("seekforward", (details) => {
-            const seekSeconds = Number(details?.seekOffset) || 10;
-            seekTo(Math.min(duration || 0, getCurrentOffset() + seekSeconds));
+            return runMediaSessionAction("Lock-screen Seek Forward", () => {
+                const seekSeconds = Number(details?.seekOffset) || 10;
+                return seekFromMediaSession(getMediaSessionPosition() + seekSeconds, playingRef.current);
+            });
         });
 
         safeSetAction("seekto", (details) => {
-            if (Number.isFinite(details?.seekTime)) {
-                seekTo(details.seekTime);
-            }
+            return runMediaSessionAction("Lock-screen Seek", () => {
+                if (!Number.isFinite(details?.seekTime)) {
+                    return false;
+                }
+
+                return seekFromMediaSession(details.seekTime, playingRef.current);
+            });
         });
     }
 
@@ -4282,6 +4493,16 @@ export default function Audio() {
         }
 
         return normalizePlaylistIndex(currentIndex + 1, list);
+    }
+
+    function getPreviousPlaylistIndex(currentIndex, list = playlistRef.current) {
+        if (!Array.isArray(list) || !list.length) return -1;
+
+        if (currentIndex < 0 || currentIndex >= list.length) {
+            return normalizePlaylistIndex(list.length - 1, list);
+        }
+
+        return normalizePlaylistIndex(currentIndex - 1, list);
     }
 
     function updatePlaylistItemAt(index, patch) {
