@@ -361,6 +361,7 @@ const STORAGE_KEYS = {
     playlistLinkDraft: "audiomasterlab.audio.playlistLinkDraft.v4",
     lastMedia: "audiomasterlab.audio.lastMedia.v4",
     lastSession: "audiomasterlab.audio.lastSession.v4",
+    carPlaySafeMode: "audiomasterlab.audio.carPlaySafeMode.v4",
 };
 
 const COOKIE_NAMES = {
@@ -678,6 +679,17 @@ function readPersistedRepeatEnabled() {
     return Boolean(getCookieJson(COOKIE_NAMES.sessionSummary, {})?.repeatEnabled);
 }
 
+function readPersistedCarPlaySafeMode() {
+    const stored = readStorageValue(STORAGE_KEYS.carPlaySafeMode, "");
+
+    if (stored === "true") return true;
+    if (stored === "false") return false;
+
+    // Default this on for iPhone/iPad because wired CarPlay and USB audio-route
+    // changes are more sensitive to WebAudio graph rebuilds and wet effect jumps.
+    return isIOSAudioDevice();
+}
+
 function readPersistedDirectLink() {
     return readStorageValue(STORAGE_KEYS.directLink, "");
 }
@@ -897,6 +909,10 @@ function persistSettingsToBrowser(settings, activePresetKey) {
     });
 }
 
+function persistCarPlaySafeModeToBrowser(enabled) {
+    writeStorageValue(STORAGE_KEYS.carPlaySafeMode, enabled ? "true" : "false");
+}
+
 function persistSessionToBrowser({
                                      repeatEnabled,
                                      directLink,
@@ -963,6 +979,7 @@ function buildPersistenceInfo() {
             ? playlist.filter((item) => item.kind === "file" && !item.dataUrl).length
             : 0,
         hasSavedCurrentAudio: Boolean(lastMedia?.dataUrl || lastMedia?.url),
+        carPlaySafeMode: readPersistedCarPlaySafeMode(),
         lastMediaKind: lastMedia?.kind || "",
         lastMediaTitle: lastMedia?.title || "",
         storageBytes: getStoredItemSizeEstimate({
@@ -1184,14 +1201,60 @@ function buildMobileAudioHint() {
     return "On iPhone, turn the side volume up, make sure the browser is not routed to AirPods, Bluetooth, CarPlay, or AirPlay, and tap Play again. Web apps cannot force speaker output; iOS plays through the currently selected output.";
 }
 
-function setAudioParam(param, value, time) {
+function setAudioParam(param, value, time, rampSeconds = 0) {
     if (!param) return;
 
+    const safeTime = Number.isFinite(time) ? time : 0;
+    const safeRamp = Math.max(0, Number(rampSeconds) || 0);
+
     try {
-        param.setValueAtTime(value, time);
+        if (
+            safeRamp > 0 &&
+            typeof param.cancelScheduledValues === "function" &&
+            typeof param.setValueAtTime === "function" &&
+            typeof param.linearRampToValueAtTime === "function"
+        ) {
+            const currentValue = Number.isFinite(param.value) ? param.value : value;
+
+            param.cancelScheduledValues(safeTime);
+            param.setValueAtTime(currentValue, safeTime);
+            param.linearRampToValueAtTime(value, safeTime + safeRamp);
+            return;
+        }
+
+        param.setValueAtTime(value, safeTime);
     } catch {
-        param.value = value;
+        try {
+            param.value = value;
+        } catch {
+            // Some AudioParams can become unavailable during iOS route changes.
+        }
     }
+}
+
+function getCarPlaySafeSettings(rawSettings) {
+    const settings = normalizeSettings(rawSettings);
+
+    return {
+        ...settings,
+        baseVolume: Math.min(settings.baseVolume, 1),
+        pan: 0,
+        reverbMix: Math.min(settings.reverbMix, 0.24),
+        reverbSeconds: Math.min(settings.reverbSeconds, 2.8),
+        delayMix: Math.min(settings.delayMix, 0.14),
+        delayFeedback: Math.min(settings.delayFeedback, 0.28),
+        highPass: Math.max(settings.highPass, 28),
+        lowPass: Math.min(settings.lowPass, 18000),
+        compressorThreshold: Math.min(settings.compressorThreshold, -18),
+        compressorRatio: Math.max(settings.compressorRatio, 2.8),
+        outputGain: Math.min(settings.outputGain, -1),
+    };
+}
+
+function buildCarPlaySafeModeLabel(enabled) {
+    return enabled
+        ? "CarPlay / USB safe mode is ON. The player keeps the same unlocked iOS audio route alive, smooths effect changes, centers pan, and caps wet effects/output so wired CarPlay does not hear effects jumping in and out."
+        : "CarPlay / USB safe mode is OFF. Full effects stay live, but wired iPhone/CarPlay route changes may be less stable.";
 }
 
 function semitonesToCents(semitones) {
@@ -1921,60 +1984,69 @@ function applySourcePlaybackSettings(source, settings, currentTime) {
 function applySettingsToNodes(nodes, rawSettings, currentTime) {
     if (!nodes) return;
 
-    const settings = normalizeSettings(rawSettings);
+    const settings = nodes.carPlaySafeMode
+        ? getCarPlaySafeSettings(rawSettings)
+        : normalizeSettings(rawSettings);
+    const smoothingSeconds = nodes.carPlaySafeMode ? 0.18 : 0.045;
 
-    setAudioParam(nodes.baseVolumeGain.gain, settings.baseVolume, currentTime);
+    setAudioParam(
+        nodes.baseVolumeGain.gain,
+        settings.baseVolume,
+        currentTime,
+        smoothingSeconds
+    );
 
     setAudioParam(
         nodes.demudHighPass.frequency,
         35 + settings.demudAmount * 95,
-        currentTime
+        currentTime,
+        smoothingSeconds
     );
-    setAudioParam(nodes.demudHighPass.Q, 0.7, currentTime);
+    setAudioParam(nodes.demudHighPass.Q, 0.7, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.demudCut.frequency, 260, currentTime);
-    setAudioParam(nodes.demudCut.Q, 1.05 + settings.demudAmount * 0.6, currentTime);
-    setAudioParam(nodes.demudCut.gain, -9 * settings.demudAmount, currentTime);
+    setAudioParam(nodes.demudCut.frequency, 260, currentTime, smoothingSeconds);
+    setAudioParam(nodes.demudCut.Q, 1.05 + settings.demudAmount * 0.6, currentTime, smoothingSeconds);
+    setAudioParam(nodes.demudCut.gain, -9 * settings.demudAmount, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.clarityBodyCut.frequency, 430, currentTime);
-    setAudioParam(nodes.clarityBodyCut.Q, 0.9, currentTime);
-    setAudioParam(nodes.clarityBodyCut.gain, -2.5 * settings.clarityAmount, currentTime);
+    setAudioParam(nodes.clarityBodyCut.frequency, 430, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityBodyCut.Q, 0.9, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityBodyCut.gain, -2.5 * settings.clarityAmount, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.clarityPresence.frequency, 3200, currentTime);
-    setAudioParam(nodes.clarityPresence.Q, 0.85, currentTime);
-    setAudioParam(nodes.clarityPresence.gain, 4.5 * settings.clarityAmount, currentTime);
+    setAudioParam(nodes.clarityPresence.frequency, 3200, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityPresence.Q, 0.85, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityPresence.gain, 4.5 * settings.clarityAmount, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.clarityAir.frequency, 9500, currentTime);
-    setAudioParam(nodes.clarityAir.Q, 0.7, currentTime);
-    setAudioParam(nodes.clarityAir.gain, 5 * settings.clarityAmount, currentTime);
+    setAudioParam(nodes.clarityAir.frequency, 9500, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityAir.Q, 0.7, currentTime, smoothingSeconds);
+    setAudioParam(nodes.clarityAir.gain, 5 * settings.clarityAmount, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.deEsserCut.frequency, settings.deEssFrequency, currentTime);
-    setAudioParam(nodes.deEsserCut.Q, 3.5 + settings.deEssAmount * 4, currentTime);
-    setAudioParam(nodes.deEsserCut.gain, -11 * settings.deEssAmount, currentTime);
+    setAudioParam(nodes.deEsserCut.frequency, settings.deEssFrequency, currentTime, smoothingSeconds);
+    setAudioParam(nodes.deEsserCut.Q, 3.5 + settings.deEssAmount * 4, currentTime, smoothingSeconds);
+    setAudioParam(nodes.deEsserCut.gain, -11 * settings.deEssAmount, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.highPass.frequency, settings.highPass, currentTime);
-    setAudioParam(nodes.highPass.Q, 0.7, currentTime);
+    setAudioParam(nodes.highPass.frequency, settings.highPass, currentTime, smoothingSeconds);
+    setAudioParam(nodes.highPass.Q, 0.7, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.lowShelf.frequency, 120, currentTime);
-    setAudioParam(nodes.lowShelf.gain, settings.lowGain, currentTime);
+    setAudioParam(nodes.lowShelf.frequency, 120, currentTime, smoothingSeconds);
+    setAudioParam(nodes.lowShelf.gain, settings.lowGain, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.midPeak.frequency, 1000, currentTime);
-    setAudioParam(nodes.midPeak.Q, 1.1, currentTime);
-    setAudioParam(nodes.midPeak.gain, settings.midGain, currentTime);
+    setAudioParam(nodes.midPeak.frequency, 1000, currentTime, smoothingSeconds);
+    setAudioParam(nodes.midPeak.Q, 1.1, currentTime, smoothingSeconds);
+    setAudioParam(nodes.midPeak.gain, settings.midGain, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.highShelf.frequency, 8500, currentTime);
-    setAudioParam(nodes.highShelf.gain, settings.highGain, currentTime);
+    setAudioParam(nodes.highShelf.frequency, 8500, currentTime, smoothingSeconds);
+    setAudioParam(nodes.highShelf.gain, settings.highGain, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.lowPass.frequency, settings.lowPass, currentTime);
-    setAudioParam(nodes.lowPass.Q, 0.7, currentTime);
+    setAudioParam(nodes.lowPass.frequency, settings.lowPass, currentTime, smoothingSeconds);
+    setAudioParam(nodes.lowPass.Q, 0.7, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.compressor.threshold, settings.compressorThreshold, currentTime);
-    setAudioParam(nodes.compressor.knee, 14, currentTime);
-    setAudioParam(nodes.compressor.ratio, settings.compressorRatio, currentTime);
-    setAudioParam(nodes.compressor.attack, 0.008, currentTime);
-    setAudioParam(nodes.compressor.release, 0.22, currentTime);
+    setAudioParam(nodes.compressor.threshold, settings.compressorThreshold, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.knee, 14, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.ratio, settings.compressorRatio, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.attack, 0.008, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.release, 0.22, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.dryGain.gain, 1, currentTime);
+    setAudioParam(nodes.dryGain.gain, 1, currentTime, smoothingSeconds);
 
     if (nodes.context) {
         const impulseKey = `${Math.round(settings.reverbSeconds * 1000)}`;
@@ -1988,21 +2060,24 @@ function applySettingsToNodes(nodes, rawSettings, currentTime) {
         }
     }
 
-    setAudioParam(nodes.reverbSendGain.gain, settings.reverbMix, currentTime);
-    setAudioParam(nodes.reverbReturnGain.gain, 0.55, currentTime);
+    setAudioParam(nodes.reverbSendGain.gain, settings.reverbMix, currentTime, smoothingSeconds);
+    setAudioParam(nodes.reverbReturnGain.gain, 0.55, currentTime, smoothingSeconds);
 
-    setAudioParam(nodes.delayNode.delayTime, settings.delayTime, currentTime);
-    setAudioParam(nodes.delaySendGain.gain, settings.delayMix, currentTime);
-    setAudioParam(nodes.delayFeedbackGain.gain, settings.delayFeedback, currentTime);
-    setAudioParam(nodes.delayReturnGain.gain, 0.75, currentTime);
+    setAudioParam(nodes.delayNode.delayTime, settings.delayTime, currentTime, smoothingSeconds);
+    setAudioParam(nodes.delaySendGain.gain, settings.delayMix, currentTime, smoothingSeconds);
+    setAudioParam(nodes.delayFeedbackGain.gain, settings.delayFeedback, currentTime, smoothingSeconds);
+    setAudioParam(nodes.delayReturnGain.gain, 0.75, currentTime, smoothingSeconds);
 
     applyPanner(nodes, settings.pan, currentTime);
 
-    setAudioParam(nodes.masterGain.gain, dbToGain(settings.outputGain), currentTime);
+    setAudioParam(nodes.masterGain.gain, dbToGain(settings.outputGain), currentTime, smoothingSeconds);
 }
 
-function createProcessingGraph(context, destination, rawSettings) {
-    const settings = normalizeSettings(rawSettings);
+function createProcessingGraph(context, destination, rawSettings, options = {}) {
+    const carPlaySafeMode = Boolean(options.carPlaySafeMode);
+    const settings = carPlaySafeMode
+        ? getCarPlaySafeSettings(rawSettings)
+        : normalizeSettings(rawSettings);
 
     const baseVolumeGain = context.createGain();
 
@@ -2096,6 +2171,8 @@ function createProcessingGraph(context, destination, rawSettings) {
         pannerKind: pannerStage.kind,
 
         masterGain,
+
+        carPlaySafeMode,
     };
 
     baseVolumeGain
@@ -2506,6 +2583,9 @@ export default function Audio() {
     const outputAudioRef = useRef(null);
     const mediaStreamDestinationRef = useRef(null);
     const iPhoneSilentKeepAliveRef = useRef(null);
+    const carPlayRecoveryTimerRef = useRef(null);
+    const lastCarPlayRecoveryReasonRef = useRef("");
+    const carPlaySafeModeRef = useRef(readPersistedCarPlaySafeMode());
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -2562,6 +2642,12 @@ export default function Audio() {
     });
     const [repeatEnabled, setRepeatEnabled] = useState(() => readPersistedRepeatEnabled());
     const [activePresetKey, setActivePresetKey] = useState(() => readPersistedPresetKey());
+    const [carPlaySafeMode, setCarPlaySafeMode] = useState(() =>
+        readPersistedCarPlaySafeMode()
+    );
+    const [carPlayOutputStatus, setCarPlayOutputStatus] = useState(() =>
+        buildCarPlaySafeModeLabel(readPersistedCarPlaySafeMode())
+    );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
 
     const settingsView = normalizeSettings(settings);
@@ -2596,6 +2682,9 @@ export default function Audio() {
         latestSettingsRef.current = normalized;
 
         if (liveNodesRef.current && audioContextRef.current) {
+            liveNodesRef.current.carPlaySafeMode = Boolean(
+                carPlaySafeModeRef.current && isIOSAudioDevice()
+            );
             applySettingsToNodes(
                 liveNodesRef.current,
                 normalized,
@@ -2616,6 +2705,25 @@ export default function Audio() {
         persistSettingsToBrowser(settings, activePresetKey);
         setStorageInfo(buildPersistenceInfo());
     }, [settings, activePresetKey]);
+
+    useEffect(() => {
+        carPlaySafeModeRef.current = carPlaySafeMode;
+        persistCarPlaySafeModeToBrowser(carPlaySafeMode);
+        setCarPlayOutputStatus(buildCarPlaySafeModeLabel(carPlaySafeMode));
+
+        if (liveNodesRef.current && audioContextRef.current) {
+            liveNodesRef.current.carPlaySafeMode = Boolean(
+                carPlaySafeMode && isIOSAudioDevice()
+            );
+            applySettingsToNodes(
+                liveNodesRef.current,
+                latestSettingsRef.current,
+                audioContextRef.current.currentTime
+            );
+        }
+
+        setStorageInfo(buildPersistenceInfo());
+    }, [carPlaySafeMode]);
 
     useEffect(() => {
         persistPlaylistToBrowser(playlist);
@@ -2671,6 +2779,8 @@ export default function Audio() {
         return () => {
             stopPlayback(false);
             stopVisualizer();
+            clearCarPlayRecoveryTimer();
+            clearMediaSession();
 
             if (objectUrlRef.current) {
                 URL.revokeObjectURL(objectUrlRef.current);
@@ -2692,6 +2802,86 @@ export default function Audio() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    useEffect(() => {
+        installMediaSessionHandlers();
+        updateMediaSessionMetadata();
+        updateMediaSessionState(playingRef.current ? "playing" : "paused");
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [mediaTitle, duration, activePlaylistIndex, playlist.length]);
+
+    useEffect(() => {
+        updateMediaSessionState(isPlaying ? "playing" : "paused");
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isPlaying, position, duration]);
+
+    useEffect(() => {
+        if (!isIOSAudioDevice()) {
+            return undefined;
+        }
+
+        const recoverFromPageEvent = (event) => {
+            if (
+                event?.type === "visibilitychange" &&
+                typeof document !== "undefined" &&
+                document.visibilityState !== "visible"
+            ) {
+                updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                return;
+            }
+
+            scheduleCarPlayOutputRecovery(`iOS page/audio route event: ${event?.type || "resume"}`);
+        };
+
+        window.addEventListener("focus", recoverFromPageEvent);
+        window.addEventListener("pageshow", recoverFromPageEvent);
+        document.addEventListener("visibilitychange", recoverFromPageEvent);
+
+        const mediaDevices = navigator.mediaDevices;
+
+        if (mediaDevices?.addEventListener) {
+            mediaDevices.addEventListener("devicechange", recoverFromPageEvent);
+        }
+
+        return () => {
+            window.removeEventListener("focus", recoverFromPageEvent);
+            window.removeEventListener("pageshow", recoverFromPageEvent);
+            document.removeEventListener("visibilitychange", recoverFromPageEvent);
+
+            if (mediaDevices?.removeEventListener) {
+                mediaDevices.removeEventListener("devicechange", recoverFromPageEvent);
+            }
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        const element = outputAudioRef.current;
+
+        if (!element || !isIOSAudioDevice()) {
+            return undefined;
+        }
+
+        const recoverEvents = ["pause", "stalled", "suspend", "waiting", "emptied", "abort", "error"];
+        const handleRecoverableOutputEvent = (event) => {
+            if (!playingRef.current && event.type !== "error") {
+                return;
+            }
+
+            scheduleCarPlayOutputRecovery(`hidden iOS output element ${event.type}`);
+        };
+
+        recoverEvents.forEach((eventName) => {
+            element.addEventListener(eventName, handleRecoverableOutputEvent);
+        });
+
+        return () => {
+            recoverEvents.forEach((eventName) => {
+                element.removeEventListener(eventName, handleRecoverableOutputEvent);
+            });
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
     function setPlayingState(nextValue) {
         playingRef.current = nextValue;
         setIsPlaying(nextValue);
@@ -2705,6 +2895,248 @@ export default function Audio() {
     function setError(message) {
         setStatus(message);
         setStatusTone("error");
+    }
+
+    function clearCarPlayRecoveryTimer() {
+        if (carPlayRecoveryTimerRef.current) {
+            window.clearTimeout(carPlayRecoveryTimerRef.current);
+            carPlayRecoveryTimerRef.current = null;
+        }
+    }
+
+    function canUseMediaSession() {
+        return typeof navigator !== "undefined" && "mediaSession" in navigator;
+    }
+
+    function updateMediaSessionMetadata() {
+        if (!canUseMediaSession()) {
+            return;
+        }
+
+        try {
+            const safeTitle =
+                mediaTitle && mediaTitle !== "Decoded audio buffer"
+                    ? mediaTitle
+                    : "AudioMaster Lab player";
+
+            navigator.mediaSession.metadata = new window.MediaMetadata({
+                title: safeTitle,
+                artist: "AudioMaster Lab",
+                album: activePlaylistIndexRef.current >= 0 ? "AudioMaster Lab Playlist" : "AudioMaster Lab",
+                artwork: [
+                    {
+                        src: "/social-preview.png",
+                        sizes: "512x512",
+                        type: "image/png",
+                    },
+                    {
+                        src: "/logo192.png",
+                        sizes: "192x192",
+                        type: "image/png",
+                    },
+                ],
+            });
+        } catch {
+            // MediaMetadata is not available in every Safari/WebView version.
+        }
+    }
+
+    function updateMediaSessionState(nextState = "none") {
+        if (!canUseMediaSession()) {
+            return;
+        }
+
+        try {
+            navigator.mediaSession.playbackState = nextState;
+        } catch {
+            // playbackState is not supported in every browser.
+        }
+
+        try {
+            if (
+                typeof navigator.mediaSession.setPositionState === "function" &&
+                Number.isFinite(duration) &&
+                duration > 0
+            ) {
+                navigator.mediaSession.setPositionState({
+                    duration,
+                    playbackRate: currentEffectiveRateRef.current || 1,
+                    position: clamp(getCurrentOffset(), 0, duration),
+                });
+            }
+        } catch {
+            // Position state is best-effort only.
+        }
+    }
+
+    function clearMediaSession() {
+        if (!canUseMediaSession()) {
+            return;
+        }
+
+        try {
+            navigator.mediaSession.playbackState = "none";
+            navigator.mediaSession.metadata = null;
+        } catch {
+            // Safe to ignore.
+        }
+    }
+
+    function installMediaSessionHandlers() {
+        if (!canUseMediaSession() || typeof navigator.mediaSession.setActionHandler !== "function") {
+            return;
+        }
+
+        const safeSetAction = (action, handler) => {
+            try {
+                navigator.mediaSession.setActionHandler(action, handler);
+            } catch {
+                // Older Safari builds may not support every action.
+            }
+        };
+
+        safeSetAction("play", () => {
+            startBufferPlayback(false, {
+                fromMediaSession: true,
+                preserveUnlockedOutput: true,
+            });
+        });
+
+        safeSetAction("pause", () => {
+            pausePlayback();
+        });
+
+        safeSetAction("stop", () => {
+            stopPlayback(false);
+            updateMediaSessionState("paused");
+        });
+
+        safeSetAction("nexttrack", () => {
+            playNextPlaylistItem();
+        });
+
+        safeSetAction("previoustrack", () => {
+            seekTo(0);
+        });
+
+        safeSetAction("seekbackward", (details) => {
+            const seekSeconds = Number(details?.seekOffset) || 10;
+            seekTo(Math.max(0, getCurrentOffset() - seekSeconds));
+        });
+
+        safeSetAction("seekforward", (details) => {
+            const seekSeconds = Number(details?.seekOffset) || 10;
+            seekTo(Math.min(duration || 0, getCurrentOffset() + seekSeconds));
+        });
+
+        safeSetAction("seekto", (details) => {
+            if (Number.isFinite(details?.seekTime)) {
+                seekTo(details.seekTime);
+            }
+        });
+    }
+
+    function toggleCarPlaySafeMode() {
+        setCarPlaySafeMode((current) => {
+            const nextValue = !current;
+
+            carPlaySafeModeRef.current = nextValue;
+            setInfo(buildCarPlaySafeModeLabel(nextValue));
+
+            if (nextValue && isIOSAudioDevice()) {
+                scheduleCarPlayOutputRecovery("CarPlay / USB safe mode enabled", {
+                    forcePlay: playingRef.current,
+                });
+            }
+
+            return nextValue;
+        });
+    }
+
+    function scheduleCarPlayOutputRecovery(reason, options = {}) {
+        if (!isIOSAudioDevice()) {
+            return;
+        }
+
+        clearCarPlayRecoveryTimer();
+        lastCarPlayRecoveryReasonRef.current = reason || "iOS audio route recovery";
+
+        if (carPlaySafeModeRef.current) {
+            setCarPlayOutputStatus(
+                `CarPlay / USB safe mode is watching the iOS audio route. Last event: ${
+                    reason || "route recovery"
+                }.`
+            );
+        }
+
+        carPlayRecoveryTimerRef.current = window.setTimeout(() => {
+            carPlayRecoveryTimerRef.current = null;
+            recoverCarPlayOutput(reason, options).catch(() => {});
+        }, 120);
+    }
+
+    async function recoverCarPlayOutput(reason, options = {}) {
+        if (!isIOSAudioDevice()) {
+            return false;
+        }
+
+        const context = audioContextRef.current;
+        const element = outputAudioRef.current;
+        const shouldForcePlay = Boolean(options.forcePlay);
+
+        try {
+            if (context && context.state !== "closed") {
+                if (mediaStreamDestinationRef.current) {
+                    ensureIPhoneSilentKeepAlive(context, mediaStreamDestinationRef.current);
+                }
+
+                if (context.state !== "running") {
+                    await context.resume();
+                }
+            }
+
+            if (element?.srcObject && (playingRef.current || shouldForcePlay)) {
+                element.muted = false;
+                element.volume = 1;
+                element.playsInline = true;
+
+                if (element.paused || element.readyState < 2) {
+                    await unlockOutputAudioElement(element);
+                }
+            }
+
+            if (
+                playingRef.current &&
+                !activeSourceRef.current &&
+                audioBufferRef.current &&
+                context?.state === "running"
+            ) {
+                await startBufferPlayback(false, {
+                    fromRouteRecovery: true,
+                    preserveUnlockedOutput: true,
+                });
+            }
+
+            updateMediaSessionMetadata();
+            updateMediaSessionState(playingRef.current ? "playing" : "paused");
+
+            setCarPlayOutputStatus(
+                carPlaySafeModeRef.current
+                    ? `CarPlay / USB safe mode recovered the iOS output route${
+                        reason ? ` after ${reason}` : ""
+                    }.`
+                    : buildCarPlaySafeModeLabel(false)
+            );
+
+            return true;
+        } catch (error) {
+            setCarPlayOutputStatus(
+                `CarPlay / USB output recovery needs one more tap on Play. ${
+                    error?.message || buildMobileAudioHint()
+                }`
+            );
+            return false;
+        }
     }
 
     function refreshStorageInfo() {
@@ -2897,6 +3329,7 @@ export default function Audio() {
 
     function detachOutputAudioElement() {
         stopIPhoneSilentKeepAlive();
+        clearCarPlayRecoveryTimer();
 
         if (outputAudioRef.current) {
             try {
@@ -3225,27 +3658,46 @@ export default function Audio() {
             startedAtContextTimeRef.current = 0;
             setPosition(0);
         }
+
+        updateMediaSessionState("paused");
     }
 
     function resetDecodedState() {
+        const preserveCarPlayOutput = Boolean(
+            carPlaySafeModeRef.current && isIOSAudioDevice() && outputAudioRef.current?.srcObject
+        );
+
         stopPlayback(true);
         stopVisualizer();
         clearVisualizerCanvases();
 
-        detachOutputAudioElement();
+        if (!preserveCarPlayOutput) {
+            detachOutputAudioElement();
 
-        if (audioContextRef.current) {
-            audioContextRef.current.close().catch(() => {});
-            audioContextRef.current = null;
+            if (audioContextRef.current) {
+                audioContextRef.current.close().catch(() => {});
+                audioContextRef.current = null;
+            }
         }
 
         audioBufferRef.current = null;
         lastDecodedArrayBufferRef.current = null;
         lastDecodedMetadataRef.current = null;
         activeSourceRef.current = null;
-        liveNodesRef.current = null;
-        analyserRef.current = null;
-        monitorMuteGainRef.current = null;
+
+        if (!preserveCarPlayOutput) {
+            liveNodesRef.current = null;
+            analyserRef.current = null;
+            monitorMuteGainRef.current = null;
+        } else if (liveNodesRef.current && audioContextRef.current) {
+            liveNodesRef.current.carPlaySafeMode = true;
+            applySettingsToNodes(
+                liveNodesRef.current,
+                latestSettingsRef.current,
+                audioContextRef.current.currentTime
+            );
+        }
+
         waveformDataRef.current = null;
         frequencyDataRef.current = null;
 
@@ -3269,8 +3721,11 @@ export default function Audio() {
     function shouldPreserveIPhonePlaylistOutput(options = {}) {
         return Boolean(
             isIOSAudioDevice() &&
-            (options.fromAutoAdvance ||
+            (carPlaySafeModeRef.current ||
+                options.fromAutoAdvance ||
                 options.fromPlaybackEnded ||
+                options.fromRouteRecovery ||
+                options.fromMediaSession ||
                 options.preserveUnlockedOutput)
         );
     }
@@ -3355,6 +3810,9 @@ export default function Audio() {
         setMediaInfo(
             `${byteDescription} • ${decodedBuffer.numberOfChannels} channel(s) • ${decodedBuffer.sampleRate} Hz • ${formatTime(decodedBuffer.duration)}`
         );
+
+        updateMediaSessionMetadata();
+        updateMediaSessionState(playingRef.current ? "playing" : "paused");
 
         return decodedBuffer;
     }
@@ -4422,6 +4880,7 @@ export default function Audio() {
 
         setPosition(0);
         setPlayingState(false);
+        updateMediaSessionState("paused");
         stopPositionTimer();
         stopVisualizer();
 
@@ -4476,9 +4935,19 @@ export default function Audio() {
                 outputAudioRef.current.volume = 1;
                 outputAudioRef.current.playsInline = true;
                 outputAudioRef.current.autoplay = true;
+                outputAudioRef.current.preload = "auto";
+                outputAudioRef.current.controls = false;
+                outputAudioRef.current.setAttribute("playsinline", "");
+                outputAudioRef.current.setAttribute("webkit-playsinline", "");
             }
 
             ensureIPhoneSilentKeepAlive(context, mediaStreamDestination);
+
+            if (carPlaySafeModeRef.current) {
+                setCarPlayOutputStatus(
+                    "CarPlay / USB safe output path is armed with a persistent hidden iOS media element."
+                );
+            }
 
             return;
         }
@@ -4495,7 +4964,10 @@ export default function Audio() {
 
         if (!audioContextRef.current) {
             audioContextRef.current = new AudioContextClass({
-                latencyHint: "interactive",
+                latencyHint:
+                    carPlaySafeModeRef.current && isIOSAudioDevice()
+                        ? "playback"
+                        : "interactive",
             });
         }
 
@@ -4523,7 +4995,10 @@ export default function Audio() {
             const nodes = createProcessingGraph(
                 context,
                 analyser,
-                latestSettingsRef.current
+                latestSettingsRef.current,
+                {
+                    carPlaySafeMode: Boolean(carPlaySafeModeRef.current && isIOSAudioDevice()),
+                }
             );
 
             analyserRef.current = analyser;
@@ -4638,12 +5113,24 @@ export default function Audio() {
 
             setMixerEnabled(true);
             setPlayingState(true);
+            updateMediaSessionMetadata();
+            updateMediaSessionState("playing");
             startPositionTimer();
             startVisualizer();
 
+            if (isIOSAudioDevice() && carPlaySafeModeRef.current) {
+                setCarPlayOutputStatus(
+                    "CarPlay / USB safe mode is active: one persistent iOS output route, smoothed effect changes, centered pan, capped wet effects, and Media Session controls are armed."
+                );
+            }
+
             setInfo(
                 isIOSAudioDevice()
-                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through the hidden iPhone media element output path. Playlist auto-next keeps this same unlocked output alive, so the next preloaded track can start without another tap when the current track finishes.`
+                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}${
+                        carPlaySafeModeRef.current
+                            ? "CarPlay / USB safe mode is active. "
+                            : ""
+                    }Playing through the hidden iPhone media element output path. Playlist auto-next keeps this same unlocked output alive, so the next preloaded track can start without another tap when the current track finishes.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
@@ -4671,6 +5158,7 @@ export default function Audio() {
 
         setPosition(nextOffset);
         setPlayingState(false);
+        updateMediaSessionState("paused");
         stopPositionTimer();
         stopVisualizer();
 
@@ -5023,6 +5511,7 @@ export default function Audio() {
                 playsInline
                 preload="auto"
                 controls={false}
+                controlsList="nodownload noplaybackrate"
                 sx={{
                     position: "fixed",
                     width: 1,
@@ -5105,6 +5594,8 @@ export default function Audio() {
                             "Direct media URL playlists",
                             "Repeat current song toggle",
                             "Automatic next-track playback",
+                            "CarPlay and wired iPhone USB safe output mode",
+                            "Media Session lock-screen and car-control metadata",
                         ],
                     })}
                 </script>
@@ -5114,7 +5605,7 @@ export default function Audio() {
                 <SectionTitle
                     eyebrow="Audio tool"
                     title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
-                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies."
+                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies, and use the CarPlay / USB safe mode for more stable wired iPhone playback."
                 />
 
                 <StoragePersistencePanel
@@ -5427,6 +5918,63 @@ export default function Audio() {
                                         {playlistPreloadSummary}
                                     </Typography>
                                 )}
+
+
+                                <Box
+                                    sx={{
+                                        borderRadius: 4,
+                                        p: 1.6,
+                                        background: carPlaySafeMode
+                                            ? "rgba(103,232,249,0.1)"
+                                            : "rgba(255,255,255,0.045)",
+                                        border: carPlaySafeMode
+                                            ? "1px solid rgba(103,232,249,0.24)"
+                                            : "1px solid rgba(255,255,255,0.08)",
+                                    }}
+                                >
+                                    <Stack spacing={1.15}>
+                                        <Stack
+                                            direction={{ xs: "column", sm: "row" }}
+                                            alignItems={{ xs: "stretch", sm: "center" }}
+                                            justifyContent="space-between"
+                                            spacing={1}
+                                        >
+                                            <Box>
+                                                <Typography sx={{ fontWeight: 950, color: "#fff" }}>
+                                                    CarPlay / USB safe mode
+                                                </Typography>
+                                                <Typography
+                                                    variant="caption"
+                                                    sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.55 }}
+                                                >
+                                                    Best for wired iPhone CarPlay where effects or route output can jump.
+                                                </Typography>
+                                            </Box>
+
+                                            <Button
+                                                variant={carPlaySafeMode ? "contained" : "outlined"}
+                                                onClick={toggleCarPlaySafeMode}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    borderRadius: 999,
+                                                    color: carPlaySafeMode ? "#06111e" : "#fff",
+                                                    borderColor: "rgba(255,255,255,0.18)",
+                                                    fontWeight: 950,
+                                                    background: carPlaySafeMode
+                                                        ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                        : "transparent",
+                                                    whiteSpace: "nowrap",
+                                                }}
+                                            >
+                                                {carPlaySafeMode ? "Safe mode ON" : "Safe mode OFF"}
+                                            </Button>
+                                        </Stack>
+
+                                        <Typography sx={{ color: "rgba(255,255,255,0.72)", lineHeight: 1.65 }}>
+                                            {carPlayOutputStatus}
+                                        </Typography>
+                                    </Stack>
+                                </Box>
 
                                 <Button
                                     component="label"

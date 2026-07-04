@@ -67,8 +67,8 @@ export function NavBar() {
         },
 
         {
-            label: "Transcripe",
-            path: "/transcripe",
+            label: "Transcribe",
+            path: "/transcribe",
             icon: <SubtitlesRoundedIcon fontSize="small" />,
         },
         {

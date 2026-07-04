@@ -257,6 +257,8 @@ const SAFE_COLLECTION_OPTIONS = [
 const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
 
 const AUDIO_PLAYLIST_STORAGE_KEY = "audiomasterlab.audio.playlist.v4";
+const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
+const ARCHIVE_PROXY_STORAGE_KEY = "audiomasterlab.archive.useProxy.v1";
 
 function makeArchivePlaylistId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -287,6 +289,50 @@ function writeAudioPlaylistToStorage(playlist) {
     } catch {
         return false;
     }
+}
+
+function readArchiveProxySetting() {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        return window.localStorage.getItem(ARCHIVE_PROXY_STORAGE_KEY) === "true";
+    } catch {
+        return false;
+    }
+}
+
+function writeArchiveProxySetting(value) {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        window.localStorage.setItem(
+            ARCHIVE_PROXY_STORAGE_KEY,
+            value ? "true" : "false"
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function shouldUseArchiveProxyForUrl(url, useArchiveProxy) {
+    if (!useArchiveProxy) return false;
+
+    try {
+        const parsedUrl = new URL(url);
+
+        return parsedUrl.protocol === "https:" && isArchiveHost(parsedUrl.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function buildArchiveProxyUrl(url, useArchiveProxy) {
+    if (!shouldUseArchiveProxyForUrl(url, useArchiveProxy)) {
+        return url;
+    }
+
+    return `${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}?url=${encodeURIComponent(url)}`;
 }
 
 function getArchiveAudioPlaylistTitle(file) {
@@ -523,7 +569,9 @@ function buildArchiveSearchQuery(query, selectedCollections) {
 }
 
 async function fetchJson(url, options = {}) {
-    const response = await fetch(url, {
+    const requestUrl = buildArchiveProxyUrl(url, Boolean(options.useArchiveProxy));
+
+    const response = await fetch(requestUrl, {
         method: "GET",
         signal: options.signal,
         headers: {
@@ -547,7 +595,13 @@ async function fetchJson(url, options = {}) {
     return response.json();
 }
 
-async function searchArchiveItems(query, selectedCollections, cursor = "", signal) {
+async function searchArchiveItems(
+    query,
+    selectedCollections,
+    cursor = "",
+    signal,
+    useArchiveProxy = false
+) {
     const archiveQuery = buildArchiveSearchQuery(query, selectedCollections);
 
     const params = new URLSearchParams({
@@ -564,13 +618,14 @@ async function searchArchiveItems(query, selectedCollections, cursor = "", signa
 
     return fetchJson(`https://archive.org/services/search/v1/scrape?${params}`, {
         signal,
+        useArchiveProxy,
     });
 }
 
-async function fetchArchiveMetadata(identifier, signal) {
+async function fetchArchiveMetadata(identifier, signal, useArchiveProxy = false) {
     return fetchJson(
         `https://archive.org/metadata/${encodeURIComponent(identifier)}`,
-        { signal }
+        { signal, useArchiveProxy }
     );
 }
 function formatSize(value) {
@@ -601,7 +656,12 @@ function formatFileLabel(file = {}) {
     return pieces.filter(Boolean).join(" • ") || "audio file";
 }
 
-function getPlayableFiles(identifier, files, allowZipInternalPaths) {
+function getPlayableFiles(
+    identifier,
+    files,
+    allowZipInternalPaths,
+    useArchiveProxy = false
+) {
     const playableFiles = files
         .filter((file) => file?.name)
         .filter((file) => isAudioFile(file.name))
@@ -609,8 +669,13 @@ function getPlayableFiles(identifier, files, allowZipInternalPaths) {
         .filter((file) => !hasBlockedTerm(file.name))
         .filter((file) => allowZipInternalPaths || !isZipInternalPath(file.name))
         .map((file) => {
-            const downloadUrl = buildDownloadUrl(identifier, file.name);
-            const serveUrl = buildServeUrl(identifier, file.name);
+            const directDownloadUrl = buildDownloadUrl(identifier, file.name);
+            const directServeUrl = buildServeUrl(identifier, file.name);
+            const downloadUrl = buildArchiveProxyUrl(
+                directDownloadUrl,
+                useArchiveProxy
+            );
+            const serveUrl = buildArchiveProxyUrl(directServeUrl, useArchiveProxy);
 
             return {
                 name: file.name,
@@ -621,11 +686,14 @@ function getPlayableFiles(identifier, files, allowZipInternalPaths) {
                 url: serveUrl,          // main player source
                 serveUrl,
                 downloadUrl,
+                directServeUrl,
+                directDownloadUrl,
+                proxied: Boolean(useArchiveProxy),
                 zipInternal: isZipInternalPath(file.name),
             };
         });
 
-    return dedupeArchiveFiles(playableFiles).slice(0, 10);
+    return dedupeArchiveFiles(playableFiles).slice(0, 20);
 }
 function stripUrlPunctuation(value) {
     return String(value || "").replace(/[),.;\]]+$/g, "");
@@ -996,8 +1064,13 @@ async function buildArchiveResultFromMetadata({
                                                   selectedCollections,
                                                   allowZipInternalPaths,
                                                   signal,
+                                                  useArchiveProxy = false,
                                               }) {
-    const metadataData = await fetchArchiveMetadata(identifier, signal);
+    const metadataData = await fetchArchiveMetadata(
+        identifier,
+        signal,
+        useArchiveProxy
+    );
     const metadata = metadataData.metadata || {};
     const metadataFiles = Array.isArray(metadataData.files)
         ? metadataData.files
@@ -1024,7 +1097,12 @@ async function buildArchiveResultFromMetadata({
 
     const playableFiles = forcedFiles.length
         ? forcedFiles
-        : getPlayableFiles(identifier, metadataFiles, allowZipInternalPaths);
+        : getPlayableFiles(
+            identifier,
+            metadataFiles,
+            allowZipInternalPaths,
+            useArchiveProxy
+        );
 
     if (!playableFiles.length) {
         return null;
@@ -1051,6 +1129,7 @@ async function loadDirectArchiveAudioLinks({
                                                selectedCollections,
                                                allowZipInternalPaths,
                                                signal,
+                                               useArchiveProxy = false,
                                            }) {
     const targets = extractArchiveTargets(query);
 
@@ -1077,16 +1156,28 @@ async function loadDirectArchiveAudioLinks({
                 continue;
             }
 
+            const serveUrl = buildArchiveProxyUrl(
+                target.serveUrl,
+                useArchiveProxy
+            );
+            const downloadUrl = buildArchiveProxyUrl(
+                target.downloadUrl,
+                useArchiveProxy
+            );
+
             grouped.get(target.identifier).forcedFiles.push({
                 name: target.fileName,
                 format: "",
                 size: "",
                 length: "",
                 source: "direct archive url",
-                url: target.serveUrl,
-                serveUrl: target.serveUrl,
-                downloadUrl: target.downloadUrl,
+                url: serveUrl,
+                serveUrl,
+                downloadUrl,
+                directServeUrl: target.serveUrl,
+                directDownloadUrl: target.downloadUrl,
                 originalUrl: target.originalUrl,
+                proxied: Boolean(useArchiveProxy),
                 zipInternal: target.zipInternal,
             });
         }
@@ -1102,6 +1193,7 @@ async function loadDirectArchiveAudioLinks({
                 selectedCollections,
                 allowZipInternalPaths,
                 signal,
+                useArchiveProxy,
             });
             if (result) {
                 results.push(result);
@@ -1127,6 +1219,7 @@ async function searchSafeAudio({
                                    selectedCollections,
                                    allowZipInternalPaths,
                                    signal,
+                                   useArchiveProxy = false,
                                }) {
     const safeQuery = getSterileArchiveQuery(query);
     const queryTokens = getArchiveQueryTokens(safeQuery);
@@ -1153,7 +1246,8 @@ async function searchSafeAudio({
             safeQuery,
             selectedCollections,
             cursor,
-            signal
+            signal,
+            useArchiveProxy
         );
     } catch (err) {
         if (cursor && isBadArchiveCursorError(err)) {
@@ -1164,7 +1258,8 @@ async function searchSafeAudio({
                 safeQuery,
                 selectedCollections,
                 "",
-                signal
+                signal,
+                useArchiveProxy
             );
         } else {
             throw err;
@@ -1178,7 +1273,7 @@ async function searchSafeAudio({
     const seenIdentifiers = new Set();
 
     // Inspect more than we display because the extra query verification can remove broad matches.
-    for (const item of items.slice(0, 48)) {
+    for (const item of items.slice(0, 100)) {
         if (!item.identifier || hasBlockedTerm(item.identifier)) {
             continue;
         }
@@ -1192,7 +1287,11 @@ async function searchSafeAudio({
         try {
             throwIfSearchAborted(signal);
 
-            const metadataData = await fetchArchiveMetadata(item.identifier, signal);
+            const metadataData = await fetchArchiveMetadata(
+                item.identifier,
+                signal,
+                useArchiveProxy
+            );
 
             throwIfSearchAborted(signal);
 
@@ -1216,7 +1315,8 @@ async function searchSafeAudio({
             const playableFiles = getPlayableFiles(
                 item.identifier,
                 files,
-                allowZipInternalPaths
+                allowZipInternalPaths,
+                useArchiveProxy
             );
 
             if (!playableFiles.length) {
@@ -1238,7 +1338,7 @@ async function searchSafeAudio({
                 files: playableFiles,
             });
 
-            if (results.length >= 24) {
+            if (results.length >= 50) {
                 break;
             }
         } catch (err) {
@@ -1258,11 +1358,17 @@ async function searchSafeAudio({
     };
 }
 
-function buildSearchSignature(query, selectedCollections, allowZipInternalPaths) {
+function buildSearchSignature(
+    query,
+    selectedCollections,
+    allowZipInternalPaths,
+    useArchiveProxy = false
+) {
     return JSON.stringify({
         query: getSterileArchiveQuery(query),
         collections: [...selectedCollections].sort(),
         allowZipInternalPaths: Boolean(allowZipInternalPaths),
+        useArchiveProxy: Boolean(useArchiveProxy),
     });
 }
 
@@ -1339,6 +1445,7 @@ export default function ArchiveAudioBrowser() {
         DEFAULT_SELECTED_COLLECTIONS
     );
     const [allowZipInternalPaths, setAllowZipInternalPaths] = useState(false);
+    const [useArchiveProxy, setUseArchiveProxy] = useState(readArchiveProxySetting);
     const [copiedUrl, setCopiedUrl] = useState("");
 
     const navigate = useNavigate();
@@ -1349,12 +1456,14 @@ export default function ArchiveAudioBrowser() {
         query: "old radio",
         selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
         allowZipInternalPaths: false,
+        useArchiveProxy: readArchiveProxySetting(),
     });
 
     const lastSubmittedSearchRef = useRef({
         query: "",
         selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
         allowZipInternalPaths: false,
+        useArchiveProxy: readArchiveProxySetting(),
         cursor: "",
         signature: "",
     });
@@ -1362,8 +1471,13 @@ export default function ArchiveAudioBrowser() {
     const [lastSearchSignature, setLastSearchSignature] = useState("");
 
     const currentSearchSignature = useMemo(() => {
-        return buildSearchSignature(query, selectedCollections, allowZipInternalPaths);
-    }, [query, selectedCollections, allowZipInternalPaths]);
+        return buildSearchSignature(
+            query,
+            selectedCollections,
+            allowZipInternalPaths,
+            useArchiveProxy
+        );
+    }, [query, selectedCollections, allowZipInternalPaths, useArchiveProxy]);
 
     const hasUnsubmittedSearchChanges = useMemo(() => {
         return Boolean(
@@ -1386,8 +1500,9 @@ export default function ArchiveAudioBrowser() {
             query,
             selectedCollections: [...selectedCollections],
             allowZipInternalPaths,
+            useArchiveProxy,
         };
-    }, [query, selectedCollections, allowZipInternalPaths]);
+    }, [query, selectedCollections, allowZipInternalPaths, useArchiveProxy]);
 
     useEffect(() => {
         return () => {
@@ -1405,6 +1520,7 @@ export default function ArchiveAudioBrowser() {
             query: "",
             selectedCollections: [...(latestInput.selectedCollections || [])],
             allowZipInternalPaths: Boolean(latestInput.allowZipInternalPaths),
+            useArchiveProxy: Boolean(latestInput.useArchiveProxy),
             cursor: "",
             signature: "",
         };
@@ -1452,6 +1568,18 @@ export default function ArchiveAudioBrowser() {
         setAllowZipInternalPaths(event.target.checked);
         stopActiveSearchAndClearResults(
             "ZIP-internal path setting changed. Press Search Archive Audio to refresh results."
+        );
+    }
+
+    function handleArchiveProxyChange(event) {
+        const enabled = event.target.checked;
+
+        setUseArchiveProxy(enabled);
+        writeArchiveProxySetting(enabled);
+        stopActiveSearchAndClearResults(
+            enabled
+                ? "Archive proxy enabled. Press Search Archive Audio to refresh search, metadata, and audio links through the proxy."
+                : "Archive proxy disabled. Press Search Archive Audio to refresh direct Archive.org results."
         );
     }
 
@@ -1552,7 +1680,8 @@ export default function ArchiveAudioBrowser() {
         const visibleSignature = buildSearchSignature(
             query,
             selectedCollections,
-            allowZipInternalPaths
+            allowZipInternalPaths,
+            useArchiveProxy
         );
 
         if (isLoadMore && submittedSearch.signature !== visibleSignature) {
@@ -1570,6 +1699,7 @@ export default function ArchiveAudioBrowser() {
                 query,
                 selectedCollections: [...selectedCollections],
                 allowZipInternalPaths,
+                useArchiveProxy,
                 cursor: "",
                 signature: visibleSignature,
             };
@@ -1577,6 +1707,7 @@ export default function ArchiveAudioBrowser() {
         const queryForRequest = searchSource.query;
         const collectionsForRequest = [...searchSource.selectedCollections];
         const allowZipForRequest = Boolean(searchSource.allowZipInternalPaths);
+        const proxyForRequest = Boolean(searchSource.useArchiveProxy);
         const cursorForRequest = isLoadMore
             ? searchSource.cursor || nextCursor || ""
             : "";
@@ -1585,8 +1716,12 @@ export default function ArchiveAudioBrowser() {
         const requestSignature = buildSearchSignature(
             queryForRequest,
             collectionsForRequest,
-            allowZipForRequest
+            allowZipForRequest,
+            proxyForRequest
         );
+        const archiveRouteLabel = proxyForRequest
+            ? " through the AudioMasterLab proxy"
+            : " directly from Archive.org";
 
         if (!safeQuery) {
             setError("Type a search query first.");
@@ -1620,8 +1755,8 @@ export default function ArchiveAudioBrowser() {
 
             setStatus(
                 isLoadMore
-                    ? `Loading more results for "${safeQuery}"...`
-                    : `Searching Archive audio for "${safeQuery}"...`
+                    ? `Loading more results for "${safeQuery}"${archiveRouteLabel}...`
+                    : `Searching Archive audio for "${safeQuery}"${archiveRouteLabel}...`
             );
 
             const directData = !isLoadMore
@@ -1630,6 +1765,7 @@ export default function ArchiveAudioBrowser() {
                     selectedCollections: collectionsForRequest,
                     allowZipInternalPaths: allowZipForRequest,
                     signal: controller.signal,
+                    useArchiveProxy: proxyForRequest,
                 })
                 : null;
 
@@ -1642,6 +1778,7 @@ export default function ArchiveAudioBrowser() {
                         selectedCollections: collectionsForRequest,
                         allowZipInternalPaths: allowZipForRequest,
                         signal: controller.signal,
+                        useArchiveProxy: proxyForRequest,
                     });
 
             // Ignore stale results from an older search.
@@ -1654,7 +1791,8 @@ export default function ArchiveAudioBrowser() {
                 const latestSignature = buildSearchSignature(
                     latestInput.query,
                     latestInput.selectedCollections,
-                    latestInput.allowZipInternalPaths
+                    latestInput.allowZipInternalPaths,
+                    latestInput.useArchiveProxy
                 );
 
                 if (requestSignature !== latestSignature) {
@@ -1672,6 +1810,7 @@ export default function ArchiveAudioBrowser() {
                 query: queryForRequest,
                 selectedCollections: collectionsForRequest,
                 allowZipInternalPaths: allowZipForRequest,
+                useArchiveProxy: proxyForRequest,
                 cursor: nextCursorValue,
                 signature: requestSignature,
             };
@@ -1691,12 +1830,12 @@ export default function ArchiveAudioBrowser() {
                 data.cursorReset
                     ? `Archive reset an expired cursor for "${safeQuery}". Results stayed on the current query; press Search Archive Audio for a fresh first page.`
                     : data.directLinkMode
-                        ? `Loaded ${incomingResults.length} rights-filtered direct Archive item(s).`
+                        ? `Loaded ${incomingResults.length} rights-filtered direct Archive item(s)${archiveRouteLabel}.`
                         : incomingResults.length
                             ? isLoadMore
-                                ? `Added ${incomingResults.length} more Archive item(s).`
-                                : `Found ${incomingResults.length} Archive item(s) with playable audio.`
-                            : `No safe playable audio files found for "${safeQuery}".`
+                                ? `Added ${incomingResults.length} more Archive item(s)${archiveRouteLabel}.`
+                                : `Found ${incomingResults.length} Archive item(s) with playable audio${archiveRouteLabel}.`
+                            : `No safe playable audio files found for "${safeQuery}"${archiveRouteLabel}.`
             );
         } catch (err) {
             if (isAbortError(err)) {
@@ -1746,6 +1885,7 @@ export default function ArchiveAudioBrowser() {
             query: "",
             selectedCollections: [...selectedCollections],
             allowZipInternalPaths,
+            useArchiveProxy,
             cursor: "",
             signature: "",
         };
@@ -1935,6 +2075,24 @@ export default function ArchiveAudioBrowser() {
                             <FormControlLabel
                                 control={
                                     <Switch
+                                        checked={useArchiveProxy}
+                                        onChange={handleArchiveProxyChange}
+                                    />
+                                }
+                                label="Use scrapewebsite Archive proxy for search, metadata, and playable audio links"
+                            />
+
+                            <Alert severity={useArchiveProxy ? "warning" : "info"}>
+                                {useArchiveProxy
+                                    ? `Proxy mode is on. Archive search JSON, metadata JSON, and audio URLs are routed through ${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}. This can help with CORS, Range requests, Safari/iPhone playback, and Archive links that fail directly, but it may be slower and it does not verify rights or bypass copyright limits.`
+                                    : "Proxy mode is off. Searches and audio links use Archive.org directly. Turn this on only when direct Archive results or playback are failing."}
+                            </Alert>
+
+                            <Divider />
+
+                            <FormControlLabel
+                                control={
+                                    <Switch
                                         checked={allowZipInternalPaths}
                                         onChange={handleAllowZipInternalPathsChange}
                                     />
@@ -1959,6 +2117,7 @@ export default function ArchiveAudioBrowser() {
                     <Stack direction="row" spacing={1} flexWrap="wrap">
                         <Chip label={`${results.length} item(s)`} color="primary" />
                         <Chip label={`${totalPlayableFiles} playable file(s)`} />
+                        <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
                         <Chip label={`Next cursor: ${nextCursor ? "available" : "none"}`} />
                     </Stack>
                 )}
@@ -2069,6 +2228,9 @@ export default function ArchiveAudioBrowser() {
                                                                     {formatFileLabel(file)}
                                                                     {file.zipInternal
                                                                         ? " • ZIP-internal path"
+                                                                        : ""}
+                                                                    {file.proxied
+                                                                        ? " • proxied"
                                                                         : ""}
                                                                 </Typography>
                                                             </Box>

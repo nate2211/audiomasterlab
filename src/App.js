@@ -26,7 +26,7 @@ import {
   Copyright,
 } from "./pages/PolicyPages.js";
 
-const Transcripe = lazy(() => import("./pages/Transcripe.js"));
+const Transcripe = lazy(() => import("./pages/./Transcribe"));
 const Visualizer = lazy(() => import("./pages/Visualizer.js"));
 
 const SITE_NAME = "AudioMaster Lab";
@@ -376,12 +376,6 @@ export default function App() {
                   <Route path="/editor" element={<Editor />} />
                   <Route path="/youtube" element={<YoutubePage />} />
                   <Route path="/transcribe" element={<Transcripe />} />
-
-                  {/* Legacy typo route. Keep this for users/Search Console, but canonical is /transcribe. */}
-                  <Route
-                      path="/transcripe"
-                      element={<Navigate to="/transcribe" replace />}
-                  />
 
                   <Route path="/visualizer" element={<Visualizer />} />
                   <Route path="/archive" element={<ArchiveAudioBrowser />} />

@@ -1,4 +1,4 @@
-// src/pages/Transcripe.js
+// src/pages/Transcribe.js
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Helmet } from "react-helmet-async";
@@ -1019,7 +1019,7 @@ function buildJsonExport({
     return JSON.stringify(
         {
             app: "AudioMaster Lab",
-            page: "Transcripe",
+            page: "Transcribe",
             type: "transcript",
             model: {
                 id: modelId,
@@ -1104,7 +1104,7 @@ function makeSessionSummary({
     };
 }
 
-export default function Transcripe() {
+export default function Transcribe() {
     const isMobile = useMediaQuery("(max-width:700px)");
     const isTablet = useMediaQuery("(max-width:1100px)");
     const [searchParams, setSearchParams] = useSearchParams();
