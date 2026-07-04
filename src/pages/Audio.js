@@ -381,6 +381,82 @@ const PLAYLIST_RECOVERY_SETTINGS = {
     fetchCacheModes: ["no-store", "reload", "default"],
 };
 
+const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
+
+function isArchiveMediaHost(hostname = "") {
+    const host = String(hostname || "").toLowerCase();
+
+    return (
+        host === "archive.org" ||
+        host === "www.archive.org" ||
+        /^ia\d+\.us\.archive\.org$/.test(host)
+    );
+}
+
+function isScrapeWebsiteArchiveProxyUrl(urlValue) {
+    try {
+        const parsed = new URL(urlValue);
+
+        return (
+            parsed.origin === "https://scrapewebsite.pages.dev" &&
+            parsed.pathname === "/api/archiveproxy"
+        );
+    } catch {
+        return false;
+    }
+}
+
+function shouldFallbackToScrapeWebsiteProxy(urlValue) {
+    if (!urlValue || isScrapeWebsiteArchiveProxyUrl(urlValue)) {
+        return false;
+    }
+
+    if (
+        String(urlValue).startsWith("blob:") ||
+        String(urlValue).startsWith("data:")
+    ) {
+        return false;
+    }
+
+    try {
+        const parsed = new URL(urlValue);
+
+        return parsed.protocol === "https:" && isArchiveMediaHost(parsed.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function buildScrapeWebsiteArchiveProxyUrl(urlValue) {
+    if (!shouldFallbackToScrapeWebsiteProxy(urlValue)) {
+        return urlValue;
+    }
+
+    return `${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}?url=${encodeURIComponent(urlValue)}`;
+}
+
+function buildMediaFetchCandidates(cleanUrl) {
+    const candidates = [
+        {
+            url: cleanUrl,
+            label: "direct media URL",
+            usingProxy: false,
+        },
+    ];
+
+    const proxyUrl = buildScrapeWebsiteArchiveProxyUrl(cleanUrl);
+
+    if (proxyUrl && proxyUrl !== cleanUrl) {
+        candidates.push({
+            url: proxyUrl,
+            label: "scrapewebsite Archive proxy",
+            usingProxy: true,
+        });
+    }
+
+    return candidates;
+}
+
 function storageAvailable() {
     if (typeof window === "undefined" || !window.localStorage) return false;
 
@@ -1445,6 +1521,7 @@ function buildFetchFailureMessage(urlValue, lastError, attempts) {
 
 async function fetchDirectMediaArrayBuffer(urlValue, options = {}) {
     const cleanUrl = normalizeRecoverableMediaUrl(urlValue);
+    const fetchCandidates = buildMediaFetchCandidates(cleanUrl);
     const retryDelays = Array.isArray(options.retryDelaysMs)
         ? options.retryDelaysMs
         : PLAYLIST_RECOVERY_SETTINGS.retryDelaysMs;
@@ -1455,70 +1532,104 @@ async function fetchDirectMediaArrayBuffer(urlValue, options = {}) {
 
     let lastError = null;
     let attempts = 0;
+    let usedProxyFallback = false;
+    let lastFetchUrl = cleanUrl;
+    let lastFetchLabel = "direct media URL";
 
-    for (let attemptIndex = 0; attemptIndex < retryDelays.length; attemptIndex += 1) {
-        const delay = retryDelays[attemptIndex];
+    for (const candidate of fetchCandidates) {
+        // Try the original URL once. If it fails and this is an Archive.org URL,
+        // immediately fall back to the scrapewebsite Pages Function proxy.
+        const candidateRetryDelays = candidate.usingProxy ? retryDelays : [0];
 
-        if (delay) {
-            await sleep(delay);
-        }
+        for (
+            let attemptIndex = 0;
+            attemptIndex < candidateRetryDelays.length;
+            attemptIndex += 1
+        ) {
+            const delay = candidateRetryDelays[attemptIndex];
 
-        const cacheMode = cacheModes[Math.min(attemptIndex, cacheModes.length - 1)] || "no-store";
-        attempts += 1;
-
-        try {
-            const response = await fetchWithTimeout(
-                cleanUrl,
-                {
-                    method: "GET",
-                    mode: "cors",
-                    credentials: "omit",
-                    cache: cacheMode,
-                    redirect: "follow",
-                },
-                timeoutMs
-            );
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+            if (delay) {
+                await sleep(delay);
             }
 
-            const contentType = response.headers.get("content-type") || "";
+            const cacheMode =
+                cacheModes[Math.min(attemptIndex, cacheModes.length - 1)] || "no-store";
+            attempts += 1;
+            lastFetchUrl = candidate.url;
+            lastFetchLabel = candidate.label;
+            usedProxyFallback = usedProxyFallback || candidate.usingProxy;
 
-            if (contentType.toLowerCase().includes("text/html")) {
-                throw new Error(
-                    "The URL returned an HTML page instead of a direct media file."
+            try {
+                const response = await fetchWithTimeout(
+                    candidate.url,
+                    {
+                        method: "GET",
+                        mode: "cors",
+                        credentials: "omit",
+                        cache: cacheMode,
+                        redirect: "follow",
+                    },
+                    timeoutMs
                 );
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const contentType = response.headers.get("content-type") || "";
+
+                if (contentType.toLowerCase().includes("text/html")) {
+                    throw new Error(
+                        "The URL returned an HTML page instead of a direct media file."
+                    );
+                }
+
+                const arrayBuffer = await response.arrayBuffer();
+
+                if (!arrayBuffer || arrayBuffer.byteLength < 8) {
+                    throw new Error(
+                        "The downloaded media file is empty or too small to decode."
+                    );
+                }
+
+                return {
+                    arrayBuffer,
+                    metadata: {
+                        name: cleanUrl,
+                        fetchUrl: candidate.url,
+                        fetchLabel: candidate.label,
+                        sourceType: "url",
+                        contentType,
+                        byteLength: arrayBuffer.byteLength,
+                        likelyMedia: isLikelyMediaUrl(cleanUrl),
+                        fetchAttempts: attempts,
+                        fetchCacheMode: cacheMode,
+                        usedProxyFallback: candidate.usingProxy,
+                        providerHint: candidate.usingProxy
+                            ? "Loaded through the scrapewebsite Cloudflare Pages Archive proxy after the direct URL failed."
+                            : "",
+                    },
+                };
+            } catch (error) {
+                lastError = error;
+
+                // Direct Archive URL failed once. Move to the proxy candidate instead
+                // of wasting all retries on a browser-CORS-blocked direct request.
+                if (!candidate.usingProxy && fetchCandidates.length > 1) {
+                    break;
+                }
             }
-
-            const arrayBuffer = await response.arrayBuffer();
-
-            if (!arrayBuffer || arrayBuffer.byteLength < 8) {
-                throw new Error(
-                    "The downloaded media file is empty or too small to decode."
-                );
-            }
-
-            return {
-                arrayBuffer,
-                metadata: {
-                    name: cleanUrl,
-                    sourceType: "url",
-                    contentType,
-                    byteLength: arrayBuffer.byteLength,
-                    likelyMedia: isLikelyMediaUrl(cleanUrl),
-                    fetchAttempts: attempts,
-                    fetchCacheMode: cacheMode,
-                },
-            };
-        } catch (error) {
-            lastError = error;
         }
     }
 
-    throw new Error(buildFetchFailureMessage(cleanUrl, lastError, attempts));
-}
+    const fallbackNote = usedProxyFallback
+        ? ` Last attempted through ${lastFetchLabel}: ${lastFetchUrl}.`
+        : "";
 
+    throw new Error(
+        `${buildFetchFailureMessage(cleanUrl, lastError, attempts)}${fallbackNote}`
+    );
+}
 
 async function readFileMediaArrayBuffer(file, sourceLabel = "Upload media file") {
     if (!file) {
@@ -2174,11 +2285,15 @@ function getPlaylistItemMeta(item) {
 
     const health = item.lastError
         ? ` • skipped last time: ${String(item.lastError).slice(0, 90)}`
-        : item.loadState === "loading"
-            ? " • loading now"
-            : item.lastLoadedAt
-                ? " • last load OK"
-                : "";
+        : item.loadState === "preloading"
+            ? " • preloading now"
+            : item.loadState === "preloaded" || item.preloadedAt
+                ? ` • preloaded${item.preloadedViaProxy ? " through proxy fallback" : ""}`
+                : item.loadState === "loading"
+                    ? " • loading now"
+                    : item.lastLoadedAt
+                        ? " • last load OK"
+                        : "";
 
     if (item.kind === "url") {
         try {
@@ -2218,6 +2333,34 @@ function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
     }
 
     return "Repeat is OFF. Add playlist tracks to enable automatic next-track playback.";
+}
+
+function getPlaylistPreloadCacheKey(item) {
+    if (!item || typeof item !== "object") {
+        return "";
+    }
+
+    if (item.id) {
+        return String(item.id);
+    }
+
+    if (item.kind === "url" && item.url) {
+        return `url:${item.url}`;
+    }
+
+    return `${item.kind || "item"}:${item.title || ""}:${item.addedAt || ""}`;
+}
+
+function getPlaylistPreloadSourceLabel(metadata = {}) {
+    if (metadata.usedProxyFallback) {
+        return "preloaded through scrapewebsite proxy fallback";
+    }
+
+    if (metadata.fetchLabel) {
+        return `preloaded through ${metadata.fetchLabel}`;
+    }
+
+    return "preloaded directly";
 }
 
 function StoragePersistencePanel({ storageInfo, onClearSavedSession }) {
@@ -2383,6 +2526,8 @@ export default function Audio() {
     const activePlaylistIndexRef = useRef(-1);
     const playlistLoadTokenRef = useRef(0);
     const playlistAdvanceTokenRef = useRef(0);
+    const playlistPreloadCacheRef = useRef(new Map());
+    const playlistPreloadTokenRef = useRef(0);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
 
     const [sourceUrl, setSourceUrl] = useState("");
@@ -2398,6 +2543,8 @@ export default function Audio() {
     const [mixerEnabled, setMixerEnabled] = useState(false);
     const [isRendering, setIsRendering] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
+    const [isPreloadingPlaylist, setIsPreloadingPlaylist] = useState(false);
+    const [playlistPreloadSummary, setPlaylistPreloadSummary] = useState("");
     const [isPlaying, setIsPlaying] = useState(false);
     const [isScrubbing, setIsScrubbing] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
@@ -2495,6 +2642,16 @@ export default function Audio() {
 
     useEffect(() => {
         playlistRef.current = playlist;
+
+        const activeCacheKeys = new Set(
+            playlist.map((item) => getPlaylistPreloadCacheKey(item)).filter(Boolean)
+        );
+
+        for (const cacheKey of playlistPreloadCacheRef.current.keys()) {
+            if (!activeCacheKeys.has(cacheKey)) {
+                playlistPreloadCacheRef.current.delete(cacheKey);
+            }
+        }
     }, [playlist]);
 
     useEffect(() => {
@@ -3435,6 +3592,233 @@ export default function Audio() {
         }));
     }
 
+    function markPlaylistItemPreloading(index) {
+        updatePlaylistItemAt(index, {
+            loadState: "preloading",
+            lastError: "",
+            lastPreloadTriedAt: new Date().toISOString(),
+        });
+    }
+
+    function markPlaylistItemPreloaded(index, preloadedItem) {
+        updatePlaylistItemAt(index, (item) => ({
+            loadState: "preloaded",
+            lastError: "",
+            preloadedAt: new Date().toISOString(),
+            preloadedViaProxy: Boolean(preloadedItem?.metadata?.usedProxyFallback),
+            preloadByteLength: preloadedItem?.arrayBuffer?.byteLength || item?.preloadByteLength || 0,
+            preloadDuration: preloadedItem?.decodedBuffer?.duration || item?.preloadDuration || 0,
+        }));
+    }
+
+    function getCachedPlaylistPreload(item) {
+        const cacheKey = getPlaylistPreloadCacheKey(item);
+
+        if (!cacheKey) {
+            return null;
+        }
+
+        const cached = playlistPreloadCacheRef.current.get(cacheKey);
+
+        if (!cached?.decodedBuffer) {
+            return null;
+        }
+
+        return cached;
+    }
+
+    function installPreloadedPlaylistBuffer(preloadedItem) {
+        if (!preloadedItem?.decodedBuffer) {
+            throw new Error("This playlist preload cache entry is missing its decoded audio buffer.");
+        }
+
+        const decodedBuffer = preloadedItem.decodedBuffer;
+        const arrayBuffer = preloadedItem.arrayBuffer || null;
+        const metadata = preloadedItem.metadata || {};
+        const byteDescription =
+            preloadedItem.byteDescription ||
+            (arrayBuffer ? describeMediaBytes(arrayBuffer) : "preloaded audio");
+
+        audioBufferRef.current = decodedBuffer;
+        lastDecodedArrayBufferRef.current = arrayBuffer;
+        lastDecodedMetadataRef.current = metadata;
+
+        startedOffsetRef.current = 0;
+        startedAtContextTimeRef.current = 0;
+        currentEffectiveRateRef.current = getEffectivePlaybackRate(
+            latestSettingsRef.current
+        );
+
+        setBufferReady(true);
+        setPosition(0);
+        setDuration(decodedBuffer.duration);
+        setMixerEnabled(false);
+        setMediaInfo(
+            `${byteDescription} • ${decodedBuffer.numberOfChannels} channel(s) • ${decodedBuffer.sampleRate} Hz • ${formatTime(decodedBuffer.duration)} • playlist preload cache`
+        );
+
+        return decodedBuffer;
+    }
+
+    async function buildPreloadedPlaylistItem(item, index) {
+        if (!item) {
+            throw new Error("That playlist item no longer exists.");
+        }
+
+        if (item.kind === "url") {
+            const cleanLink = validateDirectMediaUrl(item.url);
+
+            const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink, {
+                retryDelaysMs: PLAYLIST_RECOVERY_SETTINGS.retryDelaysMs,
+                cacheModes: PLAYLIST_RECOVERY_SETTINGS.fetchCacheModes,
+            });
+
+            const decodedBuffer = await decodeAudioBufferWithRecovery(arrayBuffer, metadata);
+
+            return {
+                id: item.id,
+                index,
+                kind: "url",
+                title: item.title || getPlaylistUrlTitle(cleanLink),
+                cleanLink,
+                arrayBuffer,
+                metadata,
+                decodedBuffer,
+                byteDescription: describeMediaBytes(arrayBuffer),
+                cachedAt: new Date().toISOString(),
+            };
+        }
+
+        let playlistFile = item.file;
+
+        if (!playlistFile && item.dataUrl) {
+            playlistFile = dataUrlToFile(
+                item.dataUrl,
+                item.title || "saved-playlist-audio",
+                item.type || "audio/mpeg"
+            );
+        }
+
+        if (!playlistFile) {
+            throw new Error(
+                "The actual local file is not available in memory. Re-select it from your device, or keep local playlist files under the localStorage save limit."
+            );
+        }
+
+        const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
+            playlistFile,
+            item.persistedDataUrl || item.dataUrl
+                ? "Playlist preload restored from localStorage"
+                : "Playlist preload file"
+        );
+
+        const decodedBuffer = await decodeAudioBufferWithRecovery(arrayBuffer, metadata);
+
+        return {
+            id: item.id,
+            index,
+            kind: "file",
+            title: item.title || playlistFile.name || "Playlist file",
+            playlistFile,
+            arrayBuffer,
+            metadata,
+            decodedBuffer,
+            byteDescription: describeMediaBytes(arrayBuffer),
+            cachedAt: new Date().toISOString(),
+        };
+    }
+
+    async function preloadPlaylist() {
+        const list = playlistRef.current;
+
+        if (!Array.isArray(list) || !list.length) {
+            setError("Add uploaded files or direct media links to the playlist before preloading.");
+            return false;
+        }
+
+        const preloadToken = playlistPreloadTokenRef.current + 1;
+        playlistPreloadTokenRef.current = preloadToken;
+
+        let preloadedCount = 0;
+        let cachedCount = 0;
+        let failedCount = 0;
+        let proxyFallbackCount = 0;
+
+        setIsPreloadingPlaylist(true);
+        setIsLoading(true);
+        setPlaylistPreloadSummary("");
+        setInfo(
+            `Preloading ${list.length} playlist item${list.length === 1 ? "" : "s"}. Each direct Archive link gets one normal attempt, then the scrapewebsite proxy fallback is tried automatically.`
+        );
+
+        try {
+            for (let index = 0; index < list.length; index += 1) {
+                if (playlistPreloadTokenRef.current !== preloadToken) {
+                    return false;
+                }
+
+                const currentList = playlistRef.current;
+                const item = currentList[index];
+
+                if (!item) {
+                    continue;
+                }
+
+                const cacheKey = getPlaylistPreloadCacheKey(item);
+
+                if (cacheKey && playlistPreloadCacheRef.current.has(cacheKey)) {
+                    cachedCount += 1;
+                    continue;
+                }
+
+                markPlaylistItemPreloading(index);
+                setPlaylistPreloadSummary(
+                    `Preloading ${index + 1} of ${currentList.length}: "${item.title}".`
+                );
+
+                try {
+                    const preloadedItem = await buildPreloadedPlaylistItem(item, index);
+
+                    if (playlistPreloadTokenRef.current !== preloadToken) {
+                        return false;
+                    }
+
+                    if (cacheKey) {
+                        playlistPreloadCacheRef.current.set(cacheKey, preloadedItem);
+                    }
+
+                    if (preloadedItem.metadata?.usedProxyFallback) {
+                        proxyFallbackCount += 1;
+                    }
+
+                    preloadedCount += 1;
+                    markPlaylistItemPreloaded(index, preloadedItem);
+                } catch (error) {
+                    failedCount += 1;
+                    markPlaylistItemFailed(index, error);
+                }
+            }
+
+            const summary = `Playlist preload finished: ${preloadedCount} newly preloaded, ${cachedCount} already cached, ${failedCount} failed, ${proxyFallbackCount} loaded through scrapewebsite proxy fallback.`;
+
+            setPlaylistPreloadSummary(summary);
+
+            if (preloadedCount + cachedCount > 0) {
+                setInfo(`${summary} Press Start playlist to play from the decoded preload cache instead of loading each song one by one.`);
+                return true;
+            }
+
+            setError(`${summary} No playable playlist items were preloaded.`);
+            return false;
+        } finally {
+            if (playlistPreloadTokenRef.current === preloadToken) {
+                setIsPreloadingPlaylist(false);
+                setIsLoading(false);
+                refreshStorageInfo();
+            }
+        }
+    }
+
     function getPlaylistFailureMessage(item, error) {
         const title = item?.title ? `"${item.title}"` : "that playlist item";
         const reason = error?.message || error?.toString?.() || "unknown browser decode error";
@@ -3600,6 +3984,18 @@ export default function Audio() {
 
                 persistCurrentUrlSnapshot(cleanLink);
 
+                const cachedPreload = getCachedPlaylistPreload(item);
+
+                if (cachedPreload) {
+                    const decodedBuffer = installPreloadedPlaylistBuffer(cachedPreload);
+                    const preloadInfo = getPlaylistPreloadSourceLabel(cachedPreload.metadata);
+
+                    return await finishSuccessfulLoad(
+                        decodedBuffer,
+                        `Loaded from playlist preload cache (${preloadInfo}). Direct media links are restored automatically after refresh.`
+                    );
+                }
+
                 const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink, {
                     retryDelaysMs: PLAYLIST_RECOVERY_SETTINGS.retryDelaysMs,
                     cacheModes: PLAYLIST_RECOVERY_SETTINGS.fetchCacheModes,
@@ -3651,6 +4047,21 @@ export default function Audio() {
             if (pickedWarning) {
                 setStatus(pickedWarning);
                 setStatusTone("info");
+            }
+
+            const cachedPreload = getCachedPlaylistPreload(item);
+
+            if (cachedPreload) {
+                const decodedBuffer = installPreloadedPlaylistBuffer(cachedPreload);
+
+                return await finishSuccessfulLoad(
+                    decodedBuffer,
+                    `Loaded from playlist preload cache. Source: ${pickedInfo}. ${
+                        item.persistedDataUrl || item.dataUrl
+                            ? "This playlist file was restored from localStorage."
+                            : "This playlist file is available for this browser session."
+                    }`
+                );
             }
 
             const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
@@ -3706,6 +4117,10 @@ export default function Audio() {
     function removePlaylistItem(id) {
         const currentIndex = activePlaylistIndexRef.current;
 
+        if (id) {
+            playlistPreloadCacheRef.current.delete(String(id));
+        }
+
         setPlaylist((current) => {
             const removedIndex = current.findIndex((item) => item.id === id);
             const nextPlaylist = current.filter((item) => item.id !== id);
@@ -3729,6 +4144,10 @@ export default function Audio() {
     function clearPlaylist() {
         playlistAdvanceTokenRef.current += 1;
         playlistLoadTokenRef.current += 1;
+        playlistPreloadTokenRef.current += 1;
+        playlistPreloadCacheRef.current.clear();
+        setIsPreloadingPlaylist(false);
+        setPlaylistPreloadSummary("");
         setPlaylist([]);
         setActivePlaylistIndex(-1);
         activePlaylistIndexRef.current = -1;
@@ -4698,7 +5117,7 @@ export default function Audio() {
                                         )
                                     }
                                     onClick={handlePlaylistPrimaryPlay}
-                                    disabled={!playlist.length || isRendering || isLoading}
+                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
                                     sx={{
                                         borderRadius: 5,
                                         py: { xs: 1.9, md: 2.35 },
@@ -4721,6 +5140,61 @@ export default function Audio() {
                                         ? "Pause playlist"
                                         : "Start playlist"}
                                 </Button>
+
+                                <Button
+                                    fullWidth
+                                    size="large"
+                                    variant="outlined"
+                                    startIcon={
+                                        isPreloadingPlaylist ? (
+                                            <LinearProgress
+                                                sx={{
+                                                    width: 28,
+                                                    height: 6,
+                                                    borderRadius: 999,
+                                                    background: "rgba(255,255,255,0.16)",
+                                                    "& .MuiLinearProgress-bar": {
+                                                        background: "#67e8f9",
+                                                    },
+                                                }}
+                                            />
+                                        ) : (
+                                            <QueueMusicRoundedIcon />
+                                        )
+                                    }
+                                    onClick={preloadPlaylist}
+                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
+                                    sx={{
+                                        borderRadius: 5,
+                                        py: { xs: 1.35, md: 1.55 },
+                                        px: 2.25,
+                                        fontWeight: 950,
+                                        color: "#fff",
+                                        borderColor: "rgba(103,232,249,0.34)",
+                                        background: "rgba(103,232,249,0.07)",
+                                        "&:hover": {
+                                            borderColor: "rgba(103,232,249,0.62)",
+                                            background: "rgba(103,232,249,0.12)",
+                                        },
+                                    }}
+                                >
+                                    {isPreloadingPlaylist
+                                        ? "Preloading playlist..."
+                                        : "Preload playlist direct + proxy fallback"}
+                                </Button>
+
+                                {playlistPreloadSummary && (
+                                    <Typography
+                                        variant="caption"
+                                        sx={{
+                                            color: "rgba(255,255,255,0.64)",
+                                            lineHeight: 1.55,
+                                            mt: -0.5,
+                                        }}
+                                    >
+                                        {playlistPreloadSummary}
+                                    </Typography>
+                                )}
 
                                 <Button
                                     component="label"
@@ -4964,7 +5438,7 @@ export default function Audio() {
                                                         size="small"
                                                         variant="outlined"
                                                         onClick={() => loadPlaylistItem(index, true)}
-                                                        disabled={isRendering || isLoading}
+                                                        disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                         sx={{
                                                             borderRadius: 999,
                                                             color: "#fff",
@@ -4978,7 +5452,7 @@ export default function Audio() {
                                                     <Button
                                                         size="small"
                                                         onClick={() => removePlaylistItem(item.id)}
-                                                        disabled={isRendering || isLoading}
+                                                        disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                         sx={{
                                                             minWidth: 42,
                                                             color: "rgba(255,255,255,0.68)",
@@ -5248,7 +5722,7 @@ export default function Audio() {
                                                                 max={HUMAN_SAFE_LIMITS.baseVolume.max}
                                                                 step={0.01}
                                                                 aria-label="Safe base volume"
-                                                                disabled={isRendering || isLoading}
+                                                                disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                                 onChange={(_, value) =>
                                                                     updateSetting(
                                                                         "baseVolume",
