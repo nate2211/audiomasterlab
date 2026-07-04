@@ -3195,6 +3195,70 @@ export default function Audio() {
         setMediaInfo("");
     }
 
+    function shouldPreserveIPhonePlaylistOutput(options = {}) {
+        return Boolean(
+            isIOSAudioDevice() &&
+            (options.fromAutoAdvance ||
+                options.fromPlaybackEnded ||
+                options.preserveUnlockedOutput)
+        );
+    }
+
+    function resetDecodedStateForPlaylistLoad(options = {}) {
+        const preserveUnlockedOutput = shouldPreserveIPhonePlaylistOutput(options);
+
+        if (!preserveUnlockedOutput) {
+            resetDecodedState();
+            return;
+        }
+
+        // iPhone/Safari requires audio playback to remain tied to the user-unlocked
+        // media element. For automatic next-track playback, do not detach the hidden
+        // audio element, close the AudioContext, or rebuild the MediaStream output.
+        // Only clear the current decoded buffer/source and keep the unlocked output
+        // graph alive for the next playlist track.
+        manualStopRef.current = true;
+        stopActiveSource();
+        stopPositionTimer();
+        stopVisualizer();
+        clearVisualizerCanvases();
+
+        audioBufferRef.current = null;
+        lastDecodedArrayBufferRef.current = null;
+        lastDecodedMetadataRef.current = null;
+        activeSourceRef.current = null;
+        waveformDataRef.current = null;
+        frequencyDataRef.current = null;
+
+        startedOffsetRef.current = 0;
+        startedAtContextTimeRef.current = 0;
+        currentEffectiveRateRef.current = getEffectivePlaybackRate(
+            latestSettingsRef.current
+        );
+
+        scrubbingRef.current = false;
+        wasPlayingBeforeScrubRef.current = false;
+
+        setIsScrubbing(false);
+        setBufferReady(false);
+        setPosition(0);
+        setDuration(0);
+        setMixerEnabled(false);
+        setMediaInfo("");
+    }
+
+    function isUnlockedIPhoneOutputStillPlaying() {
+        const element = outputAudioRef.current;
+
+        return Boolean(
+            isIOSAudioDevice() &&
+            element &&
+            element.srcObject &&
+            !element.paused &&
+            !element.ended
+        );
+    }
+
     async function prepareDecodedBuffer(arrayBuffer, metadata) {
         const decodedBuffer = await decodeAudioBufferWithRecovery(
             arrayBuffer,
@@ -3237,7 +3301,7 @@ export default function Audio() {
 
         try {
             setIsLoading(true);
-            resetDecodedState();
+            resetDecodedStateForPlaylistLoad();
             clearObjectUrl();
 
             const objectUrl = URL.createObjectURL(file);
@@ -3832,7 +3896,12 @@ export default function Audio() {
 
     async function loadNextPlayablePlaylistItem(
         startIndex = 0,
-        { autoplay = true, reason = "playlist advance" } = {}
+        {
+            autoplay = true,
+            reason = "playlist advance",
+            fromPlaybackEnded = false,
+            preserveUnlockedOutput = false,
+        } = {}
     ) {
         const list = playlistRef.current;
 
@@ -3874,6 +3943,8 @@ export default function Audio() {
             const loaded = await loadPlaylistItem(index, autoplay, {
                 suppressAutoSkip: true,
                 fromAutoAdvance: true,
+                fromPlaybackEnded,
+                preserveUnlockedOutput,
                 attemptNumber: step + 1,
                 maxAttempts: list.length,
             });
@@ -3948,7 +4019,11 @@ export default function Audio() {
 
                 window.setTimeout(() => {
                     if (playlistLoadTokenRef.current === loadToken) {
-                        startBufferPlayback(true).then((started) => {
+                        startBufferPlayback(true, {
+                            fromAutoAdvance: Boolean(options.fromAutoAdvance),
+                            fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                            preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
+                        }).then((started) => {
                             if (!started && playlistLoadTokenRef.current === loadToken) {
                                 markPlaylistItemFailed(
                                     safeIndex,
@@ -3957,6 +4032,8 @@ export default function Audio() {
                                 loadNextPlayablePlaylistItem(safeIndex + 1, {
                                     autoplay: true,
                                     reason: "Loaded track could not start, so recovery is moving to the next item",
+                                    fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                                    preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                                 });
                             }
                         });
@@ -4225,7 +4302,10 @@ export default function Audio() {
         if (repeatEnabledRef.current) {
             setInfo("Repeat is on. Restarting the current song.");
             window.setTimeout(() => {
-                startBufferPlayback(true).then((started) => {
+                startBufferPlayback(true, {
+                    fromPlaybackEnded: true,
+                    preserveUnlockedOutput: true,
+                }).then((started) => {
                     if (!started) {
                         setError("Repeat restart failed. Tap Start playlist to recover playback.");
                     }
@@ -4242,6 +4322,8 @@ export default function Audio() {
 
             await loadNextPlayablePlaylistItem(nextIndex, {
                 autoplay: true,
+                fromPlaybackEnded: true,
+                preserveUnlockedOutput: true,
                 reason:
                     nextIndex === 0 && currentIndex >= list.length - 1
                         ? "Repeat is off. End reached, wrapping to the first playable playlist track"
@@ -4335,7 +4417,7 @@ export default function Audio() {
         };
     }
 
-    async function startBufferPlayback(resetToBeginning = false) {
+    async function startBufferPlayback(resetToBeginning = false, options = {}) {
         const buffer = audioBufferRef.current;
 
         if (!buffer) {
@@ -4348,9 +4430,11 @@ export default function Audio() {
             const unlocked = await unlockMobileAudioContext(context);
 
             if (isIOSAudioDevice()) {
-                const elementUnlocked = await unlockOutputAudioElement(
-                    outputAudioRef.current
-                );
+                const preserveUnlockedOutput = shouldPreserveIPhonePlaylistOutput(options);
+                const elementUnlocked =
+                    preserveUnlockedOutput && isUnlockedIPhoneOutputStillPlaying()
+                        ? true
+                        : await unlockOutputAudioElement(outputAudioRef.current);
 
                 if (!elementUnlocked) {
                     throw new Error(
@@ -4396,12 +4480,25 @@ export default function Audio() {
             );
 
             source.onended = () => {
-                handlePlaybackEnded().catch((error) => {
-                    setError(
-                        error?.message ||
-                        "Playback ended, but the next playlist step could not be started."
-                    );
-                });
+                const runEndedHandler = () => {
+                    handlePlaybackEnded().catch((error) => {
+                        setError(
+                            error?.message ||
+                            "Playback ended, but the next playlist step could not be started."
+                        );
+                    });
+                };
+
+                // iPhone/Safari can fire the WebAudio ended callback while the hidden
+                // MediaStream audio element is still settling. A tiny delay keeps the
+                // unlocked output element alive and lets auto-next start on the same
+                // user-unlocked playback path.
+                if (isIOSAudioDevice()) {
+                    window.setTimeout(runEndedHandler, 35);
+                    return;
+                }
+
+                runEndedHandler();
             };
 
             source.start(0, safeOffset);
@@ -4413,7 +4510,7 @@ export default function Audio() {
 
             setInfo(
                 isIOSAudioDevice()
-                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker.`
+                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through the hidden iPhone media element output path. Playlist auto-next keeps this same unlocked output alive, so the next preloaded track can start without another tap when the current track finishes.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
@@ -5099,9 +5196,11 @@ export default function Audio() {
                                     </Stack>
 
                                     <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
-                                        Add uploaded files, paste direct media URLs, start the queue from
-                                        track 1 with one large button, repeat the current song, or let
-                                        playback auto-skip bad items and continue when repeat is off.
+                                        Add uploaded files, paste direct media URLs, preload the queue, start
+                                        from track 1 with one large button, repeat the current song, or let
+                                        playback auto-skip bad items and continue when repeat is off. On iPhone,
+                                        auto-next preserves the unlocked hidden audio output so the next track can
+                                        start when the current track finishes.
                                     </Typography>
                                 </Box>
 
