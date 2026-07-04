@@ -3016,11 +3016,19 @@ export default function YoutubePage() {
             </Drawer>
 
             <Helmet>
-                <title>YouTube Smart Browser</title>
+                <title>YouTube Audio Tools | AudioMaster Lab</title>
                 <meta
                     name="description"
-                    content="Browse YouTube with one smart input for searches, direct links, Shorts, Live links, Music YouTube links, playlist links, multiple pasted links, local organic interest discovery, accessible controls, playlists, a resizable official embed player, and optional No Dim mode."
+                    content="Search, load, and manage embeddable YouTube videos in a browser-based audio workspace with saved queries and playlist-style controls."
                 />
+                <link rel="canonical" href="https://audiomasterlab.com/youtube" />
+
+                <meta property="og:title" content="YouTube Audio Tools | AudioMaster Lab" />
+                <meta
+                    property="og:description"
+                    content="Search YouTube, load embeddable videos, save queries, and manage playback from AudioMaster Lab."
+                />
+                <meta property="og:url" content="https://audiomasterlab.com/youtube" />
             </Helmet>
 
             <Box

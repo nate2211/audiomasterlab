@@ -1628,6 +1628,7 @@ export default function Editor() {
         <PageShell>
             <Helmet>
                 <title>Audio Editor | AudioMaster Lab</title>
+                <link rel="canonical" href="https://audiomasterlab.com/editor" />
                 <meta
                     name="description"
                     content="AudioMaster Lab Editor is a browser-based WebAudio timeline editor with full waveform view, playhead seeking, region effect blocks, autosave, undo and redo, project JSON import/export, destructive apply, and WAV rendering."

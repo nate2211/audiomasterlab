@@ -451,7 +451,7 @@ export default function Home() {
                     name="twitter:image"
                     content="https://audiomasterlab.com/social-preview.png"
                 />
-
+                <link rel="canonical" href="https://audiomasterlab.com/" />
                 <script type="application/ld+json">
                     {JSON.stringify({
                         "@context": "https://schema.org",

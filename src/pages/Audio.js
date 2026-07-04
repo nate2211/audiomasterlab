@@ -373,6 +373,14 @@ const MAX_PERSISTED_CURRENT_AUDIO_BYTES = 6 * 1024 * 1024;
 const MAX_PERSISTED_PLAYLIST_FILE_BYTES = 3 * 1024 * 1024;
 const MAX_COOKIE_VALUE_LENGTH = 3200;
 
+const PLAYLIST_RECOVERY_SETTINGS = {
+    fetchTimeoutMs: 24000,
+    autoplayDelayMs: 140,
+    retryDelaysMs: [0, 350, 900],
+    decodeRetryDelaysMs: [0, 180],
+    fetchCacheModes: ["no-store", "reload", "default"],
+};
+
 function storageAvailable() {
     if (typeof window === "undefined" || !window.localStorage) return false;
 
@@ -899,6 +907,16 @@ function numberOrDefault(value, fallback) {
     return Number.isFinite(number) ? number : fallback;
 }
 
+function sleep(ms) {
+    const safeMs = Math.max(0, Number(ms) || 0);
+
+    if (!safeMs) {
+        return Promise.resolve();
+    }
+
+    return new Promise((resolve) => window.setTimeout(resolve, safeMs));
+}
+
 function limitSettingValue(key, value, fallback = DEFAULT_SETTINGS[key]) {
     const limit = HUMAN_SAFE_LIMITS[key];
     const safeNumber = numberOrDefault(value, fallback);
@@ -1351,55 +1369,156 @@ function buildDecodeFailureMessage(error, metadata, byteDescription) {
     }`.trim();
 }
 
-async function fetchDirectMediaArrayBuffer(urlValue) {
+function normalizeRecoverableMediaUrl(urlValue) {
     const cleanUrl = validateDirectMediaUrl(urlValue);
 
+    if (cleanUrl.startsWith("blob:") || cleanUrl.startsWith("data:")) {
+        return cleanUrl;
+    }
+
     try {
-        const response = await fetch(cleanUrl, {
-            method: "GET",
-            mode: "cors",
-            credentials: "omit",
-            cache: "no-store",
-        });
+        const parsed = new URL(cleanUrl);
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const contentType = response.headers.get("content-type") || "";
-
-        if (contentType.toLowerCase().includes("text/html")) {
-            throw new Error(
-                "The URL returned an HTML page instead of a direct media file."
-            );
-        }
-
-        const arrayBuffer = await response.arrayBuffer();
-
-        if (!arrayBuffer || arrayBuffer.byteLength < 8) {
-            throw new Error("The downloaded media file is empty or too small to decode.");
-        }
-
-        return {
-            arrayBuffer,
-            metadata: {
-                name: cleanUrl,
-                sourceType: "url",
-                contentType,
-                byteLength: arrayBuffer.byteLength,
-                likelyMedia: isLikelyMediaUrl(cleanUrl),
-            },
-        };
-    } catch (error) {
-        if (String(error?.message || "").toLowerCase().includes("failed to fetch")) {
-            throw new Error(
-                "The browser could not fetch this media URL. It may be blocked by CORS, not be a direct file, or require authentication."
-            );
-        }
-
-        throw error;
+        // URL.toString() safely escapes spaces and special path characters that
+        // commonly appear in Archive.org and direct download links.
+        return parsed.toString();
+    } catch {
+        return cleanUrl;
     }
 }
+
+function isAbortLikeError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return error?.name === "AbortError" || message.includes("abort");
+}
+
+function isCorsLikeError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+
+    return (
+        message.includes("failed to fetch") ||
+        message.includes("networkerror") ||
+        message.includes("cors") ||
+        message.includes("cross-origin")
+    );
+}
+
+async function fetchWithTimeout(urlValue, fetchOptions, timeoutMs) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timeoutId = null;
+
+    if (controller) {
+        timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    }
+
+    try {
+        return await fetch(urlValue, {
+            ...fetchOptions,
+            signal: controller?.signal,
+        });
+    } finally {
+        if (timeoutId) {
+            window.clearTimeout(timeoutId);
+        }
+    }
+}
+
+function buildFetchFailureMessage(urlValue, lastError, attempts) {
+    const reason = lastError?.message || String(lastError || "unknown error");
+
+    if (isAbortLikeError(lastError)) {
+        return `The media URL timed out after ${attempts} attempt${
+            attempts === 1 ? "" : "s"
+        }. The server may be slow or refusing range/full-file downloads: ${urlValue}`;
+    }
+
+    if (isCorsLikeError(lastError)) {
+        return `The browser could not fetch this media URL after ${attempts} attempt${
+            attempts === 1 ? "" : "s"
+        }. It is probably CORS-blocked, not a direct file, offline, or requires authentication: ${urlValue}`;
+    }
+
+    return `The browser could not load this media URL after ${attempts} attempt${
+        attempts === 1 ? "" : "s"
+    }: ${reason}`;
+}
+
+async function fetchDirectMediaArrayBuffer(urlValue, options = {}) {
+    const cleanUrl = normalizeRecoverableMediaUrl(urlValue);
+    const retryDelays = Array.isArray(options.retryDelaysMs)
+        ? options.retryDelaysMs
+        : PLAYLIST_RECOVERY_SETTINGS.retryDelaysMs;
+    const cacheModes = Array.isArray(options.cacheModes)
+        ? options.cacheModes
+        : PLAYLIST_RECOVERY_SETTINGS.fetchCacheModes;
+    const timeoutMs = Number(options.timeoutMs) || PLAYLIST_RECOVERY_SETTINGS.fetchTimeoutMs;
+
+    let lastError = null;
+    let attempts = 0;
+
+    for (let attemptIndex = 0; attemptIndex < retryDelays.length; attemptIndex += 1) {
+        const delay = retryDelays[attemptIndex];
+
+        if (delay) {
+            await sleep(delay);
+        }
+
+        const cacheMode = cacheModes[Math.min(attemptIndex, cacheModes.length - 1)] || "no-store";
+        attempts += 1;
+
+        try {
+            const response = await fetchWithTimeout(
+                cleanUrl,
+                {
+                    method: "GET",
+                    mode: "cors",
+                    credentials: "omit",
+                    cache: cacheMode,
+                    redirect: "follow",
+                },
+                timeoutMs
+            );
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const contentType = response.headers.get("content-type") || "";
+
+            if (contentType.toLowerCase().includes("text/html")) {
+                throw new Error(
+                    "The URL returned an HTML page instead of a direct media file."
+                );
+            }
+
+            const arrayBuffer = await response.arrayBuffer();
+
+            if (!arrayBuffer || arrayBuffer.byteLength < 8) {
+                throw new Error(
+                    "The downloaded media file is empty or too small to decode."
+                );
+            }
+
+            return {
+                arrayBuffer,
+                metadata: {
+                    name: cleanUrl,
+                    sourceType: "url",
+                    contentType,
+                    byteLength: arrayBuffer.byteLength,
+                    likelyMedia: isLikelyMediaUrl(cleanUrl),
+                    fetchAttempts: attempts,
+                    fetchCacheMode: cacheMode,
+                },
+            };
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw new Error(buildFetchFailureMessage(cleanUrl, lastError, attempts));
+}
+
 
 async function readFileMediaArrayBuffer(file, sourceLabel = "Upload media file") {
     if (!file) {
@@ -1449,6 +1568,33 @@ async function decodeAudioBufferFromArrayBuffer(arrayBuffer, metadata) {
     } finally {
         decodeContext.close().catch(() => {});
     }
+}
+
+async function decodeAudioBufferWithRecovery(arrayBuffer, metadata, options = {}) {
+    const retryDelays = Array.isArray(options.retryDelaysMs)
+        ? options.retryDelaysMs
+        : PLAYLIST_RECOVERY_SETTINGS.decodeRetryDelaysMs;
+
+    let lastError = null;
+
+    for (let attemptIndex = 0; attemptIndex < retryDelays.length; attemptIndex += 1) {
+        const delay = retryDelays[attemptIndex];
+
+        if (delay) {
+            await sleep(delay);
+        }
+
+        try {
+            return await decodeAudioBufferFromArrayBuffer(arrayBuffer, {
+                ...(metadata || {}),
+                decodeAttempt: attemptIndex + 1,
+            });
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw lastError || new Error("The browser could not decode this media source.");
 }
 
 function getMediaDisplayTitle(inputFile, sourceKind, sourceUrl) {
@@ -2026,12 +2172,20 @@ function getPlaylistItemMeta(item) {
         return "Unknown playlist item";
     }
 
+    const health = item.lastError
+        ? ` • skipped last time: ${String(item.lastError).slice(0, 90)}`
+        : item.loadState === "loading"
+            ? " • loading now"
+            : item.lastLoadedAt
+                ? " • last load OK"
+                : "";
+
     if (item.kind === "url") {
         try {
             const parsed = new URL(item.url);
-            return `Direct media URL • ${parsed.hostname} • saved across refreshes`;
+            return `Direct media URL • ${parsed.hostname} • saved across refreshes${health}`;
         } catch {
-            return "Direct media URL • saved across refreshes";
+            return `Direct media URL • saved across refreshes${health}`;
         }
     }
 
@@ -2040,30 +2194,30 @@ function getPlaylistItemMeta(item) {
     )}`;
 
     if (item.persistedDataUrl || item.dataUrl) {
-        return `${baseMeta} • saved in localStorage`;
+        return `${baseMeta} • saved in localStorage${health}`;
     }
 
     if (item.needsReselect || !item.file) {
-        return `${baseMeta} • remembered placeholder, reselect file after refresh`;
+        return `${baseMeta} • remembered placeholder, reselect file after refresh${health}`;
     }
 
-    return `${baseMeta} • available this session`;
+    return `${baseMeta} • available this session${health}`;
 }
 
 function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
     if (repeatEnabled) {
-        return "Repeat is ON. The current song will restart when it ends.";
+        return "Repeat is ON. The loaded song will restart when it ends.";
     }
 
-    if (playlistLength > 0 && activeIndex >= 0 && activeIndex < playlistLength - 1) {
-        return "Repeat is OFF. The next playlist song will start when this one ends.";
+    if (playlistLength > 0 && activeIndex >= 0) {
+        return "Repeat is OFF. The playlist will advance to the next song, skip broken links/files, and wrap back to the first playable track.";
     }
 
-    if (playlistLength > 0 && activeIndex === -1) {
-        return "Repeat is OFF. Load a playlist item to enable automatic next-song playback.";
+    if (playlistLength > 0) {
+        return "Repeat is OFF. Press Start playlist to begin at track 1 and keep moving through the queue.";
     }
 
-    return "Repeat is OFF. Playback will stop when the current song ends.";
+    return "Repeat is OFF. Add playlist tracks to enable automatic next-track playback.";
 }
 
 function StoragePersistencePanel({ storageInfo, onClearSavedSession }) {
@@ -2227,6 +2381,9 @@ export default function Audio() {
     const repeatEnabledRef = useRef(false);
     const playlistRef = useRef([]);
     const activePlaylistIndexRef = useRef(-1);
+    const playlistLoadTokenRef = useRef(0);
+    const playlistAdvanceTokenRef = useRef(0);
+    const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -2882,7 +3039,7 @@ export default function Audio() {
     }
 
     async function prepareDecodedBuffer(arrayBuffer, metadata) {
-        const decodedBuffer = await decodeAudioBufferFromArrayBuffer(
+        const decodedBuffer = await decodeAudioBufferWithRecovery(
             arrayBuffer,
             metadata
         );
@@ -3205,85 +3362,281 @@ export default function Audio() {
         setError("Load a file or direct media link first, then add the loaded source to the playlist.");
     }
 
-    async function loadPlaylistItem(index, autoplay = false) {
-        const item = playlistRef.current[index];
+    function normalizePlaylistIndex(index, list = playlistRef.current) {
+        if (!Array.isArray(list) || !list.length) return -1;
+
+        const number = Number(index);
+        const safeIndex = Number.isFinite(number) ? Math.trunc(number) : 0;
+
+        return ((safeIndex % list.length) + list.length) % list.length;
+    }
+
+    function getNextPlaylistIndex(currentIndex, list = playlistRef.current) {
+        if (!Array.isArray(list) || !list.length) return -1;
+
+        if (currentIndex < 0 || currentIndex >= list.length) {
+            return 0;
+        }
+
+        return normalizePlaylistIndex(currentIndex + 1, list);
+    }
+
+    function updatePlaylistItemAt(index, patch) {
+        setPlaylist((current) => {
+            if (!Array.isArray(current) || index < 0 || index >= current.length) {
+                return current;
+            }
+
+            const nextPatch = typeof patch === "function" ? patch(current[index]) : patch;
+
+            if (!nextPatch || typeof nextPatch !== "object") {
+                return current;
+            }
+
+            return current.map((item, itemIndex) =>
+                itemIndex === index
+                    ? {
+                        ...item,
+                        ...nextPatch,
+                    }
+                    : item
+            );
+        });
+    }
+
+    function markPlaylistItemLoading(index) {
+        updatePlaylistItemAt(index, {
+            loadState: "loading",
+            lastError: "",
+            lastTriedAt: new Date().toISOString(),
+        });
+    }
+
+    function markPlaylistItemLoaded(index) {
+        updatePlaylistItemAt(index, (item) => ({
+            loadState: "ready",
+            lastError: "",
+            lastLoadedAt: new Date().toISOString(),
+            playCount: Number(item?.playCount || 0) + 1,
+        }));
+    }
+
+    function markPlaylistItemFailed(index, error) {
+        const message =
+            error?.message ||
+            error?.toString?.() ||
+            "This playlist item could not be loaded by the browser.";
+
+        updatePlaylistItemAt(index, (item) => ({
+            loadState: "failed",
+            lastError: message,
+            failedAttempts: Number(item?.failedAttempts || 0) + 1,
+            lastFailedAt: new Date().toISOString(),
+        }));
+    }
+
+    function getPlaylistFailureMessage(item, error) {
+        const title = item?.title ? `"${item.title}"` : "that playlist item";
+        const reason = error?.message || error?.toString?.() || "unknown browser decode error";
+
+        if (item?.kind === "file" && (item.needsReselect || (!item.file && !item.dataUrl))) {
+            return `${title} needs to be selected again because the full local file was not stored after refresh.`;
+        }
+
+        return `${title} could not load after recovery attempts: ${reason}`;
+    }
+
+    async function loadNextPlayablePlaylistItem(
+        startIndex = 0,
+        { autoplay = true, reason = "playlist advance" } = {}
+    ) {
+        const list = playlistRef.current;
+
+        if (!Array.isArray(list) || !list.length) {
+            setError("Add uploaded files or direct media links to the playlist first.");
+            return false;
+        }
+
+        const advanceToken = playlistAdvanceTokenRef.current + 1;
+        playlistAdvanceTokenRef.current = advanceToken;
+
+        const firstIndex = normalizePlaylistIndex(startIndex, list);
+        const failures = [];
+
+        for (let step = 0; step < list.length; step += 1) {
+            if (playlistAdvanceTokenRef.current !== advanceToken) {
+                return false;
+            }
+
+            const index = normalizePlaylistIndex(firstIndex + step, playlistRef.current);
+            const item = playlistRef.current[index];
+
+            if (!item) continue;
+
+            if (step > 0) {
+                setInfo(
+                    `Skipping unavailable track(s). Trying playlist item ${index + 1} of ${
+                        playlistRef.current.length
+                    }: "${item.title}".`
+                );
+            } else if (reason) {
+                setInfo(
+                    `${reason}. Trying playlist item ${index + 1} of ${
+                        playlistRef.current.length
+                    }: "${item.title}".`
+                );
+            }
+
+            const loaded = await loadPlaylistItem(index, autoplay, {
+                suppressAutoSkip: true,
+                fromAutoAdvance: true,
+                attemptNumber: step + 1,
+                maxAttempts: list.length,
+            });
+
+            if (loaded) {
+                if (failures.length) {
+                    setInfo(
+                        `Skipped ${failures.length} unavailable playlist item${
+                            failures.length === 1 ? "" : "s"
+                        } and loaded "${playlistRef.current[index]?.title || item.title}".`
+                    );
+                }
+
+                return true;
+            }
+
+            failures.push(item.title || `Track ${index + 1}`);
+        }
+
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
+        setError(
+            `No playable playlist items were found after checking ${failures.length || list.length} track${
+                (failures.length || list.length) === 1 ? "" : "s"
+            }. Every item failed after retry/recovery attempts. Broken direct links can be CORS-blocked, not direct media files, offline, or unsupported codecs. Large remembered local files need to be selected again.`
+        );
+
+        return false;
+    }
+
+    async function loadPlaylistItem(index, autoplay = false, options = {}) {
+        const list = playlistRef.current;
+        const safeIndex = normalizePlaylistIndex(index, list);
+        const item = safeIndex >= 0 ? list[safeIndex] : null;
 
         if (!item) {
             setError("That playlist item is no longer available.");
-            return;
+            return false;
         }
 
-        if (item.kind === "url") {
-            try {
-                setIsLoading(true);
-                resetDecodedState();
-                clearObjectUrl();
+        const loadToken = playlistLoadTokenRef.current + 1;
+        playlistLoadTokenRef.current = loadToken;
 
+        const shouldSuppressAutoSkip = Boolean(options.suppressAutoSkip);
+        const shouldAutoSkip = autoplay && !shouldSuppressAutoSkip;
+
+        markPlaylistItemLoading(safeIndex);
+
+        const ensureStillCurrentLoad = () => playlistLoadTokenRef.current === loadToken;
+
+        async function finishSuccessfulLoad(decodedBuffer, extraInfo = "") {
+            if (!ensureStillCurrentLoad()) {
+                return false;
+            }
+
+            markPlaylistItemLoaded(safeIndex);
+            refreshStorageInfo();
+
+            const loadMessage = `Loaded playlist item ${safeIndex + 1} of ${
+                playlistRef.current.length
+            }: "${item.title}". Browser decoded ${formatTime(decodedBuffer.duration)}.${
+                extraInfo ? ` ${extraInfo}` : ""
+            }`;
+
+            setInfo(loadMessage);
+
+            if (autoplay) {
+                lastPlaylistAutoStartRef.current = {
+                    index: safeIndex,
+                    reason: options.fromAutoAdvance ? "auto-advance" : "manual playlist play",
+                };
+
+                window.setTimeout(() => {
+                    if (playlistLoadTokenRef.current === loadToken) {
+                        startBufferPlayback(true).then((started) => {
+                            if (!started && playlistLoadTokenRef.current === loadToken) {
+                                markPlaylistItemFailed(
+                                    safeIndex,
+                                    new Error("Playback could not start after this track loaded.")
+                                );
+                                loadNextPlayablePlaylistItem(safeIndex + 1, {
+                                    autoplay: true,
+                                    reason: "Loaded track could not start, so recovery is moving to the next item",
+                                });
+                            }
+                        });
+                    }
+                }, PLAYLIST_RECOVERY_SETTINGS.autoplayDelayMs);
+            }
+
+            return true;
+        }
+
+        try {
+            setIsLoading(true);
+            resetDecodedState();
+            clearObjectUrl();
+
+            if (item.kind === "url") {
                 const cleanLink = validateDirectMediaUrl(item.url);
 
                 setInputFile(null);
                 setSourceKind("url");
                 setSourceUrl(cleanLink);
                 setDirectLink(cleanLink);
-                setActivePlaylistIndex(index);
-                activePlaylistIndexRef.current = index;
+                setActivePlaylistIndex(safeIndex);
+                activePlaylistIndexRef.current = safeIndex;
 
                 persistCurrentUrlSnapshot(cleanLink);
 
-                const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
+                const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink, {
+                    retryDelaysMs: PLAYLIST_RECOVERY_SETTINGS.retryDelaysMs,
+                    cacheModes: PLAYLIST_RECOVERY_SETTINGS.fetchCacheModes,
+                });
                 const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
-                refreshStorageInfo();
+                const retryInfo = metadata.fetchAttempts > 1
+                    ? `Recovery needed ${metadata.fetchAttempts} fetch attempts before decode.`
+                    : "";
 
-                setInfo(
-                    `Loaded playlist link ${index + 1} of ${
-                        playlistRef.current.length
-                    }: "${item.title}". Browser decoded ${formatTime(
-                        decodedBuffer.duration
-                    )}.`
+                return await finishSuccessfulLoad(
+                    decodedBuffer,
+                    `Direct media links are restored automatically after refresh. ${retryInfo}`.trim()
                 );
+            }
 
-                if (autoplay) {
-                    window.setTimeout(() => {
-                        startBufferPlayback(true);
-                    }, 80);
+            let playlistFile = item.file;
+
+            if (!playlistFile && item.dataUrl) {
+                try {
+                    playlistFile = dataUrlToFile(
+                        item.dataUrl,
+                        item.title || "saved-playlist-audio",
+                        item.type || "audio/mpeg"
+                    );
+                } catch {
+                    playlistFile = null;
                 }
-            } catch (error) {
-                setError(error?.message || "Could not decode this playlist link.");
-            } finally {
-                setIsLoading(false);
             }
 
-            return;
-        }
-
-        let playlistFile = item.file;
-
-        if (!playlistFile && item.dataUrl) {
-            try {
-                playlistFile = dataUrlToFile(
-                    item.dataUrl,
-                    item.title || "saved-playlist-audio",
-                    item.type || "audio/mpeg"
+            if (!playlistFile) {
+                throw new Error(
+                    "The actual local file is not available in memory. Re-select it from your device, or keep local playlist files under the localStorage save limit."
                 );
-            } catch {
-                playlistFile = null;
             }
-        }
 
-        if (!playlistFile) {
-            setError(
-                "That playlist file was remembered after refresh, but the actual local file was too large for localStorage. Add it again from your device."
-            );
-            return;
-        }
-
-        const pickedInfo = buildPickedFileInfo(playlistFile, "Playlist file");
-        const pickedWarning = buildPickedFileWarning(playlistFile);
-
-        try {
-            setIsLoading(true);
-            resetDecodedState();
-            clearObjectUrl();
+            const pickedInfo = buildPickedFileInfo(playlistFile, "Playlist file");
+            const pickedWarning = buildPickedFileWarning(playlistFile);
 
             const objectUrl = URL.createObjectURL(playlistFile);
 
@@ -3292,8 +3645,8 @@ export default function Audio() {
             setInputFile(playlistFile);
             setSourceKind("file");
             setSourceUrl(objectUrl);
-            setActivePlaylistIndex(index);
-            activePlaylistIndexRef.current = index;
+            setActivePlaylistIndex(safeIndex);
+            activePlaylistIndexRef.current = safeIndex;
 
             if (pickedWarning) {
                 setStatus(pickedWarning);
@@ -3314,29 +3667,39 @@ export default function Audio() {
             });
 
             const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
-            refreshStorageInfo();
 
-            setInfo(
-                `Loaded playlist file ${index + 1} of ${
-                    playlistRef.current.length
-                }: "${item.title}". Browser decoded ${formatTime(
-                    decodedBuffer.duration
-                )}. Source: ${pickedInfo}. ${
+            return await finishSuccessfulLoad(
+                decodedBuffer,
+                `Source: ${pickedInfo}. ${
                     item.persistedDataUrl || item.dataUrl
                         ? "This playlist file was restored from localStorage."
                         : "This playlist file is available for this browser session."
                 }`
             );
-
-            if (autoplay) {
-                window.setTimeout(() => {
-                    startBufferPlayback(true);
-                }, 80);
-            }
         } catch (error) {
-            setError(error?.message || "Could not decode this playlist file.");
+            if (!ensureStillCurrentLoad()) {
+                return false;
+            }
+
+            markPlaylistItemFailed(safeIndex, error);
+
+            const failureMessage = getPlaylistFailureMessage(item, error);
+
+            if (shouldAutoSkip && playlistRef.current.length > 1) {
+                setInfo(`${failureMessage} Skipping to the next playlist item.`);
+                return loadNextPlayablePlaylistItem(safeIndex + 1, {
+                    autoplay,
+                    reason: "Previous playlist item failed",
+                });
+            }
+
+            setError(failureMessage);
+            return false;
         } finally {
-            setIsLoading(false);
+            if (ensureStillCurrentLoad()) {
+                setIsLoading(false);
+                refreshStorageInfo();
+            }
         }
     }
 
@@ -3348,8 +3711,12 @@ export default function Audio() {
             const nextPlaylist = current.filter((item) => item.id !== id);
 
             if (removedIndex === currentIndex) {
-                setActivePlaylistIndex(-1);
-                activePlaylistIndexRef.current = -1;
+                const nextIndex = nextPlaylist.length
+                    ? normalizePlaylistIndex(removedIndex, nextPlaylist)
+                    : -1;
+
+                setActivePlaylistIndex(nextIndex);
+                activePlaylistIndexRef.current = nextIndex;
             } else if (removedIndex >= 0 && removedIndex < currentIndex) {
                 setActivePlaylistIndex(currentIndex - 1);
                 activePlaylistIndexRef.current = currentIndex - 1;
@@ -3360,6 +3727,8 @@ export default function Audio() {
     }
 
     function clearPlaylist() {
+        playlistAdvanceTokenRef.current += 1;
+        playlistLoadTokenRef.current += 1;
         setPlaylist([]);
         setActivePlaylistIndex(-1);
         activePlaylistIndexRef.current = -1;
@@ -3374,8 +3743,8 @@ export default function Audio() {
 
             setInfo(
                 nextValue
-                    ? "Repeat turned on. This song will restart automatically when it ends."
-                    : "Repeat turned off. If a playlist song is loaded, the next playlist item will play when this one ends."
+                    ? "Repeat turned on. The current song will restart automatically when it ends."
+                    : "Repeat turned off. The player will advance to the next playlist item and skip broken tracks."
             );
 
             return nextValue;
@@ -3391,12 +3760,12 @@ export default function Audio() {
         }
 
         const currentIndex = activePlaylistIndexRef.current;
-        const nextIndex =
-            currentIndex >= 0 && currentIndex < list.length - 1
-                ? currentIndex + 1
-                : 0;
+        const nextIndex = getNextPlaylistIndex(currentIndex, list);
 
-        loadPlaylistItem(nextIndex, true);
+        loadNextPlayablePlaylistItem(nextIndex, {
+            autoplay: true,
+            reason: "Manual next-track request",
+        });
     }
 
     async function playPlaylistFromStart() {
@@ -3404,17 +3773,13 @@ export default function Audio() {
 
         if (!list.length) {
             setError("Add uploaded files or direct media links to the playlist first.");
-            return;
+            return false;
         }
 
-        const currentIndex = activePlaylistIndexRef.current;
-
-        if (hasMedia && currentIndex >= 0 && currentIndex < list.length) {
-            await startBufferPlayback(false);
-            return;
-        }
-
-        await loadPlaylistItem(currentIndex >= 0 ? currentIndex : 0, true);
+        return loadNextPlayablePlaylistItem(0, {
+            autoplay: true,
+            reason: "Starting playlist from track 1",
+        });
     }
 
     async function handlePlaylistPrimaryPlay() {
@@ -3441,8 +3806,12 @@ export default function Audio() {
         if (repeatEnabledRef.current) {
             setInfo("Repeat is on. Restarting the current song.");
             window.setTimeout(() => {
-                startBufferPlayback(true);
-            }, 80);
+                startBufferPlayback(true).then((started) => {
+                    if (!started) {
+                        setError("Repeat restart failed. Tap Start playlist to recover playback.");
+                    }
+                });
+            }, PLAYLIST_RECOVERY_SETTINGS.autoplayDelayMs);
             return;
         }
 
@@ -3450,28 +3819,21 @@ export default function Audio() {
         const currentIndex = activePlaylistIndexRef.current;
 
         if (list.length > 0) {
-            const nextIndex =
-                currentIndex >= 0 && currentIndex < list.length - 1
-                    ? currentIndex + 1
-                    : 0;
+            const nextIndex = getNextPlaylistIndex(currentIndex, list);
 
-            if (nextIndex === 0 && currentIndex >= list.length - 1) {
-                setInfo("Repeat is off. End of playlist reached, looping back to the first track.");
-            } else if (currentIndex < 0) {
-                setInfo("Repeat is off. Starting playlist from the first track.");
-            } else {
-                setInfo("Repeat is off. Loading the next playlist song.");
-            }
-
-            await loadPlaylistItem(nextIndex, true);
+            await loadNextPlayablePlaylistItem(nextIndex, {
+                autoplay: true,
+                reason:
+                    nextIndex === 0 && currentIndex >= list.length - 1
+                        ? "Repeat is off. End reached, wrapping to the first playable playlist track"
+                        : "Repeat is off. Moving to the next playlist track",
+            });
             return;
         }
 
-        setInfo("Repeat is off and no playlist track is available, so the current audio is starting again from the beginning.");
-        window.setTimeout(() => {
-            startBufferPlayback(true);
-        }, 80);
+        setInfo("Playback ended. Repeat is off and there are no playlist tracks to continue with.");
     }
+
 
     function connectOutputStage(context, monitorMuteGain) {
         if (isIOSAudioDevice() && context.createMediaStreamDestination) {
@@ -3559,7 +3921,7 @@ export default function Audio() {
 
         if (!buffer) {
             setError("Load and decode a media source before playback.");
-            return;
+            return false;
         }
 
         try {
@@ -3615,7 +3977,12 @@ export default function Audio() {
             );
 
             source.onended = () => {
-                handlePlaybackEnded();
+                handlePlaybackEnded().catch((error) => {
+                    setError(
+                        error?.message ||
+                        "Playback ended, but the next playlist step could not be started."
+                    );
+                });
             };
 
             source.start(0, safeOffset);
@@ -3627,15 +3994,18 @@ export default function Audio() {
 
             setInfo(
                 isIOSAudioDevice()
-                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. "}Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker.`
-                    : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
+                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through the hidden iPhone media element output path. If no AirPods, Bluetooth, CarPlay, or AirPlay route is active, iOS should use the iPhone speaker.`
+                    : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
+
+            return true;
         } catch (error) {
             setError(
                 `Could not start playback. ${
                     error?.message || "The browser blocked the audio graph."
                 } ${buildMobileAudioHint()}`
             );
+            return false;
         }
     }
 
@@ -3917,7 +4287,7 @@ export default function Audio() {
             if (!decodedBuffer) {
                 const { arrayBuffer, metadata } = await loadSourceArrayBuffer();
 
-                decodedBuffer = await decodeAudioBufferFromArrayBuffer(
+                decodedBuffer = await decodeAudioBufferWithRecovery(
                     arrayBuffer,
                     metadata
                 );
@@ -4017,6 +4387,7 @@ export default function Audio() {
 
             <Helmet>
                 <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
+                <link rel="canonical" href="https://audiomasterlab.com/audio" />
                 <meta
                     name="description"
                     content="Use AudioMaster Lab's WebAudio tool to import files from desktop, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, and Dropbox, decode audio files, preview a live processing graph, visualize waveform and frequency spectrum, apply effects, and export WAV."
@@ -4309,9 +4680,9 @@ export default function Audio() {
                                     </Stack>
 
                                     <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
-                                        Add uploaded files, paste direct media URLs, play the whole
-                                        playlist with one large button, repeat the current song, or let
-                                        playback continue to the next playlist item when repeat is off.
+                                        Add uploaded files, paste direct media URLs, start the queue from
+                                        track 1 with one large button, repeat the current song, or let
+                                        playback auto-skip bad items and continue when repeat is off.
                                     </Typography>
                                 </Box>
 
@@ -4348,7 +4719,7 @@ export default function Audio() {
                                 >
                                     {isPlaying && activePlaylistIndex >= 0
                                         ? "Pause playlist"
-                                        : "Play playlist"}
+                                        : "Start playlist"}
                                 </Button>
 
                                 <Button

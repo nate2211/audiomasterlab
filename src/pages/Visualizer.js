@@ -1490,6 +1490,7 @@ export default function Visualizer() {
         <PageShell>
             <Helmet>
                 <title>3D Audio Visualizer Studio</title>
+                <link rel="canonical" href="https://audiomasterlab.com/visualizer" />
                 <meta
                     name="description"
                     content="AudioMaster Lab 3D visualizer studio for waveform, spectrum, oscilloscope, animated FBX export, and WebAudio frequency research."

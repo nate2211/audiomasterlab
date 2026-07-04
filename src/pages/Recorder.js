@@ -1243,6 +1243,7 @@ export default function Recorder() {
         <>
             <Helmet>
                 <title>Recorder</title>
+                <link rel="canonical" href="https://audiomasterlab.com/recorder" />
                 <meta
                     name="description"
                     content="Record vocals, microphones, Focusrite-style audio interface inputs, guitar amp line outputs, and instrument takes in the browser with a WebAudio waveform player."

@@ -1841,6 +1841,7 @@ export default function Transcripe() {
                     content="Upload audio, load direct Archive.org media links, choose stronger Whisper models, and create browser-based transcripts. Export TXT, SRT, VTT, and JSON."
                 />
                 <link rel="canonical" href="https://audiomasterlab.com/transcribe" />
+
             </Helmet>
 
             <PageShell>

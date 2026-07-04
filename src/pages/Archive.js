@@ -1,6 +1,6 @@
 // src/pages/ArchiveAudioBrowser.js
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
     Alert,
     Box,
@@ -26,6 +26,7 @@ import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
 import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
 import { useNavigate } from "react-router-dom";
+import {Helmet} from "react-helmet-async";
 const AUDIO_EXTENSIONS = [
     ".mp3",
     ".m4a",
@@ -442,16 +443,20 @@ function buildArchiveSearchQuery(query, selectedCollections) {
         .map((collection) => `collection:${collection}`)
         .join(" OR ");
 
+    // Keep the API search scoped to the selected collections.
+    // Rights/license metadata is still checked later, but licenseurl:* should not broaden
+    // the search so much that a new query displays unrelated Archive items.
     return [
         "mediatype:audio",
-        `(${collectionQuery} OR licenseurl:*)`,
+        `(${collectionQuery})`,
         `(${safeQuery})`,
     ].join(" AND ");
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, options = {}) {
     const response = await fetch(url, {
         method: "GET",
+        signal: options.signal,
         headers: {
             Accept: "application/json",
         },
@@ -473,7 +478,7 @@ async function fetchJson(url) {
     return response.json();
 }
 
-async function searchArchiveItems(query, selectedCollections, cursor = "") {
+async function searchArchiveItems(query, selectedCollections, cursor = "", signal) {
     const archiveQuery = buildArchiveSearchQuery(query, selectedCollections);
 
     const params = new URLSearchParams({
@@ -488,15 +493,17 @@ async function searchArchiveItems(query, selectedCollections, cursor = "") {
         params.set("cursor", cursor);
     }
 
-    return fetchJson(`https://archive.org/services/search/v1/scrape?${params}`);
+    return fetchJson(`https://archive.org/services/search/v1/scrape?${params}`, {
+        signal,
+    });
 }
 
-async function fetchArchiveMetadata(identifier) {
+async function fetchArchiveMetadata(identifier, signal) {
     return fetchJson(
-        `https://archive.org/metadata/${encodeURIComponent(identifier)}`
+        `https://archive.org/metadata/${encodeURIComponent(identifier)}`,
+        { signal }
     );
 }
-
 function formatSize(value) {
     const bytes = Number(value);
 
@@ -739,13 +746,144 @@ function getArchiveSearchTextFromInput(value) {
     return value;
 }
 
+const ARCHIVE_QUERY_STOP_WORDS = new Set([
+    "a",
+    "an",
+    "and",
+    "archive",
+    "archives",
+    "audio",
+    "by",
+    "cc",
+    "commons",
+    "creative",
+    "domain",
+    "download",
+    "downloads",
+    "for",
+    "from",
+    "in",
+    "listen",
+    "mediatype",
+    "music",
+    "of",
+    "official",
+    "on",
+    "or",
+    "public",
+    "safe",
+    "stream",
+    "the",
+    "to",
+    "with",
+]);
+
+function getArchiveQueryTokens(value) {
+    const safeQuery = sanitizeArchiveQuery(getArchiveSearchTextFromInput(value))
+        .toLowerCase()
+        .replace(/https?:\/\/\S+/g, " ");
+
+    const rawTokens = safeQuery
+        .split(/[^a-z0-9]+/i)
+        .map((token) => token.trim().toLowerCase())
+        .filter((token) => token.length >= 2);
+
+    const meaningfulTokens = rawTokens.filter(
+        (token) => !ARCHIVE_QUERY_STOP_WORDS.has(token)
+    );
+
+    return Array.from(new Set(meaningfulTokens.length ? meaningfulTokens : rawTokens))
+        .slice(0, 10);
+}
+
+function getArchiveCandidateSearchText(item = {}, metadata = {}, files = []) {
+    return [
+        item.identifier,
+        item.title,
+        item.creator,
+        item.subject,
+        item.description,
+        item.collection,
+        metadata.identifier,
+        metadata.title,
+        metadata.creator,
+        metadata.subject,
+        metadata.description,
+        metadata.collection,
+        metadata.licenseurl,
+        metadata.rights,
+        metadata.usage,
+        metadata.license,
+        ...files.map((file) => file?.name || ""),
+        ...files.map((file) => file?.format || ""),
+    ]
+        .flat()
+        .map(String)
+        .join(" ")
+        .toLowerCase();
+}
+
+function archiveItemMatchesActiveQuery({
+                                           query,
+                                           queryTokens,
+                                           item,
+                                           metadata,
+                                           files,
+                                       }) {
+    const tokens = Array.isArray(queryTokens) && queryTokens.length
+        ? queryTokens
+        : getArchiveQueryTokens(query);
+
+    if (!tokens.length) {
+        return true;
+    }
+
+    const haystack = getArchiveCandidateSearchText(item, metadata, files);
+    const matchedCount = tokens.reduce((count, token) => {
+        return haystack.includes(token) ? count + 1 : count;
+    }, 0);
+
+    if (tokens.length === 1) {
+        return matchedCount === 1;
+    }
+
+    // Require enough terms to prove the item belongs to the current query.
+    // This prevents Archive's broad search matches from showing unrelated old results.
+    return matchedCount >= Math.min(2, tokens.length) && matchedCount / tokens.length >= 0.5;
+}
+
+function isAbortError(error) {
+    return (
+        error?.name === "AbortError" ||
+        error?.code === 20 ||
+        String(error?.message || "").toLowerCase().includes("abort")
+    );
+}
+
+function createAbortError() {
+    try {
+        return new DOMException("Search aborted", "AbortError");
+    } catch {
+        const error = new Error("Search aborted");
+        error.name = "AbortError";
+        return error;
+    }
+}
+
+function throwIfSearchAborted(signal) {
+    if (signal?.aborted) {
+        throw createAbortError();
+    }
+}
+
 async function buildArchiveResultFromMetadata({
                                                   identifier,
                                                   forcedFiles = [],
                                                   selectedCollections,
                                                   allowZipInternalPaths,
+                                                  signal,
                                               }) {
-    const metadataData = await fetchArchiveMetadata(identifier);
+    const metadataData = await fetchArchiveMetadata(identifier, signal);
     const metadata = metadataData.metadata || {};
     const metadataFiles = Array.isArray(metadataData.files)
         ? metadataData.files
@@ -798,6 +936,7 @@ async function loadDirectArchiveAudioLinks({
                                                query,
                                                selectedCollections,
                                                allowZipInternalPaths,
+                                               signal,
                                            }) {
     const targets = extractArchiveTargets(query);
 
@@ -848,12 +987,16 @@ async function loadDirectArchiveAudioLinks({
                 forcedFiles: group.forcedFiles,
                 selectedCollections,
                 allowZipInternalPaths,
+                signal,
             });
-
             if (result) {
                 results.push(result);
             }
-        } catch {
+        } catch (err) {
+            if (isAbortError(err)) {
+                throw err;
+            }
+
             // Skip bad Archive items so one broken URL does not crash the page.
         }
     }
@@ -869,8 +1012,10 @@ async function searchSafeAudio({
                                    cursor = "",
                                    selectedCollections,
                                    allowZipInternalPaths,
+                                   signal,
                                }) {
     const safeQuery = sanitizeArchiveQuery(getArchiveSearchTextFromInput(query));
+    const queryTokens = getArchiveQueryTokens(safeQuery);
 
     if (!safeQuery) {
         throw new Error("Type a search query first.");
@@ -889,21 +1034,40 @@ async function searchSafeAudio({
     const searchData = await searchArchiveItems(
         safeQuery,
         selectedCollections,
-        cursor
+        cursor,
+        signal
     );
+
+    throwIfSearchAborted(signal);
 
     const items = Array.isArray(searchData.items) ? searchData.items : [];
     const results = [];
 
-    for (const item of items.slice(0, 24)) {
+    // Inspect more than we display because the extra query verification can remove broad matches.
+    for (const item of items.slice(0, 48)) {
         if (!item.identifier || hasBlockedTerm(item.identifier)) {
             continue;
         }
 
         try {
-            const metadataData = await fetchArchiveMetadata(item.identifier);
+            throwIfSearchAborted(signal);
+
+            const metadataData = await fetchArchiveMetadata(item.identifier, signal);
+
+            throwIfSearchAborted(signal);
+
             const metadata = metadataData.metadata || {};
             const files = Array.isArray(metadataData.files) ? metadataData.files : [];
+
+            if (!archiveItemMatchesActiveQuery({
+                query: safeQuery,
+                queryTokens,
+                item,
+                metadata,
+                files,
+            })) {
+                continue;
+            }
 
             if (!looksRightsSafer(item, metadata, selectedCollections)) {
                 continue;
@@ -933,7 +1097,15 @@ async function searchSafeAudio({
                 detailsUrl: buildDetailsUrl(item.identifier),
                 files: playableFiles,
             });
-        } catch {
+
+            if (results.length >= 24) {
+                break;
+            }
+        } catch (err) {
+            if (isAbortError(err)) {
+                throw err;
+            }
+
             // Some Archive items have incomplete metadata or temporary errors.
             // Skip those so one bad item does not break the whole browser.
         }
@@ -944,7 +1116,31 @@ async function searchSafeAudio({
         results,
     };
 }
+function buildSearchSignature(query, selectedCollections, allowZipInternalPaths) {
+    return JSON.stringify({
+        query: sanitizeArchiveQuery(getArchiveSearchTextFromInput(query)),
+        collections: [...selectedCollections].sort(),
+        allowZipInternalPaths: Boolean(allowZipInternalPaths),
+    });
+}
 
+function mergeArchiveResults(current = [], incoming = []) {
+    const seen = new Set();
+    const merged = [];
+
+    for (const item of [...current, ...incoming]) {
+        const key = item?.identifier || item?.detailsUrl || item?.title;
+
+        if (!key || seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        merged.push(item);
+    }
+
+    return merged;
+}
 export default function ArchiveAudioBrowser() {
     const [query, setQuery] = useState("old radio");
     const [results, setResults] = useState([]);
@@ -952,35 +1148,110 @@ export default function ArchiveAudioBrowser() {
     const [status, setStatus] = useState("");
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
-    const navigate = useNavigate();
     const [selectedCollections, setSelectedCollections] = useState(
         DEFAULT_SELECTED_COLLECTIONS
     );
-
     const [allowZipInternalPaths, setAllowZipInternalPaths] = useState(false);
     const [copiedUrl, setCopiedUrl] = useState("");
 
+    const navigate = useNavigate();
+
+    const searchRunRef = useRef(0);
+    const abortControllerRef = useRef(null);
+    const latestSearchInputRef = useRef({
+        query: "old radio",
+        selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
+        allowZipInternalPaths: false,
+    });
+
+    const lastSubmittedSearchRef = useRef({
+        query: "",
+        selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
+        allowZipInternalPaths: false,
+        cursor: "",
+    });
+
+    const [lastSearchSignature, setLastSearchSignature] = useState("");
+
+    const currentSearchSignature = useMemo(() => {
+        return buildSearchSignature(query, selectedCollections, allowZipInternalPaths);
+    }, [query, selectedCollections, allowZipInternalPaths]);
+
+    const hasUnsubmittedSearchChanges = useMemo(() => {
+        return Boolean(
+            lastSearchSignature && currentSearchSignature !== lastSearchSignature
+        );
+    }, [currentSearchSignature, lastSearchSignature]);
+
     const totalPlayableFiles = useMemo(() => {
-        return results.reduce((total, item) => total + item.files.length, 0);
+        return results.reduce((total, item) => {
+            return total + (Array.isArray(item.files) ? item.files.length : 0);
+        }, 0);
     }, [results]);
 
     const selectedCollectionSet = useMemo(() => {
         return new Set(selectedCollections);
     }, [selectedCollections]);
 
+    useEffect(() => {
+        latestSearchInputRef.current = {
+            query,
+            selectedCollections: [...selectedCollections],
+            allowZipInternalPaths,
+        };
+    }, [query, selectedCollections, allowZipInternalPaths]);
+
+    useEffect(() => {
+        return () => {
+            abortControllerRef.current?.abort();
+        };
+    }, []);
+
+    function stopActiveSearchAndClearResults(nextStatus = "") {
+        abortControllerRef.current?.abort();
+        searchRunRef.current += 1;
+        setLoading(false);
+        setResults([]);
+        setNextCursor("");
+        setLastSearchSignature("");
+        setCopiedUrl("");
+
+        setStatus(nextStatus || "");
+    }
+
+    function handleQueryChange(event) {
+        const nextQuery = event.target.value;
+
+        setQuery(nextQuery);
+        setError("");
+        stopActiveSearchAndClearResults(
+            nextQuery.trim()
+                ? "New query typed. Press Search Archive Audio to refresh results."
+                : ""
+        );
+    }
+
     function toggleCollection(collectionId) {
         setSelectedCollections((current) => {
-            if (current.includes(collectionId)) {
-                return current.filter((id) => id !== collectionId);
-            }
+            const nextSelected = current.includes(collectionId)
+                ? current.filter((id) => id !== collectionId)
+                : [...current, collectionId];
 
-            return [...current, collectionId];
+            stopActiveSearchAndClearResults(
+                "Collection filters changed. Press Search Archive Audio to refresh results."
+            );
+
+            return nextSelected;
         });
     }
 
     function resetCollections() {
         setSelectedCollections(DEFAULT_SELECTED_COLLECTIONS);
+        stopActiveSearchAndClearResults(
+            "Collection filters reset. Press Search Archive Audio to refresh results."
+        );
     }
+
     function addArchiveFileToAudioPlaylist(file) {
         const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
 
@@ -1029,6 +1300,7 @@ export default function ArchiveAudioBrowser() {
             setError("Could not add this Archive song to your Audio playlist.");
         }
     }
+
     async function copyText(value) {
         try {
             await navigator.clipboard.writeText(value);
@@ -1038,6 +1310,7 @@ export default function ArchiveAudioBrowser() {
             setError("Could not copy to clipboard in this browser.");
         }
     }
+
     function sendArchiveFileToAudioPage(file) {
         const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
 
@@ -1069,65 +1342,201 @@ export default function ArchiveAudioBrowser() {
 
         navigate(`/audio?url=${encodeURIComponent(selectedUrl)}`);
     }
+
     async function runSearch(loadMore = false) {
+        const isLoadMore = Boolean(loadMore);
+
+        const searchSource = isLoadMore
+            ? lastSubmittedSearchRef.current
+            : {
+                query,
+                selectedCollections: [...selectedCollections],
+                allowZipInternalPaths,
+                cursor: "",
+            };
+
+        const queryForRequest = searchSource.query;
+        const collectionsForRequest = [...searchSource.selectedCollections];
+        const allowZipForRequest = Boolean(searchSource.allowZipInternalPaths);
+        const cursorForRequest = isLoadMore
+            ? nextCursor || searchSource.cursor || ""
+            : "";
+
+        const safeQuery = sanitizeArchiveQuery(
+            getArchiveSearchTextFromInput(queryForRequest)
+        );
+        const requestSignature = buildSearchSignature(
+            queryForRequest,
+            collectionsForRequest,
+            allowZipForRequest
+        );
+
+        if (!safeQuery) {
+            setError("Type a search query first.");
+            setStatus("");
+            return;
+        }
+
+        if (!collectionsForRequest.length) {
+            setError("Choose at least one safe Archive collection.");
+            setStatus("");
+            return;
+        }
+
+        const searchId = searchRunRef.current + 1;
+        searchRunRef.current = searchId;
+
+        abortControllerRef.current?.abort();
+
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+
         try {
             setLoading(true);
             setError("");
             setCopiedUrl("");
+
+            if (!isLoadMore) {
+                setResults([]);
+                setNextCursor("");
+            }
+
             setStatus(
-                loadMore
-                    ? "Loading more safe Archive audio..."
-                    : "Searching safe Archive audio..."
+                isLoadMore
+                    ? `Loading more results for "${safeQuery}"...`
+                    : `Searching Archive audio for "${safeQuery}"...`
             );
 
-            const directData = await loadDirectArchiveAudioLinks({
-                query,
-                selectedCollections,
-                allowZipInternalPaths,
-            });
+            const directData = !isLoadMore
+                ? await loadDirectArchiveAudioLinks({
+                    query: queryForRequest,
+                    selectedCollections: collectionsForRequest,
+                    allowZipInternalPaths: allowZipForRequest,
+                    signal: controller.signal,
+                })
+                : null;
 
             const data =
                 directData ||
                 (await searchSafeAudio({
-                    query,
-                    cursor: loadMore ? nextCursor : "",
-                    selectedCollections,
-                    allowZipInternalPaths,
+                    query: queryForRequest,
+                    cursor: cursorForRequest,
+                    selectedCollections: collectionsForRequest,
+                    allowZipInternalPaths: allowZipForRequest,
+                    signal: controller.signal,
                 }));
 
-            setNextCursor(data.cursor || "");
+            // Ignore stale results from an older search.
+            if (controller.signal.aborted || searchId !== searchRunRef.current) {
+                return;
+            }
 
-            setResults((current) =>
-                loadMore && !data.directLinkMode
-                    ? [...current, ...data.results]
-                    : data.results
+            if (!isLoadMore) {
+                const latestInput = latestSearchInputRef.current;
+                const latestSignature = buildSearchSignature(
+                    latestInput.query,
+                    latestInput.selectedCollections,
+                    latestInput.allowZipInternalPaths
+                );
+
+                if (requestSignature !== latestSignature) {
+                    return;
+                }
+            }
+
+            const incomingResults = Array.isArray(data.results) ? data.results : [];
+            const nextCursorValue = data.cursor || "";
+
+            lastSubmittedSearchRef.current = {
+                query: queryForRequest,
+                selectedCollections: collectionsForRequest,
+                allowZipInternalPaths: allowZipForRequest,
+                cursor: nextCursorValue,
+            };
+
+            setLastSearchSignature(
+                buildSearchSignature(
+                    queryForRequest,
+                    collectionsForRequest,
+                    allowZipForRequest
+                )
             );
+
+            setNextCursor(nextCursorValue);
+
+            setResults((current) => {
+                if (isLoadMore && !data.directLinkMode) {
+                    return mergeArchiveResults(current, incomingResults);
+                }
+
+                return incomingResults;
+            });
 
             setStatus(
                 data.directLinkMode
-                    ? `Loaded ${data.results.length} rights-filtered direct Archive item(s).`
-                    : data.results.length
-                        ? `Found ${data.results.length} Archive item(s) with playable audio.`
-                        : "No safe playable audio files found for that query."
+                    ? `Loaded ${incomingResults.length} rights-filtered direct Archive item(s).`
+                    : incomingResults.length
+                        ? isLoadMore
+                            ? `Added ${incomingResults.length} more Archive item(s).`
+                            : `Found ${incomingResults.length} Archive item(s) with playable audio.`
+                        : `No safe playable audio files found for "${safeQuery}".`
             );
         } catch (err) {
+            if (isAbortError(err)) {
+                return;
+            }
+
+            if (searchId !== searchRunRef.current) {
+                return;
+            }
+
             setError(err?.message || "Archive search failed.");
             setStatus("");
+
+            if (!isLoadMore) {
+                setResults([]);
+                setNextCursor("");
+            }
         } finally {
-            setLoading(false);
+            if (searchId === searchRunRef.current) {
+                setLoading(false);
+
+                if (abortControllerRef.current === controller) {
+                    abortControllerRef.current = null;
+                }
+            }
         }
     }
 
     function clearResults() {
-        setResults([]);
-        setNextCursor("");
-        setStatus("Results cleared.");
+        stopActiveSearchAndClearResults("Results cleared.");
         setError("");
-        setCopiedUrl("");
+
+        lastSubmittedSearchRef.current = {
+            query: "",
+            selectedCollections: [...selectedCollections],
+            allowZipInternalPaths,
+            cursor: "",
+        };
     }
 
     return (
         <Box sx={{ p: { xs: 2, md: 4 }, maxWidth: 1240, mx: "auto" }}>
+            <Helmet>
+                <title>Archive Audio Browser | AudioMaster Lab</title>
+                <meta
+                    name="description"
+                    content="Search safe public Archive.org audio collections, load direct media links, build playlists, and play browser-supported audio files."
+                />
+                <link rel="canonical" href="https://audiomasterlab.com/archive" />
+
+                <meta property="og:title" content="Archive Audio Browser | AudioMaster Lab" />
+                <meta
+                    property="og:description"
+                    content="Search safe public Archive.org audio collections and add playable direct media links to your AudioMaster Lab playlist."
+                />
+                <meta property="og:url" content="https://audiomasterlab.com/archive" />
+            </Helmet>
             <Stack spacing={3}>
                 <Box>
                     <Stack direction="row" spacing={1.5} alignItems="center">
@@ -1167,7 +1576,13 @@ export default function ArchiveAudioBrowser() {
                             <TextField
                                 label="Search safe Archive audio"
                                 value={query}
-                                onChange={(event) => setQuery(event.target.value)}
+                                onChange={handleQueryChange}
+                                onKeyDown={(event) => {
+                                    if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        runSearch(false);
+                                    }
+                                }}
                                 placeholder="old radio, public domain jazz, speeches, librivox, live concert..."
                                 fullWidth
                                 helperText="Avoid leaked, unreleased, bootleg, full album, discography, or commercial artist discovery searches."
@@ -1184,7 +1599,7 @@ export default function ArchiveAudioBrowser() {
                                             <SearchRoundedIcon />
                                         )
                                     }
-                                    disabled={loading}
+                                    disabled={false}
                                     onClick={() => runSearch(false)}
                                 >
                                     Search Archive Audio
@@ -1193,7 +1608,7 @@ export default function ArchiveAudioBrowser() {
                                 <Button
                                     variant="outlined"
                                     size="large"
-                                    disabled={loading || !nextCursor}
+                                    disabled={loading || !nextCursor || hasUnsubmittedSearchChanges}
                                     onClick={() => runSearch(true)}
                                 >
                                     Load More
@@ -1532,7 +1947,13 @@ export default function ArchiveAudioBrowser() {
                                         <Chip
                                             key={suggestion}
                                             label={suggestion}
-                                            onClick={() => setQuery(suggestion)}
+                                            onClick={() => {
+                                                setQuery(suggestion);
+                                                setError("");
+                                                stopActiveSearchAndClearResults(
+                                                    "Suggestion selected. Press Search Archive Audio to refresh results."
+                                                );
+                                            }}
                                             clickable
                                         />
                                     ))}
