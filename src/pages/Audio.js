@@ -808,6 +808,7 @@ function sanitizePersistedPlaylistItem(item) {
                 proxiedArchiveUrl:
                     item.proxiedArchiveUrl ||
                     (isScrapeWebsiteArchiveProxyUrl(cleanUrl) ? cleanUrl : ""),
+                artworkUrl: getPlaylistItemArtworkSource(item),
             };
         } catch {
             return null;
@@ -841,6 +842,7 @@ function sanitizePersistedPlaylistItem(item) {
             persistedDataUrl: Boolean(item.dataUrl),
             restoredFromStorage: true,
             needsReselect: !restoredFile,
+            artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
 
@@ -891,6 +893,7 @@ function serializePlaylistItemForStorage(item) {
             proxiedArchiveUrl:
                 item.proxiedArchiveUrl ||
                 (isScrapeWebsiteArchiveProxyUrl(item.url) ? item.url : ""),
+            artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
 
@@ -905,6 +908,7 @@ function serializePlaylistItemForStorage(item) {
             dataUrl: item.dataUrl || "",
             persistedDataUrl: Boolean(item.dataUrl),
             needsReselect: !item.dataUrl,
+            artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
 
@@ -1908,6 +1912,191 @@ function getMediaDisplayTitle(
     return "Decoded audio buffer";
 }
 
+function buildAbsoluteMediaAssetUrl(assetPath) {
+    const cleanPath = String(assetPath || "").trim();
+
+    if (!cleanPath) {
+        return "";
+    }
+
+    if (/^(https?:|data:|blob:)/i.test(cleanPath)) {
+        return cleanPath;
+    }
+
+    if (typeof window === "undefined" || !window.location?.origin) {
+        return cleanPath;
+    }
+
+    try {
+        return new URL(cleanPath, window.location.origin).toString();
+    } catch {
+        return cleanPath;
+    }
+}
+
+function getPlaylistItemArtworkSource(item) {
+    if (!item || typeof item !== "object") {
+        return "";
+    }
+
+    const candidates = [
+        item.artworkUrl,
+        item.artwork,
+        item.coverUrl,
+        item.cover,
+        item.imageUrl,
+        item.image,
+        item.thumbnailUrl,
+        item.thumbnail,
+        item.posterUrl,
+        item.poster,
+    ];
+
+    return String(candidates.find(Boolean) || "").trim();
+}
+
+function createGeneratedMediaSessionArtwork(title, size = 512) {
+    if (typeof document === "undefined") {
+        return "";
+    }
+
+    try {
+        const canvas = document.createElement("canvas");
+        const safeSize = Math.max(128, Math.min(1024, Number(size) || 512));
+        const safeTitle = String(title || "AudioMaster Lab").trim() || "AudioMaster Lab";
+
+        canvas.width = safeSize;
+        canvas.height = safeSize;
+
+        const context = canvas.getContext("2d");
+
+        if (!context) {
+            return "";
+        }
+
+        const gradient = context.createLinearGradient(0, 0, safeSize, safeSize);
+        gradient.addColorStop(0, "#070a13");
+        gradient.addColorStop(0.42, "#12314a");
+        gradient.addColorStop(1, "#2d1b55");
+
+        context.fillStyle = gradient;
+        context.fillRect(0, 0, safeSize, safeSize);
+
+        context.save();
+        context.globalAlpha = 0.22;
+        context.strokeStyle = "#67e8f9";
+        context.lineWidth = Math.max(2, safeSize * 0.012);
+
+        for (let i = 0; i < 9; i += 1) {
+            const y = safeSize * (0.18 + i * 0.075);
+            context.beginPath();
+
+            for (let x = -20; x <= safeSize + 20; x += 18) {
+                const wave = Math.sin((x / safeSize) * Math.PI * 3 + i) * safeSize * 0.026;
+                const nextY = y + wave;
+
+                if (x <= -20) {
+                    context.moveTo(x, nextY);
+                } else {
+                    context.lineTo(x, nextY);
+                }
+            }
+
+            context.stroke();
+        }
+
+        context.restore();
+
+        context.fillStyle = "rgba(255,255,255,0.94)";
+        context.textAlign = "center";
+        context.textBaseline = "middle";
+        context.font = `900 ${Math.floor(safeSize * 0.095)}px system-ui, -apple-system, Segoe UI, sans-serif`;
+        context.fillText("AudioMaster", safeSize / 2, safeSize * 0.34);
+
+        context.font = `800 ${Math.floor(safeSize * 0.062)}px system-ui, -apple-system, Segoe UI, sans-serif`;
+        context.fillStyle = "rgba(103,232,249,0.95)";
+        context.fillText("LAB", safeSize / 2, safeSize * 0.44);
+
+        context.fillStyle = "rgba(255,255,255,0.88)";
+        context.font = `700 ${Math.floor(safeSize * 0.045)}px system-ui, -apple-system, Segoe UI, sans-serif`;
+
+        const words = safeTitle.replace(/\.[a-z0-9]{2,6}$/i, "").split(/\s+/).filter(Boolean);
+        const lines = [];
+        let line = "";
+        const maxWidth = safeSize * 0.78;
+
+        words.forEach((word) => {
+            const nextLine = line ? `${line} ${word}` : word;
+
+            if (context.measureText(nextLine).width <= maxWidth || !line) {
+                line = nextLine;
+            } else {
+                lines.push(line);
+                line = word;
+            }
+        });
+
+        if (line) {
+            lines.push(line);
+        }
+
+        lines.slice(0, 3).forEach((lineText, index) => {
+            context.fillText(lineText, safeSize / 2, safeSize * (0.62 + index * 0.07));
+        });
+
+        return canvas.toDataURL("image/png");
+    } catch {
+        return "";
+    }
+}
+
+function getMediaSessionArtwork(title, activeItem) {
+    const itemArtwork = buildAbsoluteMediaAssetUrl(getPlaylistItemArtworkSource(activeItem));
+    const generated512 = createGeneratedMediaSessionArtwork(title, 512);
+    const generated192 = createGeneratedMediaSessionArtwork(title, 192);
+
+    return [
+        itemArtwork
+            ? {
+                src: itemArtwork,
+                sizes: "512x512",
+                type: itemArtwork.startsWith("data:image/")
+                    ? itemArtwork.slice(5, itemArtwork.indexOf(";") > 0 ? itemArtwork.indexOf(";") : undefined)
+                    : "image/png",
+            }
+            : null,
+        generated512
+            ? {
+                src: generated512,
+                sizes: "512x512",
+                type: "image/png",
+            }
+            : null,
+        generated192
+            ? {
+                src: generated192,
+                sizes: "192x192",
+                type: "image/png",
+            }
+            : null,
+        {
+            src: buildAbsoluteMediaAssetUrl("/logo512.png"),
+            sizes: "512x512",
+            type: "image/png",
+        },
+        {
+            src: buildAbsoluteMediaAssetUrl("/social-preview.png"),
+            sizes: "512x512",
+            type: "image/png",
+        },
+        {
+            src: buildAbsoluteMediaAssetUrl("/logo192.png"),
+            sizes: "192x192",
+            type: "image/png",
+        },
+    ].filter((artwork) => artwork?.src);
+}
+
 function drawRoundedCanvasRect(context, x, y, width, height, radius) {
     const safeRadius = Math.min(radius, width / 2, height / 2);
 
@@ -2769,6 +2958,8 @@ export default function Audio() {
     const mediaPositionRef = useRef(0);
     const hasMediaRef = useRef(false);
     const lastMediaSessionActionRef = useRef("");
+    const outputElementActionGuardRef = useRef(false);
+    const lastOutputElementPlayEventAtRef = useRef(0);
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3028,7 +3219,37 @@ export default function Audio() {
             return undefined;
         }
 
-        const recoverEvents = ["pause", "stalled", "suspend", "waiting", "emptied", "abort", "error"];
+        const handleOutputPlay = () => {
+            if (outputElementActionGuardRef.current) {
+                updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                return;
+            }
+
+            const now = Date.now();
+
+            if (now - lastOutputElementPlayEventAtRef.current < 350) {
+                return;
+            }
+
+            lastOutputElementPlayEventAtRef.current = now;
+            runMediaSessionAction("iOS lock-screen Play", playFromMediaSession);
+        };
+
+        const handleOutputPause = () => {
+            if (outputElementActionGuardRef.current) {
+                updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                return;
+            }
+
+            if (playingRef.current) {
+                runMediaSessionAction("iOS lock-screen Pause", pauseFromMediaSession);
+                return;
+            }
+
+            updateMediaSessionState("paused");
+        };
+
+        const recoverEvents = ["stalled", "suspend", "waiting", "emptied", "abort", "error"];
         const handleRecoverableOutputEvent = (event) => {
             if (!playingRef.current && event.type !== "error") {
                 return;
@@ -3037,11 +3258,19 @@ export default function Audio() {
             scheduleCarPlayOutputRecovery(`hidden iOS output element ${event.type}`);
         };
 
+        element.addEventListener("play", handleOutputPlay);
+        element.addEventListener("playing", handleOutputPlay);
+        element.addEventListener("pause", handleOutputPause);
+
         recoverEvents.forEach((eventName) => {
             element.addEventListener(eventName, handleRecoverableOutputEvent);
         });
 
         return () => {
+            element.removeEventListener("play", handleOutputPlay);
+            element.removeEventListener("playing", handleOutputPlay);
+            element.removeEventListener("pause", handleOutputPause);
+
             recoverEvents.forEach((eventName) => {
                 element.removeEventListener(eventName, handleRecoverableOutputEvent);
             });
@@ -3148,22 +3377,14 @@ export default function Audio() {
                 return;
             }
 
+            const title = getMediaSessionTitle();
+            const activeItem = playlistRef.current?.[activePlaylistIndexRef.current];
+
             navigator.mediaSession.metadata = new window.MediaMetadata({
-                title: getMediaSessionTitle(),
+                title,
                 artist: "AudioMaster Lab",
                 album: getMediaSessionAlbum(),
-                artwork: [
-                    {
-                        src: "/social-preview.png",
-                        sizes: "512x512",
-                        type: "image/png",
-                    },
-                    {
-                        src: "/logo192.png",
-                        sizes: "192x192",
-                        type: "image/png",
-                    },
-                ],
+                artwork: getMediaSessionArtwork(title, activeItem),
             });
         } catch {
             // MediaMetadata is not available in every Safari/WebView version.
@@ -3210,6 +3431,40 @@ export default function Audio() {
             navigator.mediaSession.metadata = null;
         } catch {
             // Safe to ignore.
+        }
+    }
+
+    async function unlockOutputElementForAppAction(element = outputAudioRef.current) {
+        outputElementActionGuardRef.current = true;
+
+        try {
+            return await unlockOutputAudioElement(element);
+        } finally {
+            window.setTimeout(() => {
+                outputElementActionGuardRef.current = false;
+            }, 80);
+        }
+    }
+
+    function pauseOutputElementForAppAction() {
+        const element = outputAudioRef.current;
+
+        if (!element || !isIOSAudioDevice()) {
+            return;
+        }
+
+        outputElementActionGuardRef.current = true;
+
+        try {
+            if (!element.paused) {
+                element.pause();
+            }
+        } catch {
+            // Safe to ignore iOS media element pause issues.
+        } finally {
+            window.setTimeout(() => {
+                outputElementActionGuardRef.current = false;
+            }, 80);
         }
     }
 
@@ -3465,7 +3720,7 @@ export default function Audio() {
                 element.playsInline = true;
 
                 if (element.paused || element.readyState < 2) {
-                    await unlockOutputAudioElement(element);
+                    await unlockOutputElementForAppAction(element);
                 }
             }
 
@@ -4018,6 +4273,7 @@ export default function Audio() {
         setPlayingState(false);
 
         if (resetToBeginning) {
+            pauseOutputElementForAppAction();
             startedOffsetRef.current = 0;
             startedAtContextTimeRef.current = 0;
             setPosition(0);
@@ -5170,7 +5426,7 @@ export default function Audio() {
             );
 
             const contextUnlocked = await unlockMobileAudioContext(context);
-            const elementUnlocked = await unlockOutputAudioElement(outputAudioRef.current);
+            const elementUnlocked = await unlockOutputElementForAppAction(outputAudioRef.current);
 
             if (!contextUnlocked || context.state !== "running" || !elementUnlocked) {
                 throw new Error(buildMobileAudioHint());
@@ -5416,7 +5672,7 @@ export default function Audio() {
                 const elementUnlocked =
                     preserveUnlockedOutput && isUnlockedIPhoneOutputStillPlaying()
                         ? true
-                        : await unlockOutputAudioElement(outputAudioRef.current);
+                        : await unlockOutputElementForAppAction(outputAudioRef.current);
 
                 if (!elementUnlocked) {
                     throw new Error(
@@ -5535,6 +5791,7 @@ export default function Audio() {
         updateMediaSessionState("paused");
         stopPositionTimer();
         stopVisualizer();
+        pauseOutputElementForAppAction();
 
         setInfo("Playback paused. Press Play to create a new source from this position.");
     }
