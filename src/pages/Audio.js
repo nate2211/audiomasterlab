@@ -407,6 +407,77 @@ function isScrapeWebsiteArchiveProxyUrl(urlValue) {
     }
 }
 
+function getScrapeWebsiteArchiveProxyTargetUrl(urlValue) {
+    try {
+        const parsed = new URL(urlValue);
+
+        if (
+            parsed.origin !== "https://scrapewebsite.pages.dev" ||
+            parsed.pathname !== "/api/archiveproxy"
+        ) {
+            return "";
+        }
+
+        const targetUrl = parsed.searchParams.get("url") || "";
+
+        if (!targetUrl) {
+            return "";
+        }
+
+        const decodedTargetUrl = decodeURIComponent(targetUrl);
+        const targetParsed = new URL(decodedTargetUrl);
+
+        if (
+            targetParsed.protocol !== "https:" ||
+            !isArchiveMediaHost(targetParsed.hostname)
+        ) {
+            return "";
+        }
+
+        return targetParsed.toString();
+    } catch {
+        return "";
+    }
+}
+
+function getCanonicalArchiveMediaUrl(urlValue) {
+    return getScrapeWebsiteArchiveProxyTargetUrl(urlValue) || urlValue;
+}
+
+function isPlaceholderProxyTitle(value) {
+    const title = String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\.[a-z0-9]{2,6}$/i, "");
+
+    return (
+        !title ||
+        title === "archiveproxy" ||
+        title === "archive proxy" ||
+        title === "api/archiveproxy" ||
+        title === "scrapewebsite archive proxy" ||
+        title === "direct media link"
+    );
+}
+
+function cleanMediaFileTitle(value) {
+    const title = String(value || "")
+        .replace(/[?#].*$/g, "")
+        .split("/")
+        .filter(Boolean)
+        .pop();
+
+    if (!title) {
+        return "";
+    }
+
+    try {
+        return decodeURIComponent(title).replace(/\+/g, " ").trim();
+    } catch {
+        return title.replace(/\+/g, " ").trim();
+    }
+}
+
 function shouldFallbackToScrapeWebsiteProxy(urlValue) {
     if (!urlValue || isScrapeWebsiteArchiveProxyUrl(urlValue)) {
         return false;
@@ -704,16 +775,39 @@ function sanitizePersistedPlaylistItem(item) {
     if (item.kind === "url" && item.url) {
         try {
             const cleanUrl = validateDirectMediaUrl(item.url);
+            const canonicalArchiveUrl = getCanonicalArchiveMediaUrl(cleanUrl);
+            const archiveFileName =
+                item.archiveFileName ||
+                item.archiveFile ||
+                item.fileName ||
+                cleanMediaFileTitle(canonicalArchiveUrl);
+            const title = normalizePlaylistUrlTitle(
+                item.title,
+                cleanUrl,
+                archiveFileName
+            );
 
             return {
                 id: item.id || makePlaylistId(),
                 kind: "url",
-                title: item.title || getPlaylistUrlTitle(cleanUrl),
+                title,
                 url: cleanUrl,
                 size: 0,
                 type: "direct media URL",
                 addedAt: item.addedAt || new Date().toISOString(),
                 restoredFromStorage: true,
+                archiveFileName: archiveFileName || "",
+                archiveServeUrl: item.archiveServeUrl || "",
+                archiveDownloadUrl: item.archiveDownloadUrl || "",
+                directArchiveUrl:
+                    item.directArchiveUrl ||
+                    item.directServeUrl ||
+                    item.archiveOriginalUrl ||
+                    canonicalArchiveUrl ||
+                    "",
+                proxiedArchiveUrl:
+                    item.proxiedArchiveUrl ||
+                    (isScrapeWebsiteArchiveProxyUrl(cleanUrl) ? cleanUrl : ""),
             };
         } catch {
             return null;
@@ -765,14 +859,38 @@ function serializePlaylistItemForStorage(item) {
     if (!item || typeof item !== "object") return null;
 
     if (item.kind === "url" && item.url) {
+        const canonicalArchiveUrl = getCanonicalArchiveMediaUrl(item.url);
+        const archiveFileName =
+            item.archiveFileName ||
+            item.archiveFile ||
+            item.fileName ||
+            cleanMediaFileTitle(canonicalArchiveUrl);
+        const title = normalizePlaylistUrlTitle(
+            item.title,
+            item.url,
+            archiveFileName
+        );
+
         return {
             id: item.id,
             kind: "url",
-            title: item.title,
+            title,
             url: item.url,
             size: 0,
             type: "direct media URL",
             addedAt: item.addedAt,
+            archiveFileName: archiveFileName || "",
+            archiveServeUrl: item.archiveServeUrl || "",
+            archiveDownloadUrl: item.archiveDownloadUrl || "",
+            directArchiveUrl:
+                item.directArchiveUrl ||
+                item.directServeUrl ||
+                item.archiveOriginalUrl ||
+                canonicalArchiveUrl ||
+                "",
+            proxiedArchiveUrl:
+                item.proxiedArchiveUrl ||
+                (isScrapeWebsiteArchiveProxyUrl(item.url) ? item.url : ""),
         };
     }
 
@@ -874,16 +992,18 @@ function persistCurrentFileSnapshot({ file, arrayBuffer, metadata }) {
     return saved;
 }
 
-function persistCurrentUrlSnapshot(urlValue) {
+function persistCurrentUrlSnapshot(urlValue, preferredTitle = "") {
     if (!urlValue) return false;
 
-    const title = getPlaylistUrlTitle(urlValue);
+    const title = normalizePlaylistUrlTitle(preferredTitle, urlValue);
 
     return writeStorageJson(STORAGE_KEYS.lastMedia, {
         kind: "url",
         title,
         url: urlValue,
         savedAt: new Date().toISOString(),
+        directArchiveUrl: getCanonicalArchiveMediaUrl(urlValue),
+        proxiedArchiveUrl: isScrapeWebsiteArchiveProxyUrl(urlValue) ? urlValue : "",
     });
 }
 
@@ -1771,24 +1891,18 @@ async function decodeAudioBufferWithRecovery(arrayBuffer, metadata, options = {}
     throw lastError || new Error("The browser could not decode this media source.");
 }
 
-function getMediaDisplayTitle(inputFile, sourceKind, sourceUrl) {
+function getMediaDisplayTitle(
+    inputFile,
+    sourceKind,
+    sourceUrl,
+    preferredTitle = ""
+) {
     if (inputFile?.name) {
         return inputFile.name;
     }
 
     if (sourceKind === "url" && sourceUrl) {
-        try {
-            const parsed = new URL(sourceUrl);
-            const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
-
-            if (lastPart) {
-                return decodeURIComponent(lastPart);
-            }
-
-            return parsed.hostname;
-        } catch {
-            return sourceUrl;
-        }
+        return normalizePlaylistUrlTitle(preferredTitle, sourceUrl);
     }
 
     return "Decoded audio buffer";
@@ -2319,32 +2433,61 @@ function buildPlaylistItemFromFile(file) {
     };
 }
 
-function getPlaylistUrlTitle(urlValue) {
-    try {
-        const parsed = new URL(urlValue);
-        const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
+function getPlaylistUrlTitle(urlValue, fallbackTitle = "Direct media link") {
+    const canonicalUrl = getCanonicalArchiveMediaUrl(urlValue);
 
-        if (lastPart) {
-            return decodeURIComponent(lastPart);
+    try {
+        const parsed = new URL(canonicalUrl);
+        const lastPart = cleanMediaFileTitle(parsed.pathname);
+
+        if (lastPart && !isPlaceholderProxyTitle(lastPart)) {
+            return lastPart;
         }
 
-        return parsed.hostname || "Direct media link";
+        return parsed.hostname || fallbackTitle;
     } catch {
-        return String(urlValue || "Direct media link").slice(0, 96);
+        const cleanTitle = cleanMediaFileTitle(canonicalUrl || urlValue);
+
+        if (cleanTitle && !isPlaceholderProxyTitle(cleanTitle)) {
+            return cleanTitle.slice(0, 120);
+        }
+
+        return String(fallbackTitle || "Direct media link").slice(0, 120);
     }
+}
+
+function normalizePlaylistUrlTitle(titleValue, urlValue, archiveFileName = "") {
+    const archiveTitle = cleanMediaFileTitle(archiveFileName);
+    const currentTitle = String(titleValue || "").trim();
+
+    if (currentTitle && !isPlaceholderProxyTitle(currentTitle)) {
+        return currentTitle;
+    }
+
+    if (archiveTitle && !isPlaceholderProxyTitle(archiveTitle)) {
+        return archiveTitle;
+    }
+
+    return getPlaylistUrlTitle(urlValue);
 }
 
 function buildPlaylistItemFromUrl(urlValue) {
     const cleanUrl = validateDirectMediaUrl(urlValue);
+    const canonicalArchiveUrl = getCanonicalArchiveMediaUrl(cleanUrl);
+    const archiveFileName = cleanMediaFileTitle(canonicalArchiveUrl);
+    const title = normalizePlaylistUrlTitle("", cleanUrl, archiveFileName);
 
     return {
         id: makePlaylistId(),
         kind: "url",
-        title: getPlaylistUrlTitle(cleanUrl),
+        title,
         url: cleanUrl,
         size: 0,
         type: "direct media URL",
         addedAt: new Date().toISOString(),
+        archiveFileName: archiveFileName || "",
+        directArchiveUrl: canonicalArchiveUrl || "",
+        proxiedArchiveUrl: isScrapeWebsiteArchiveProxyUrl(cleanUrl) ? cleanUrl : "",
     };
 }
 
@@ -2374,8 +2517,13 @@ function getPlaylistItemMeta(item) {
 
     if (item.kind === "url") {
         try {
-            const parsed = new URL(item.url);
-            return `Direct media URL • ${parsed.hostname} • saved across refreshes${health}`;
+            const canonicalUrl = getCanonicalArchiveMediaUrl(item.url);
+            const parsed = new URL(canonicalUrl);
+            const proxyLabel = isScrapeWebsiteArchiveProxyUrl(item.url)
+                ? " • via archive proxy"
+                : "";
+
+            return `Direct media URL • ${parsed.hostname}${proxyLabel} • saved across refreshes${health}`;
         } catch {
             return `Direct media URL • saved across refreshes${health}`;
         }
@@ -2652,15 +2800,20 @@ export default function Audio() {
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
-    const mediaTitle = getMediaDisplayTitle(inputFile, sourceKind, sourceUrl);
+    const activePlaylistItem =
+        activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
+    const mediaTitle = getMediaDisplayTitle(
+        inputFile,
+        sourceKind,
+        sourceUrl,
+        activePlaylistItem?.title
+    );
 
     const progressValue =
         duration > 0 ? clamp((position / duration) * 100, 0, 100) : 0;
 
     const effectiveRate = getEffectivePlaybackRate(settingsView);
     const pitchCents = semitonesToCents(settingsView.pitchSemitones);
-    const activePlaylistItem =
-        activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
     const playlistStatusLabel = getPlaylistStatusLabel(
         repeatEnabled,
         playlist.length,
@@ -4272,7 +4425,7 @@ export default function Audio() {
                 id: item.id,
                 index,
                 kind: "url",
-                title: item.title || getPlaylistUrlTitle(cleanLink),
+                title: normalizePlaylistUrlTitle(item.title, cleanLink, item.archiveFileName),
                 cleanLink,
                 arrayBuffer,
                 metadata,
@@ -4592,7 +4745,7 @@ export default function Audio() {
                 setActivePlaylistIndex(safeIndex);
                 activePlaylistIndexRef.current = safeIndex;
 
-                persistCurrentUrlSnapshot(cleanLink);
+                persistCurrentUrlSnapshot(cleanLink, item.title);
 
                 const cachedPreload = getCachedPlaylistPreload(item);
 
