@@ -2325,7 +2325,9 @@ function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
     }
 
     if (playlistLength > 0 && activeIndex >= 0) {
-        return "Repeat is OFF. The playlist will advance to the next song, skip broken links/files, and wrap back to the first playable track.";
+        return isIOSAudioDevice()
+            ? "Repeat is OFF. After one Start playlist tap, Safari/iOS auto-next stays on the same unlocked audio session, advances to the next song, skips broken links/files, and wraps back to the first playable track."
+            : "Repeat is OFF. The playlist will advance to the next song, skip broken links/files, and wrap back to the first playable track.";
     }
 
     if (playlistLength > 0) {
@@ -2503,6 +2505,7 @@ export default function Audio() {
     const monitorMuteGainRef = useRef(null);
     const outputAudioRef = useRef(null);
     const mediaStreamDestinationRef = useRef(null);
+    const iPhoneSilentKeepAliveRef = useRef(null);
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -2826,7 +2829,75 @@ export default function Audio() {
         }
     }
 
+    function stopIPhoneSilentKeepAlive() {
+        const keepAlive = iPhoneSilentKeepAliveRef.current;
+
+        if (!keepAlive) {
+            return;
+        }
+
+        try {
+            keepAlive.oscillator?.stop();
+        } catch {
+            // Safe to ignore.
+        }
+
+        try {
+            keepAlive.oscillator?.disconnect();
+        } catch {
+            // Safe to ignore.
+        }
+
+        try {
+            keepAlive.gain?.disconnect();
+        } catch {
+            // Safe to ignore.
+        }
+
+        iPhoneSilentKeepAliveRef.current = null;
+    }
+
+    function ensureIPhoneSilentKeepAlive(context, destinationNode) {
+        if (!isIOSAudioDevice() || !context || !destinationNode) {
+            return false;
+        }
+
+        const existing = iPhoneSilentKeepAliveRef.current;
+
+        if (existing?.context === context) {
+            return true;
+        }
+
+        stopIPhoneSilentKeepAlive();
+
+        try {
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+
+            oscillator.type = "sine";
+            oscillator.frequency.value = 18;
+            gain.gain.value = 0.0000001;
+
+            oscillator.connect(gain);
+            gain.connect(destinationNode);
+            oscillator.start();
+
+            iPhoneSilentKeepAliveRef.current = {
+                context,
+                oscillator,
+                gain,
+            };
+
+            return true;
+        } catch {
+            iPhoneSilentKeepAliveRef.current = null;
+            return false;
+        }
+    }
+
     function detachOutputAudioElement() {
+        stopIPhoneSilentKeepAlive();
+
         if (outputAudioRef.current) {
             try {
                 outputAudioRef.current.pause();
@@ -4046,7 +4117,11 @@ export default function Audio() {
 
         try {
             setIsLoading(true);
-            resetDecodedState();
+            resetDecodedStateForPlaylistLoad({
+                fromAutoAdvance: Boolean(options.fromAutoAdvance),
+                fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
+            });
             clearObjectUrl();
 
             if (item.kind === "url") {
@@ -4178,6 +4253,8 @@ export default function Audio() {
                 return loadNextPlayablePlaylistItem(safeIndex + 1, {
                     autoplay,
                     reason: "Previous playlist item failed",
+                    fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                    preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                 });
             }
 
@@ -4247,11 +4324,52 @@ export default function Audio() {
         });
     }
 
-    function playNextPlaylistItem() {
+    async function primeIPhonePlaylistOutputFromGesture() {
+        if (!isIOSAudioDevice()) {
+            return true;
+        }
+
+        try {
+            const { context } = ensureLiveGraph();
+
+            ensureIPhoneSilentKeepAlive(
+                context,
+                mediaStreamDestinationRef.current
+            );
+
+            const contextUnlocked = await unlockMobileAudioContext(context);
+            const elementUnlocked = await unlockOutputAudioElement(outputAudioRef.current);
+
+            if (!contextUnlocked || context.state !== "running" || !elementUnlocked) {
+                throw new Error(buildMobileAudioHint());
+            }
+
+            setInfo(
+                "iPhone/Safari playlist output is unlocked. The queue can auto-advance on this same audio session after this first Start playlist tap."
+            );
+
+            return true;
+        } catch (error) {
+            setError(
+                `Safari/iOS blocked the playlist audio unlock. Tap Start playlist again after the page is focused. ${
+                    error?.message || buildMobileAudioHint()
+                }`
+            );
+            return false;
+        }
+    }
+
+    async function playNextPlaylistItem() {
         const list = playlistRef.current;
 
         if (!list.length) {
             setError("Add uploaded files or direct media links to the playlist first.");
+            return;
+        }
+
+        const primed = await primeIPhonePlaylistOutputFromGesture();
+
+        if (!primed) {
             return;
         }
 
@@ -4261,6 +4379,7 @@ export default function Audio() {
         loadNextPlayablePlaylistItem(nextIndex, {
             autoplay: true,
             reason: "Manual next-track request",
+            preserveUnlockedOutput: isIOSAudioDevice(),
         });
     }
 
@@ -4275,12 +4394,19 @@ export default function Audio() {
         return loadNextPlayablePlaylistItem(0, {
             autoplay: true,
             reason: "Starting playlist from track 1",
+            preserveUnlockedOutput: isIOSAudioDevice(),
         });
     }
 
     async function handlePlaylistPrimaryPlay() {
         if (playingRef.current && activePlaylistIndexRef.current >= 0) {
             pausePlayback();
+            return;
+        }
+
+        const primed = await primeIPhonePlaylistOutputFromGesture();
+
+        if (!primed) {
             return;
         }
 
@@ -4349,8 +4475,10 @@ export default function Audio() {
                 outputAudioRef.current.muted = false;
                 outputAudioRef.current.volume = 1;
                 outputAudioRef.current.playsInline = true;
-                outputAudioRef.current.autoplay = false;
+                outputAudioRef.current.autoplay = true;
             }
+
+            ensureIPhoneSilentKeepAlive(context, mediaStreamDestination);
 
             return;
         }
@@ -4430,6 +4558,11 @@ export default function Audio() {
             const unlocked = await unlockMobileAudioContext(context);
 
             if (isIOSAudioDevice()) {
+                ensureIPhoneSilentKeepAlive(
+                    context,
+                    mediaStreamDestinationRef.current
+                );
+
                 const preserveUnlockedOutput = shouldPreserveIPhonePlaylistOutput(options);
                 const elementUnlocked =
                     preserveUnlockedOutput && isUnlockedIPhoneOutputStillPlaying()
