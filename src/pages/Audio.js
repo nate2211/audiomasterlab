@@ -3574,6 +3574,57 @@ export default function Audio() {
         }
     }
 
+    function forceRestoreAudibleWebAudioOutput(context = audioContextRef.current, nodes = liveNodesRef.current) {
+        const safeSettings = normalizeSettings(latestSettingsRef.current);
+        const safeBaseVolume = Math.max(
+            0.01,
+            nodes?.carPlaySafeMode ? Math.min(safeSettings.baseVolume, 1) : safeSettings.baseVolume
+        );
+        const now = context?.currentTime || 0;
+
+        mutedRef.current = false;
+        setIsMuted(false);
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(monitorMuteGainRef.current.gain, 1, now, 0.015);
+            }
+        } catch {
+            // Best-effort lock-screen output recovery.
+        }
+
+        try {
+            if (nodes?.baseVolumeGain?.gain) {
+                setAudioParam(nodes.baseVolumeGain.gain, safeBaseVolume, now, 0.015);
+            }
+        } catch {
+            // Best-effort lock-screen output recovery.
+        }
+
+        const element = outputAudioRef.current;
+
+        if (element && isIOSAudioDevice()) {
+            try {
+                element.muted = false;
+                element.defaultMuted = false;
+                element.volume = 1;
+                element.playsInline = true;
+                element.autoplay = true;
+                element.preload = "auto";
+                element.removeAttribute("muted");
+                element.setAttribute("playsinline", "");
+                element.setAttribute("webkit-playsinline", "");
+            } catch {
+                // Some iOS/WebView builds can reject element mutations while locked.
+            }
+        }
+
+        applySettingsToNodes(nodes, safeSettings, now);
+        applyMonitorMute(false);
+
+        return safeBaseVolume;
+    }
+
     function attachOutputElementToCurrentStream(element = outputAudioRef.current, forcedStream = null) {
         if (!element || !isIOSAudioDevice()) {
             return false;
@@ -3617,6 +3668,8 @@ export default function Audio() {
             element.setAttribute("playsinline", "");
             element.setAttribute("webkit-playsinline", "");
             element.removeAttribute("muted");
+
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
 
             return true;
         } catch {
@@ -3669,9 +3722,11 @@ export default function Audio() {
                 element,
                 mediaStreamDestinationRef.current?.stream || null
             );
+            forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
 
             if (!isIPhoneOutputRouteArmed()) {
                 await unlockOutputElementForAppAction(element);
+                forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
             }
 
             if (context.state !== "running") {
@@ -3747,6 +3802,8 @@ export default function Audio() {
                 // Safe to ignore unsupported element mutations.
             }
 
+            forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
+
             if (
                 element.paused ||
                 element.ended ||
@@ -3821,12 +3878,16 @@ export default function Audio() {
         let outputAlreadyRestarted = false;
 
         if (isIPhoneLockScreenPlay) {
+            const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Play"
             );
+            forceRestoreAudibleWebAudioOutput(context, nodes);
         }
 
         if (playingRef.current && activeSourceRef.current) {
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             updateMediaSessionState("playing");
             return true;
         }
@@ -3836,6 +3897,7 @@ export default function Audio() {
             const mediaPosition = getMediaSessionPosition();
             const shouldRestartFromBeginning =
                 shouldRestartAfterLockScreenStop ||
+                startedOffsetRef.current <= 0.01 ||
                 (mediaDuration > 0 && mediaPosition >= Math.max(0, mediaDuration - 0.25));
 
             return startBufferPlayback(shouldRestartFromBeginning, {
@@ -3870,7 +3932,15 @@ export default function Audio() {
     async function pauseFromMediaSession() {
         if (playingRef.current) {
             pausePlayback();
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             return true;
+        }
+
+        if (isIOSAudioDevice()) {
+            await keepIPhoneOutputElementAliveForLockScreen(
+                "Lock-screen Pause kept the hidden iPhone stream alive so Play can restart with volume"
+            );
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
         }
 
         updateMediaSessionState("paused");
@@ -3889,16 +3959,18 @@ export default function Audio() {
         }
 
         if (keepIOSOutputAvailableForRestart) {
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             const held = await keepIPhoneOutputElementAliveForLockScreen(
                 "Lock-screen Stop reset the song but kept the iPhone lock-screen audio route alive for restart"
             );
+            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
 
             iPhoneOutputHeldForLockScreenRestartRef.current = held;
             iPhoneLockScreenOutputArmedRef.current = held;
             updateMediaSessionState("paused");
             setInfo(
                 held
-                    ? "Lock-screen Stop reset WebAudio to the beginning and kept the hidden iPhone output route alive silently, so lock-screen Play can restart without unlocking the phone."
+                    ? "Lock-screen Stop reset WebAudio to the beginning, restored the hidden output volume path, and kept the iPhone stream alive silently so lock-screen Play can restart without unlocking the phone."
                     : "Lock-screen Stop reset WebAudio to the beginning. iOS did not keep the hidden output route alive, so open the page once and press Play if lock-screen Play cannot restart."
             );
             return true;
@@ -3915,9 +3987,12 @@ export default function Audio() {
         let outputAlreadyRestarted = false;
 
         if (isIPhoneLockScreenAction) {
+            const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Next"
             );
+            forceRestoreAudibleWebAudioOutput(context, nodes);
         }
 
         if (!Array.isArray(list) || !list.length) {
@@ -3956,9 +4031,12 @@ export default function Audio() {
         let outputAlreadyRestarted = false;
 
         if (isIPhoneLockScreenAction) {
+            const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Previous"
             );
+            forceRestoreAudibleWebAudioOutput(context, nodes);
         }
 
         if (!Array.isArray(list) || !list.length) {
@@ -3993,9 +4071,12 @@ export default function Audio() {
         let outputAlreadyRestarted = false;
 
         if (isIOSAudioDevice() && shouldResume) {
+            const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Seek"
             );
+            forceRestoreAudibleWebAudioOutput(context, nodes);
         }
 
         await seekTo(nextPosition, shouldResume, {
@@ -4033,6 +4114,8 @@ export default function Audio() {
             return runMediaSessionAction("Lock-screen Stop", stopFromMediaSession);
         });
 
+        // Hardware keys, Bluetooth controls, CarPlay controls, and iOS lock-screen
+        // transport buttons use these exact Media Session action names.
         safeSetAction("nexttrack", () => {
             return runMediaSessionAction("Lock-screen Next", nextTrackFromMediaSession);
         });
@@ -6037,13 +6120,18 @@ export default function Audio() {
             throw new Error("This browser does not support the Web Audio API.");
         }
 
-        if (!audioContextRef.current) {
+        if (!audioContextRef.current || audioContextRef.current.state === "closed") {
             audioContextRef.current = new AudioContextClass({
                 latencyHint:
                     carPlaySafeModeRef.current && isIOSAudioDevice()
                         ? "playback"
                         : "interactive",
             });
+            liveNodesRef.current = null;
+            analyserRef.current = null;
+            monitorMuteGainRef.current = null;
+            mediaStreamDestinationRef.current = null;
+            iPhoneSilentKeepAliveRef.current = null;
         }
 
         const context = audioContextRef.current;
@@ -6105,6 +6193,7 @@ export default function Audio() {
 
         try {
             const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
             const unlocked = await unlockMobileAudioContext(context);
 
             if (isIOSAudioDevice()) {
@@ -6201,6 +6290,7 @@ export default function Audio() {
             };
 
             source.start(0, safeOffset);
+            forceRestoreAudibleWebAudioOutput(context, nodes);
 
             if (isIOSAudioDevice()) {
                 const outputConfirmed = await confirmIPhoneOutputAfterSourceStart(context, {
@@ -6273,8 +6363,9 @@ export default function Audio() {
             keepAlive: true,
             reason: "Paused WebAudio while keeping iPhone lock-screen output armed",
         });
+        forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
 
-        setInfo("Playback paused. Press Play to create a new source from this position.");
+        setInfo("Playback paused. Press Play to create a new WebAudio source from this position with the output volume path restored.");
     }
 
     async function handlePlayPause() {
