@@ -778,7 +778,7 @@ function getPlayableFiles(
     allowZipInternalPaths,
     useArchiveProxy = false
 ) {
-    const playableFiles = files
+    const playableFiles = (Array.isArray(files) ? files : [])
         .filter((file) => file?.name)
         .filter((file) => isAudioFile(file.name))
         .filter((file) => !isSkipFile(file.name))
@@ -809,7 +809,19 @@ function getPlayableFiles(
             };
         });
 
-    return dedupeArchiveFiles(playableFiles).slice(0, 20);
+    // Important: do not slice this list.
+    // Archive items/collections can contain more than 20 playable files, and
+    // cutting here was the main reason only part of a collection appeared.
+    return dedupeArchiveFiles(playableFiles);
+}
+
+function mergeForcedAndMetadataPlayableFiles(forcedFiles = [], metadataFiles = []) {
+    // Pasted direct audio URLs should appear first, but the rest of the Archive
+    // item's playable files should still load underneath them.
+    return dedupeArchiveFiles([
+        ...(Array.isArray(forcedFiles) ? forcedFiles : []),
+        ...(Array.isArray(metadataFiles) ? metadataFiles : []),
+    ]);
 }
 function stripUrlPunctuation(value) {
     return String(value || "").replace(/[),.;\]]+$/g, "");
@@ -1181,6 +1193,7 @@ async function buildArchiveResultFromMetadata({
                                                   allowZipInternalPaths,
                                                   signal,
                                                   useArchiveProxy = false,
+                                                  allowDirectUrlResult = false,
                                               }) {
     const metadataData = await fetchArchiveMetadata(
         identifier,
@@ -1207,18 +1220,22 @@ async function buildArchiveResultFromMetadata({
         selectedCollections
     );
 
-    if (!rightsSafer) {
+    // Normal search remains rights/collection filtered. Direct URL mode can still
+    // show the exact item the user pasted, but the UI labels it as not verified.
+    if (!rightsSafer && !allowDirectUrlResult) {
         return null;
     }
 
+    const metadataPlayableFiles = getPlayableFiles(
+        identifier,
+        metadataFiles,
+        allowZipInternalPaths,
+        useArchiveProxy
+    );
+
     const playableFiles = forcedFiles.length
-        ? forcedFiles
-        : getPlayableFiles(
-            identifier,
-            metadataFiles,
-            allowZipInternalPaths,
-            useArchiveProxy
-        );
+        ? mergeForcedAndMetadataPlayableFiles(forcedFiles, metadataPlayableFiles)
+        : metadataPlayableFiles;
 
     if (!playableFiles.length) {
         return null;
@@ -1234,6 +1251,8 @@ async function buildArchiveResultFromMetadata({
             .slice(0, 260),
         collection: Array.from(new Set(getItemCollections(itemLike, metadata))),
         license: getLicense(metadata),
+        rightsVerified: rightsSafer,
+        directUrlResult: Boolean(allowDirectUrlResult),
         downloads: "",
         detailsUrl: buildDetailsUrl(identifier),
         images: getArchiveItemImages(
@@ -1316,6 +1335,7 @@ async function loadDirectArchiveAudioLinks({
                 allowZipInternalPaths,
                 signal,
                 useArchiveProxy,
+                allowDirectUrlResult: true,
             });
             if (result) {
                 results.push(result);
@@ -1455,6 +1475,8 @@ async function searchSafeAudio({
                     .slice(0, 260),
                 collection: Array.from(new Set(getItemCollections(item, metadata))),
                 license: getLicense(metadata),
+                rightsVerified: true,
+                directUrlResult: false,
                 downloads: item.downloads || "",
                 detailsUrl: buildDetailsUrl(item.identifier),
                 images: getArchiveItemImages(
@@ -1466,9 +1488,8 @@ async function searchSafeAudio({
                 files: playableFiles,
             });
 
-            if (results.length >= 50) {
-                break;
-            }
+            // Do not stop at 50. The Archive scrape page already caps the
+            // request batch, and every returned item may contain multiple files.
         } catch (err) {
             if (isAbortError(err)) {
                 throw err;
@@ -1738,6 +1759,28 @@ export default function ArchiveAudioBrowser() {
         );
     }
 
+    function createPlaylistItemFromArchiveFile(file) {
+        const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
+
+        if (!selectedUrl) {
+            return null;
+        }
+
+        return {
+            id: makeArchivePlaylistId(),
+            kind: "url",
+            title: getArchiveAudioPlaylistTitle(file),
+            url: selectedUrl,
+            size: 0,
+            type: "direct media URL",
+            addedAt: new Date().toISOString(),
+            source: "archive.org",
+            archiveFileName: file?.name || "",
+            archiveServeUrl: file?.serveUrl || "",
+            archiveDownloadUrl: file?.downloadUrl || "",
+        };
+    }
+
     function addArchiveFileToAudioPlaylist(file) {
         const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
 
@@ -1759,19 +1802,12 @@ export default function ArchiveAudioBrowser() {
                 return;
             }
 
-            const nextItem = {
-                id: makeArchivePlaylistId(),
-                kind: "url",
-                title: getArchiveAudioPlaylistTitle(file),
-                url: selectedUrl,
-                size: 0,
-                type: "direct media URL",
-                addedAt: new Date().toISOString(),
-                source: "archive.org",
-                archiveFileName: file?.name || "",
-                archiveServeUrl: file?.serveUrl || "",
-                archiveDownloadUrl: file?.downloadUrl || "",
-            };
+            const nextItem = createPlaylistItemFromArchiveFile(file);
+
+            if (!nextItem) {
+                setError("No playable Archive audio link was found for this file.");
+                return;
+            }
 
             const saved = writeAudioPlaylistToStorage([...playlist, nextItem]);
 
@@ -1785,6 +1821,60 @@ export default function ArchiveAudioBrowser() {
         } catch {
             setError("Could not add this Archive song to your Audio playlist.");
         }
+    }
+
+    function addArchiveFilesToAudioPlaylist(files = [], label = "Archive files") {
+        const playableFiles = dedupeArchiveFiles(files).filter(
+            (file) => file?.serveUrl || file?.url || file?.downloadUrl
+        );
+
+        if (!playableFiles.length) {
+            setError("No playable Archive audio links were found.");
+            return;
+        }
+
+        try {
+            const playlist = readAudioPlaylistFromStorage();
+            const existingUrls = new Set(
+                playlist
+                    .filter((item) => item?.kind === "url" && item?.url)
+                    .map((item) => item.url)
+            );
+
+            const newItems = playableFiles
+                .filter((file) => {
+                    const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
+                    return selectedUrl && !existingUrls.has(selectedUrl);
+                })
+                .map(createPlaylistItemFromArchiveFile)
+                .filter(Boolean);
+
+            if (!newItems.length) {
+                setStatus(`All ${playableFiles.length} ${label} are already in your Audio playlist.`);
+                setError("");
+                return;
+            }
+
+            const saved = writeAudioPlaylistToStorage([...playlist, ...newItems]);
+
+            if (!saved) {
+                setError("Could not save to playlist. Browser storage may be blocked.");
+                return;
+            }
+
+            setError("");
+            setStatus(`Added ${newItems.length} ${label} to your Audio playlist.`);
+        } catch {
+            setError(`Could not add ${label} to your Audio playlist.`);
+        }
+    }
+
+    function addAllVisibleArchiveFilesToPlaylist() {
+        const files = results.flatMap((item) =>
+            Array.isArray(item.files) ? item.files : []
+        );
+
+        addArchiveFilesToAudioPlaylist(files, "visible Archive file(s)");
     }
 
     async function copyText(value) {
@@ -1985,7 +2075,7 @@ export default function ArchiveAudioBrowser() {
                 data.cursorReset
                     ? `Archive reset an expired cursor for "${safeQuery}". Results stayed on the current query; press Search Archive Audio for a fresh first page.`
                     : data.directLinkMode
-                        ? `Loaded ${incomingResults.length} rights-filtered direct Archive item(s)${archiveRouteLabel}.`
+                        ? `Loaded ${incomingResults.length} direct Archive item(s)${archiveRouteLabel}, including all playable files found in each item.`
                         : incomingResults.length
                             ? isLoadMore
                                 ? `Added ${incomingResults.length} more Archive item(s)${archiveRouteLabel}.`
@@ -2269,11 +2359,24 @@ export default function ArchiveAudioBrowser() {
                 {copiedUrl && <Alert severity="info">Copied direct audio link.</Alert>}
 
                 {!!results.length && (
-                    <Stack direction="row" spacing={1} flexWrap="wrap">
+                    <Stack
+                        direction="row"
+                        spacing={1}
+                        flexWrap="wrap"
+                        alignItems="center"
+                    >
                         <Chip label={`${results.length} item(s)`} color="primary" />
                         <Chip label={`${totalPlayableFiles} playable file(s)`} />
                         <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
                         <Chip label={`Next cursor: ${nextCursor ? "available" : "none"}`} />
+                        <Button
+                            size="small"
+                            variant="outlined"
+                            startIcon={<PlaylistAddRoundedIcon />}
+                            onClick={addAllVisibleArchiveFilesToPlaylist}
+                        >
+                            Add all visible files to playlist
+                        </Button>
                     </Stack>
                 )}
 
@@ -2305,16 +2408,41 @@ export default function ArchiveAudioBrowser() {
                                                 {item.date ? ` • ${item.date}` : ""}
                                                 {item.downloads ? ` • ${item.downloads} downloads` : ""}
                                             </Typography>
+
+                                            <Typography variant="caption" color="text.secondary">
+                                                Loaded {Array.isArray(item.files) ? item.files.length : 0} playable file(s) from this Archive item.
+                                            </Typography>
                                         </Box>
 
-                                        <Button
-                                            href={item.detailsUrl}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            endIcon={<OpenInNewRoundedIcon />}
+                                        <Stack
+                                            direction={{ xs: "column", sm: "row" }}
+                                            spacing={1}
+                                            alignItems={{ xs: "stretch", sm: "center" }}
                                         >
-                                            Archive page
-                                        </Button>
+                                            <Button
+                                                size="small"
+                                                variant="outlined"
+                                                startIcon={<PlaylistAddRoundedIcon />}
+                                                disabled={!Array.isArray(item.files) || !item.files.length}
+                                                onClick={() =>
+                                                    addArchiveFilesToAudioPlaylist(
+                                                        item.files,
+                                                        `file(s) from "${item.title || item.identifier}"`
+                                                    )
+                                                }
+                                            >
+                                                Add all item files
+                                            </Button>
+
+                                            <Button
+                                                href={item.detailsUrl}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                endIcon={<OpenInNewRoundedIcon />}
+                                            >
+                                                Archive page
+                                            </Button>
+                                        </Stack>
                                     </Stack>
 
                                     {!!item.images?.[0] && (
@@ -2375,9 +2503,15 @@ export default function ArchiveAudioBrowser() {
                                         </Typography>
                                     )}
 
-                                    <Typography variant="caption" color="text.secondary">
+                                    <Typography
+                                        variant="caption"
+                                        color={item.rightsVerified === false ? "warning.main" : "text.secondary"}
+                                    >
                                         License / rights:{" "}
-                                        {item.license || "Not listed — verify before reuse."}
+                                        {item.license ||
+                                            (item.directUrlResult
+                                                ? "Direct URL result — rights were not verified by AudioMaster Lab. Only use audio you own or have permission to use."
+                                                : "Not listed — verify before reuse.")}
                                     </Typography>
 
                                     <Stack direction="row" spacing={1} flexWrap="wrap">
