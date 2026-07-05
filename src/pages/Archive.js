@@ -39,6 +39,15 @@ const AUDIO_EXTENSIONS = [
     ".webm",
 ];
 
+const IMAGE_EXTENSIONS = [
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+];
+
 const ARCHIVE_SKIP_EXTENSIONS = [
     ".zip",
     ".rar",
@@ -425,6 +434,12 @@ function isAudioFile(name = "") {
     return AUDIO_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
+function isImageFile(name = "") {
+    const lower = getLowerFileName(name);
+
+    return IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
 function isSkipFile(name = "") {
     const lower = getLowerFileName(name);
 
@@ -498,6 +513,107 @@ function buildServeUrl(identifier, fileName) {
         identifier
     )}/${encodeArchivePath(fileName)}`;
 }
+
+function buildArchiveImageServiceUrl(identifier) {
+    return `https://archive.org/services/img/${encodeURIComponent(identifier)}`;
+}
+
+function isArchiveWaveformImage(file = {}) {
+    const lowerName = getLowerFileName(file.name);
+    const format = String(file.format || "").toLowerCase();
+    const source = String(file.source || "").toLowerCase();
+    const combined = `${lowerName} ${format} ${source}`;
+
+    return (
+        /(^|[\s_.\-/])(spectrogram|spectrograph|spectrum|spectral|sonogram|waveform|waveforms|frequency|freq|oscilloscope)([\s_.\-/]|$)/i.test(combined) ||
+        /_spectrogram\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName) ||
+        /_waveform\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName)
+    );
+}
+
+function getArchiveImageScore(file = {}) {
+    if (isArchiveWaveformImage(file)) return -10000;
+
+    const lowerName = getLowerFileName(file.name);
+    const format = String(file.format || "").toLowerCase();
+    let score = 10;
+
+    if (/\b(cover|front|folder|artwork|album|poster)\b/i.test(lowerName)) score += 120;
+    if (lowerName.includes("__ia_thumb")) score += 95;
+    if (format.includes("item tile")) score += 90;
+    if (format.includes("jpeg thumb") || format.includes("thumbnail")) score += 85;
+    if (/\b(thumb|image|scan|jacket|sleeve)\b/i.test(lowerName)) score += 70;
+    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) score += 12;
+    if (lowerName.endsWith(".webp")) score += 10;
+    if (lowerName.endsWith(".png")) score += 4;
+    if (lowerName.endsWith(".gif")) score -= 20;
+
+    const size = Number(file.size);
+    if (Number.isFinite(size) && size > 0) {
+        if (size < 1500) score -= 45;
+        if (size > 5000) score += 8;
+        if (size > 25000) score += 6;
+        if (size > 2500000) score -= 12;
+    }
+
+    return score;
+}
+
+function getArchiveItemImages(
+    identifier,
+    metadata = {},
+    files = [],
+    useArchiveProxy = false
+) {
+    const title = metadata.title || identifier || "Archive item";
+    const serviceImageUrl = buildArchiveImageServiceUrl(identifier);
+
+    const metadataImages = (Array.isArray(files) ? files : [])
+        .filter((file) => file?.name)
+        .filter((file) => isImageFile(file.name))
+        .filter((file) => !hasBlockedTerm(file.name))
+        .filter((file) => !isZipInternalPath(file.name))
+        .filter((file) => !isArchiveWaveformImage(file))
+        .map((file) => {
+            const directUrl = buildDownloadUrl(identifier, file.name);
+            const imageUrl = buildArchiveProxyUrl(directUrl, useArchiveProxy);
+
+            return {
+                name: file.name,
+                format: file.format || "",
+                size: file.size || "",
+                source: file.source || "archive metadata",
+                url: imageUrl,
+                imageUrl,
+                directUrl,
+                proxied: Boolean(useArchiveProxy),
+                alt: `${title} artwork from Archive.org`,
+                score: getArchiveImageScore(file),
+            };
+        })
+        .filter((image) => image.score > -1000)
+        .sort((a, b) => b.score - a.score);
+
+    if (metadataImages.length) {
+        return dedupeArchiveImages(metadataImages).slice(0, 1);
+    }
+
+    const serviceImage = {
+        name: "Archive item thumbnail",
+        format: "Archive thumbnail fallback",
+        size: "",
+        source: "archive services image",
+        url: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
+        imageUrl: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
+        directUrl: serviceImageUrl,
+        proxied: Boolean(useArchiveProxy),
+        alt: `${title} Archive.org thumbnail`,
+        score: 1,
+    };
+
+    return dedupeArchiveImages([serviceImage]).slice(0, 1);
+}
+
 function looksRightsSafer(item = {}, metadata = {}, selectedCollections = []) {
     const combined = getMetadataText(item, metadata);
 
@@ -1120,6 +1236,12 @@ async function buildArchiveResultFromMetadata({
         license: getLicense(metadata),
         downloads: "",
         detailsUrl: buildDetailsUrl(identifier),
+        images: getArchiveItemImages(
+            identifier,
+            metadata,
+            metadataFiles,
+            useArchiveProxy
+        ),
         files: playableFiles,
     };
 }
@@ -1335,6 +1457,12 @@ async function searchSafeAudio({
                 license: getLicense(metadata),
                 downloads: item.downloads || "",
                 detailsUrl: buildDetailsUrl(item.identifier),
+                images: getArchiveItemImages(
+                    item.identifier,
+                    metadata,
+                    files,
+                    useArchiveProxy
+                ),
                 files: playableFiles,
             });
 
@@ -1380,6 +1508,28 @@ function makeArchiveFileKey(file = {}) {
     return String(file?.serveUrl || file?.url || file?.downloadUrl || file?.name || "");
 }
 
+function makeArchiveImageKey(image = {}) {
+    return String(image?.imageUrl || image?.url || image?.directUrl || image?.name || "");
+}
+
+function dedupeArchiveImages(images = []) {
+    const seen = new Set();
+    const uniqueImages = [];
+
+    for (const image of Array.isArray(images) ? images : []) {
+        const key = makeArchiveImageKey(image);
+
+        if (!key || seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        uniqueImages.push(image);
+    }
+
+    return uniqueImages;
+}
+
 function dedupeArchiveFiles(files = []) {
     const seen = new Set();
     const uniqueFiles = [];
@@ -1412,6 +1562,7 @@ function dedupeArchiveResults(items = []) {
         seen.add(key);
         uniqueItems.push({
             ...item,
+            images: dedupeArchiveImages(item.images),
             files: dedupeArchiveFiles(item.files),
         });
     }
@@ -1423,6 +1574,10 @@ function stampArchiveResults(items = [], searchSignature = "") {
     return dedupeArchiveResults(items).map((item) => ({
         ...item,
         searchSignature,
+        images: dedupeArchiveImages(item.images).map((image) => ({
+            ...image,
+            searchSignature,
+        })),
         files: dedupeArchiveFiles(item.files).map((file) => ({
             ...file,
             searchSignature,
@@ -2161,6 +2316,58 @@ export default function ArchiveAudioBrowser() {
                                             Archive page
                                         </Button>
                                     </Stack>
+
+                                    {!!item.images?.[0] && (
+                                        <Card
+                                            variant="outlined"
+                                            sx={{
+                                                borderRadius: 3,
+                                                bgcolor: "background.default",
+                                                overflow: "hidden",
+                                            }}
+                                        >
+                                            <Box
+                                                component="img"
+                                                src={item.images[0].imageUrl || item.images[0].url}
+                                                alt={item.images[0].alt || `${item.title} Archive thumbnail`}
+                                                loading="lazy"
+                                                referrerPolicy="no-referrer"
+                                                onError={(event) => {
+                                                    event.currentTarget.style.display = "none";
+                                                }}
+                                                sx={{
+                                                    width: "100%",
+                                                    height: { xs: 220, sm: 280 },
+                                                    objectFit: "contain",
+                                                    objectPosition: "center",
+                                                    display: "block",
+                                                    bgcolor: "background.paper",
+                                                }}
+                                            />
+
+                                            <CardContent sx={{ p: 1.5, "&:last-child": { pb: 1.5 } }}>
+                                                <Stack
+                                                    direction={{ xs: "column", sm: "row" }}
+                                                    spacing={1}
+                                                    justifyContent="space-between"
+                                                    alignItems={{ xs: "flex-start", sm: "center" }}
+                                                >
+                                                    <Typography variant="body2" sx={{ fontWeight: 900 }}>
+                                                        Archive thumbnail
+                                                    </Typography>
+
+                                                    <Typography
+                                                        variant="caption"
+                                                        color="text.secondary"
+                                                        sx={{ wordBreak: "break-word" }}
+                                                    >
+                                                        {item.images[0].name || "Archive item thumbnail"}
+                                                        {item.images[0].proxied ? " • proxied" : ""}
+                                                    </Typography>
+                                                </Stack>
+                                            </CardContent>
+                                        </Card>
+                                    )}
 
                                     {item.description && (
                                         <Typography variant="body2" color="text.secondary">

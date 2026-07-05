@@ -3406,7 +3406,12 @@ export default function Audio() {
         }
 
         const mediaDuration = getMediaSessionDuration();
-        const safeState = hasMediaRef.current || audioBufferRef.current ? nextState : "none";
+        const hasPlayableMediaSessionTarget = Boolean(
+            hasMediaRef.current ||
+            audioBufferRef.current ||
+            (Array.isArray(playlistRef.current) && playlistRef.current.length > 0)
+        );
+        const safeState = hasPlayableMediaSessionTarget ? nextState : "none";
 
         try {
             navigator.mediaSession.playbackState = safeState;
@@ -3719,6 +3724,7 @@ export default function Audio() {
                 autoplay: true,
                 reason: "Lock-screen play request",
                 preserveUnlockedOutput: true,
+                fromMediaSession: true,
                 outputAlreadyRestarted: isIPhoneLockScreenPlay,
             });
         }
@@ -3740,21 +3746,47 @@ export default function Audio() {
 
     async function stopFromMediaSession() {
         if (audioBufferRef.current || playingRef.current) {
-            stopPlayback(false);
+            stopPlayback(true, {
+                fromMediaSessionStop: true,
+                stopIPhoneOutputStream: true,
+            });
+        } else if (isIOSAudioDevice()) {
+            pauseOutputElementForAppAction({
+                keepAlive: false,
+                reason: "Lock-screen Stop paused the hidden iPhone media stream",
+            });
         }
 
+        iPhoneLockScreenOutputArmedRef.current = false;
         updateMediaSessionState("paused");
+        setInfo(
+            isIOSAudioDevice()
+                ? "Lock-screen Stop stopped WebAudio, reset the track position, and paused the hidden iPhone media stream. Press lock-screen Play to re-arm and restart from the beginning."
+                : "Lock-screen Stop stopped playback and reset the track position."
+        );
         return true;
     }
 
     async function nextTrackFromMediaSession() {
         const list = playlistRef.current;
+        const isIPhoneLockScreenAction = isIOSAudioDevice();
+        let outputAlreadyRestarted = false;
+
+        if (isIPhoneLockScreenAction) {
+            outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
+                "Lock-screen Next"
+            );
+        }
 
         if (!Array.isArray(list) || !list.length) {
             const mediaDuration = getMediaSessionDuration();
 
             if (mediaDuration > 0) {
-                await seekTo(mediaDuration, false);
+                await seekTo(mediaDuration, false, {
+                    fromMediaSession: true,
+                    preserveUnlockedOutput: true,
+                    outputAlreadyRestarted,
+                });
             }
 
             setInfo("No playlist is loaded, so lock-screen Next moved to the end of the current media.");
@@ -3768,19 +3800,29 @@ export default function Audio() {
             autoplay: true,
             reason: "Lock-screen next-track request",
             preserveUnlockedOutput: true,
+            fromMediaSession: true,
+            outputAlreadyRestarted,
         });
     }
 
     async function previousTrackFromMediaSession() {
         const list = playlistRef.current;
-        const currentOffset = getMediaSessionPosition();
         const wasPlaying = playingRef.current;
+        const isIPhoneLockScreenAction = isIOSAudioDevice();
+        let outputAlreadyRestarted = false;
 
-        // Match native music-player behavior: if the current song has played for
-        // a few seconds, Previous restarts it. If already near the beginning,
-        // Previous moves to the prior playlist item.
-        if (currentOffset > 3 || !Array.isArray(list) || list.length <= 1) {
-            await seekTo(0, wasPlaying);
+        if (isIPhoneLockScreenAction) {
+            outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
+                "Lock-screen Previous"
+            );
+        }
+
+        if (!Array.isArray(list) || !list.length) {
+            await seekTo(0, wasPlaying, {
+                fromMediaSession: true,
+                preserveUnlockedOutput: true,
+                outputAlreadyRestarted,
+            });
             return true;
         }
 
@@ -3791,6 +3833,8 @@ export default function Audio() {
             autoplay: true,
             reason: "Lock-screen previous-track request",
             preserveUnlockedOutput: true,
+            fromMediaSession: true,
+            outputAlreadyRestarted,
         });
     }
 
@@ -3800,7 +3844,19 @@ export default function Audio() {
             ? clamp(numberOrDefault(targetSeconds, 0), 0, mediaDuration)
             : Math.max(0, numberOrDefault(targetSeconds, 0));
 
-        await seekTo(nextPosition, shouldResume);
+        let outputAlreadyRestarted = false;
+
+        if (isIOSAudioDevice() && shouldResume) {
+            outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
+                "Lock-screen Seek"
+            );
+        }
+
+        await seekTo(nextPosition, shouldResume, {
+            fromMediaSession: true,
+            preserveUnlockedOutput: true,
+            outputAlreadyRestarted,
+        });
         updateMediaSessionState(playingRef.current ? "playing" : "paused");
         return true;
     }
@@ -4470,21 +4526,34 @@ export default function Audio() {
         activeSourceRef.current = null;
     }
 
-    function stopPlayback(resetToBeginning = true) {
+    function stopPlayback(resetToBeginning = true, options = {}) {
         manualStopRef.current = true;
         stopActiveSource();
         stopPositionTimer();
         stopVisualizer();
         setPlayingState(false);
 
+        const shouldStopIPhoneOutputStream = Boolean(
+            options.stopIPhoneOutputStream ||
+            options.fromMediaSessionStop ||
+            options.fromLockScreenStop
+        );
+
         if (resetToBeginning) {
             pauseOutputElementForAppAction({
-                keepAlive: true,
-                reason: "Stopped WebAudio while keeping iPhone lock-screen output armed",
+                keepAlive: !shouldStopIPhoneOutputStream,
+                reason: shouldStopIPhoneOutputStream
+                    ? "Lock-screen Stop paused the hidden iPhone media stream and reset WebAudio to the beginning"
+                    : "Stopped WebAudio while keeping iPhone lock-screen output armed",
             });
             startedOffsetRef.current = 0;
             startedAtContextTimeRef.current = 0;
             setPosition(0);
+        } else if (shouldStopIPhoneOutputStream) {
+            pauseOutputElementForAppAction({
+                keepAlive: false,
+                reason: "Lock-screen Stop paused the hidden iPhone media stream",
+            });
         }
 
         updateMediaSessionState("paused");
@@ -5268,6 +5337,8 @@ export default function Audio() {
             reason = "playlist advance",
             fromPlaybackEnded = false,
             preserveUnlockedOutput = false,
+            fromMediaSession = false,
+            outputAlreadyRestarted = false,
         } = {}
     ) {
         const list = playlistRef.current;
@@ -5312,6 +5383,8 @@ export default function Audio() {
                 fromAutoAdvance: true,
                 fromPlaybackEnded,
                 preserveUnlockedOutput,
+                fromMediaSession,
+                outputAlreadyRestarted,
                 attemptNumber: step + 1,
                 maxAttempts: list.length,
             });
@@ -5389,6 +5462,7 @@ export default function Audio() {
                         startBufferPlayback(true, {
                             fromAutoAdvance: Boolean(options.fromAutoAdvance),
                             fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                            fromMediaSession: Boolean(options.fromMediaSession),
                             preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                             outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                         }).then((started) => {
@@ -5401,6 +5475,7 @@ export default function Audio() {
                                     autoplay: true,
                                     reason: "Loaded track could not start, so recovery is moving to the next item",
                                     fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                                    fromMediaSession: Boolean(options.fromMediaSession),
                                     preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                                     outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                                 });
@@ -5418,6 +5493,7 @@ export default function Audio() {
             resetDecodedStateForPlaylistLoad({
                 fromAutoAdvance: Boolean(options.fromAutoAdvance),
                 fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                fromMediaSession: Boolean(options.fromMediaSession),
                 preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
             });
             clearObjectUrl();
@@ -5552,7 +5628,9 @@ export default function Audio() {
                     autoplay,
                     reason: "Previous playlist item failed",
                     fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                    fromMediaSession: Boolean(options.fromMediaSession),
                     preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
+                    outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                 });
             }
 
@@ -6032,7 +6110,7 @@ export default function Audio() {
         await startBufferPlayback(true);
     }
 
-    async function seekTo(seconds, shouldResume) {
+    async function seekTo(seconds, shouldResume, options = {}) {
         const buffer = audioBufferRef.current;
 
         if (!buffer) return;
@@ -6051,7 +6129,11 @@ export default function Audio() {
         setPlayingState(false);
 
         if (shouldResume && nextOffset < buffer.duration) {
-            await startBufferPlayback(false);
+            await startBufferPlayback(false, {
+                fromMediaSession: Boolean(options.fromMediaSession),
+                preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
+                outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+            });
             setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
         } else {
             setInfo(`Scrubbed to ${formatTime(nextOffset)}.`);
