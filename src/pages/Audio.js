@@ -2964,6 +2964,9 @@ export default function Audio() {
     const mediaSessionPlayRestartTokenRef = useRef(0);
     const lastMediaSessionPlayRestartAtRef = useRef(0);
     const lastMediaSessionPauseAtRef = useRef(0);
+    const pauseActionInFlightRef = useRef(false);
+    const ignoreOutputPauseUntilRef = useRef(0);
+    const pauseReleaseTimerRef = useRef(null);
     const mediaSessionActionQueueRef = useRef(Promise.resolve());
     const mediaSessionActionSerialRef = useRef(0);
     const iPhoneLockScreenOutputArmedRef = useRef(false);
@@ -3154,6 +3157,7 @@ export default function Audio() {
             stopPlayback(false);
             stopVisualizer();
             clearCarPlayRecoveryTimer();
+            clearPauseReleaseTimer();
             clearMediaSession();
 
             if (objectUrlRef.current) {
@@ -3253,14 +3257,14 @@ export default function Audio() {
         };
 
         const handleOutputPause = () => {
-            if (outputElementActionGuardRef.current) {
+            if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
                 updateMediaSessionState(playingRef.current ? "playing" : "paused");
                 return;
             }
 
             const now = Date.now();
 
-            if (now - lastMediaSessionPauseAtRef.current < 900) {
+            if (now - lastMediaSessionPauseAtRef.current < 1100) {
                 updateMediaSessionState(playingRef.current ? "playing" : "paused");
                 return;
             }
@@ -3271,13 +3275,10 @@ export default function Audio() {
                 return;
             }
 
-            keepIPhoneOutputElementAliveForLockScreen(
-                iPhoneOutputHeldForLockScreenRestartRef.current
-                    ? "iOS tried to pause the hidden output after lock-screen Stop; re-arming it for restart"
-                    : "iOS paused the hidden output element while WebAudio was paused"
-            ).catch(() => {
-                iPhoneLockScreenOutputArmedRef.current = false;
-            });
+            // Do not re-play or re-arm the hidden media element from its own pause
+            // event while WebAudio is already paused. Re-arming here is what caused
+            // the audible flutter/stutter after pressing Pause on the lock screen.
+            iPhoneLockScreenOutputArmedRef.current = false;
             updateMediaSessionState("paused");
         };
 
@@ -3330,6 +3331,69 @@ export default function Audio() {
             window.clearTimeout(carPlayRecoveryTimerRef.current);
             carPlayRecoveryTimerRef.current = null;
         }
+    }
+
+    function clearPauseReleaseTimer() {
+        if (pauseReleaseTimerRef.current) {
+            window.clearTimeout(pauseReleaseTimerRef.current);
+            pauseReleaseTimerRef.current = null;
+        }
+    }
+
+    function beginCleanPauseWindow(durationMs = 1400) {
+        const now = Date.now();
+        const safeDuration = Math.max(450, Number(durationMs) || 1400);
+
+        pauseActionInFlightRef.current = true;
+        lastMediaSessionPauseAtRef.current = now;
+        ignoreOutputPauseUntilRef.current = now + safeDuration;
+        clearCarPlayRecoveryTimer();
+        clearPauseReleaseTimer();
+
+        pauseReleaseTimerRef.current = window.setTimeout(() => {
+            pauseActionInFlightRef.current = false;
+            pauseReleaseTimerRef.current = null;
+        }, safeDuration);
+    }
+
+    function extendCleanPauseWindow(durationMs = 1100) {
+        const now = Date.now();
+        const safeDuration = Math.max(350, Number(durationMs) || 1100);
+
+        ignoreOutputPauseUntilRef.current = Math.max(
+            ignoreOutputPauseUntilRef.current || 0,
+            now + safeDuration
+        );
+        pauseActionInFlightRef.current = true;
+        clearPauseReleaseTimer();
+
+        pauseReleaseTimerRef.current = window.setTimeout(() => {
+            pauseActionInFlightRef.current = false;
+            pauseReleaseTimerRef.current = null;
+        }, safeDuration);
+    }
+
+    function isInsideCleanPauseWindow() {
+        return pauseActionInFlightRef.current || Date.now() < (ignoreOutputPauseUntilRef.current || 0);
+    }
+
+    async function fadeMonitorForPause(context = audioContextRef.current, fadeSeconds = 0.09) {
+        if (!context || context.state === "closed") {
+            return;
+        }
+
+        const now = context.currentTime || 0;
+        const safeFade = Math.max(0.04, Math.min(0.18, Number(fadeSeconds) || 0.09));
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(monitorMuteGainRef.current.gain, 0, now, safeFade);
+            }
+        } catch {
+            // Best-effort click/stutter prevention before pausing or suspending WebAudio.
+        }
+
+        await sleep(Math.ceil(safeFade * 1000) + 28);
     }
 
     function canUseMediaSession() {
@@ -3505,9 +3569,13 @@ export default function Audio() {
         );
     }
 
-    async function keepIPhoneOutputElementAliveForLockScreen(reason = "iPhone lock-screen output keep-alive") {
+    async function keepIPhoneOutputElementAliveForLockScreen(reason = "iPhone lock-screen output keep-alive", options = {}) {
         if (!isIOSAudioDevice()) {
             return true;
+        }
+
+        if (!options.allowDuringPause && isInsideCleanPauseWindow()) {
+            return false;
         }
 
         const now = Date.now();
@@ -3683,7 +3751,9 @@ export default function Audio() {
             element.setAttribute("webkit-playsinline", "");
             element.removeAttribute("muted");
 
-            forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
+            if (!isInsideCleanPauseWindow()) {
+                forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
+            }
 
             return true;
         } catch {
@@ -3695,6 +3765,10 @@ export default function Audio() {
         if (!isIOSAudioDevice()) {
             return true;
         }
+
+        pauseActionInFlightRef.current = false;
+        ignoreOutputPauseUntilRef.current = 0;
+        clearPauseReleaseTimer();
 
         const restartToken = mediaSessionPlayRestartTokenRef.current + 1;
 
@@ -3858,19 +3932,22 @@ export default function Audio() {
             return false;
         }
 
-        const nextOffset = getCurrentOffset();
-        const now = context.currentTime || 0;
+        if (pauseActionInFlightRef.current) {
+            updateMediaSessionState("paused");
+            return true;
+        }
 
-        // Lock-screen Pause must not re-play, rebind, or re-arm the hidden audio
-        // element. Re-arming during Pause causes the same stream to restart for a
-        // split second, which sounds like a stutter or doubled/muddy output.
+        beginCleanPauseWindow(1700);
         outputElementActionGuardRef.current = true;
-        lastMediaSessionPauseAtRef.current = Date.now();
 
+        const nextOffset = getCurrentOffset();
+
+        // Lock-screen Pause must be a one-way quiet fade. It must not play(),
+        // load(), rebind, or keep-alive the hidden media element during the pause
+        // command. Those operations restart the MediaStream route for a split
+        // second on iOS and sound like stutter or duplicated audio.
         try {
-            if (monitorMuteGainRef.current?.gain) {
-                setAudioParam(monitorMuteGainRef.current.gain, 0, now, 0.025);
-            }
+            await fadeMonitorForPause(context, 0.095);
         } catch {
             // Best-effort click/stutter prevention before suspending WebAudio.
         }
@@ -3892,8 +3969,6 @@ export default function Audio() {
         updateMediaSessionState("paused");
 
         try {
-            await sleep(30);
-
             if (context.state === "running") {
                 await context.suspend();
             }
@@ -3909,11 +3984,11 @@ export default function Audio() {
         } finally {
             window.setTimeout(() => {
                 outputElementActionGuardRef.current = false;
-            }, 700);
+            }, 900);
         }
 
         setCarPlayOutputStatus(
-            `${reason}: paused cleanly by fading and suspending the single WebAudio stream. The hidden iPhone media element stays attached, but it is not re-played during Pause, so the stream is not duplicated or muddied.`
+            `${reason}: paused with a quiet gain fade first, then suspended WebAudio. The hidden iPhone stream is not replayed during Pause, so there is no lock-screen stutter, flutter, or doubled/muddy stream.`
         );
 
         return true;
@@ -3949,6 +4024,9 @@ export default function Audio() {
                 await context.resume();
             }
 
+            pauseActionInFlightRef.current = false;
+            ignoreOutputPauseUntilRef.current = 0;
+            clearPauseReleaseTimer();
             forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
 
             startedOffsetRef.current = clamp(
@@ -4118,21 +4196,16 @@ export default function Audio() {
                 }
             }
 
-            pausePlayback();
-
-            if (isIOSAudioDevice()) {
-                await keepIPhoneOutputElementAliveForLockScreen(
-                    "Lock-screen Pause stopped the WebAudio source and kept only the hidden iPhone route alive for Play"
-                );
-            }
+            await pausePlayback({
+                reason: "Lock-screen Pause",
+                fromMediaSession: true,
+            });
 
             return true;
         }
 
         if (isIOSAudioDevice()) {
-            await keepIPhoneOutputElementAliveForLockScreen(
-                "Lock-screen Pause kept the hidden iPhone stream alive so Play can restart with volume"
-            );
+            extendCleanPauseWindow(900);
         }
 
         updateMediaSessionState("paused");
@@ -4153,7 +4226,8 @@ export default function Audio() {
         if (keepIOSOutputAvailableForRestart) {
             forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             const held = await keepIPhoneOutputElementAliveForLockScreen(
-                "Lock-screen Stop reset the song but kept the iPhone lock-screen audio route alive for restart"
+                "Lock-screen Stop reset the song but kept the iPhone lock-screen audio route alive for restart",
+                { allowDuringPause: true }
             );
             forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
 
@@ -4332,6 +4406,10 @@ export default function Audio() {
             return;
         }
 
+        if (!options.forcePlay && isInsideCleanPauseWindow()) {
+            return;
+        }
+
         clearCarPlayRecoveryTimer();
         lastCarPlayRecoveryReasonRef.current = reason || "iOS audio route recovery";
 
@@ -4371,7 +4449,8 @@ export default function Audio() {
 
             if (element && (playingRef.current || shouldForcePlay || iPhoneLockScreenOutputArmedRef.current)) {
                 await keepIPhoneOutputElementAliveForLockScreen(
-                    reason || "iOS audio route recovery"
+                    reason || "iOS audio route recovery",
+                    { allowDuringPause: shouldForcePlay || playingRef.current }
                 );
             }
 
@@ -6248,7 +6327,7 @@ export default function Audio() {
 
     async function handlePlaylistPrimaryPlay() {
         if (playingRef.current && activePlaylistIndexRef.current >= 0) {
-            pausePlayback();
+            await pausePlayback({ reason: "Playlist pause button" });
             return;
         }
 
@@ -6612,10 +6691,22 @@ export default function Audio() {
         }
     }
 
-    function pausePlayback() {
-        if (!playingRef.current) return;
+    async function pausePlayback(options = {}) {
+        if (!playingRef.current) return false;
+
+        const context = audioContextRef.current;
+        const isIPhone = isIOSAudioDevice();
+
+        if (isIPhone) {
+            beginCleanPauseWindow(options.fromMediaSession ? 1700 : 1250);
+            outputElementActionGuardRef.current = true;
+        }
 
         const nextOffset = getCurrentOffset();
+
+        if (isIPhone && context && context.state !== "closed") {
+            await fadeMonitorForPause(context, options.fromMediaSession ? 0.095 : 0.075);
+        }
 
         manualStopRef.current = true;
         stopActiveSource();
@@ -6628,17 +6719,34 @@ export default function Audio() {
         updateMediaSessionState("paused");
         stopPositionTimer();
         stopVisualizer();
-        pauseOutputElementForAppAction({
-            keepAlive: true,
-            reason: "Paused WebAudio while keeping the single iPhone lock-screen output route armed",
-        });
 
-        setInfo("Playback paused. Press Play to create a new WebAudio source from this position through the single hidden iPhone output route.");
+        if (isIPhone) {
+            // Do not call element.play(), element.load(), or a keep-alive re-arm
+            // during Pause. Play will re-arm the hidden MediaStream route when the
+            // user actually asks to resume, which avoids pause-clicks and flutter.
+            iPhoneLockScreenOutputArmedRef.current = false;
+            window.setTimeout(() => {
+                outputElementActionGuardRef.current = false;
+            }, options.fromMediaSession ? 900 : 650);
+        } else {
+            pauseOutputElementForAppAction({
+                keepAlive: false,
+                reason: "Paused WebAudio preview",
+            });
+        }
+
+        setInfo(
+            isIPhone
+                ? "Playback paused cleanly with a short fade. Press Play to re-arm the single hidden iPhone output route and restart from this position."
+                : "Playback paused. Press Play to resume from this position."
+        );
+
+        return true;
     }
 
     async function handlePlayPause() {
         if (playingRef.current) {
-            pausePlayback();
+            await pausePlayback({ reason: "Main pause button" });
             return;
         }
 
