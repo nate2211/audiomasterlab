@@ -3700,6 +3700,80 @@ export default function Audio() {
         );
     }
 
+    async function confirmIPhoneOutputAfterSourceStart(context, options = {}) {
+        if (!isIOSAudioDevice()) {
+            return true;
+        }
+
+        const element = outputAudioRef.current;
+
+        if (!context || context.state === "closed" || !element) {
+            iPhoneLockScreenOutputArmedRef.current = false;
+            return false;
+        }
+
+        const delays = options.fromMediaSession || options.forceIPhoneOutputPostStart
+            ? [0, 70, 180, 320]
+            : [0, 90];
+
+        for (const delayMs of delays) {
+            if (delayMs) {
+                await sleep(delayMs);
+            }
+
+            try {
+                if (context.state !== "running") {
+                    await context.resume();
+                }
+            } catch {
+                // Safari may reject resume from a background lock-screen action.
+                // The MediaStream-backed audio element can still keep the route alive.
+            }
+
+            ensureIPhoneSilentKeepAlive(context, mediaStreamDestinationRef.current);
+            attachOutputElementToCurrentStream(
+                element,
+                mediaStreamDestinationRef.current?.stream || null
+            );
+
+            try {
+                element.muted = false;
+                element.defaultMuted = false;
+                element.volume = 1;
+                element.playsInline = true;
+                element.autoplay = true;
+                element.removeAttribute("muted");
+            } catch {
+                // Safe to ignore unsupported element mutations.
+            }
+
+            if (
+                element.paused ||
+                element.ended ||
+                options.fromMediaSession ||
+                options.outputAlreadyRestarted ||
+                options.forceIPhoneOutputPostStart
+            ) {
+                try {
+                    await unlockOutputElementForAppAction(element);
+                } catch {
+                    // The armed check below decides whether this was fatal.
+                }
+            }
+
+            const armed = isIPhoneOutputRouteArmed();
+            iPhoneLockScreenOutputArmedRef.current = armed;
+
+            if (armed) {
+                iPhoneOutputHeldForLockScreenRestartRef.current = false;
+                return true;
+            }
+        }
+
+        iPhoneLockScreenOutputArmedRef.current = false;
+        return false;
+    }
+
     async function runMediaSessionAction(actionLabel, action) {
         const serial = mediaSessionActionSerialRef.current + 1;
         mediaSessionActionSerialRef.current = serial;
@@ -3741,6 +3815,9 @@ export default function Audio() {
 
     async function playFromMediaSession() {
         const isIPhoneLockScreenPlay = isIOSAudioDevice();
+        const shouldRestartAfterLockScreenStop = Boolean(
+            iPhoneOutputHeldForLockScreenRestartRef.current
+        );
         let outputAlreadyRestarted = false;
 
         if (isIPhoneLockScreenPlay) {
@@ -3758,12 +3835,14 @@ export default function Audio() {
             const mediaDuration = getMediaSessionDuration();
             const mediaPosition = getMediaSessionPosition();
             const shouldRestartFromBeginning =
-                mediaDuration > 0 && mediaPosition >= Math.max(0, mediaDuration - 0.25);
+                shouldRestartAfterLockScreenStop ||
+                (mediaDuration > 0 && mediaPosition >= Math.max(0, mediaDuration - 0.25));
 
             return startBufferPlayback(shouldRestartFromBeginning, {
                 fromMediaSession: true,
                 preserveUnlockedOutput: true,
                 outputAlreadyRestarted,
+                forceIPhoneOutputPostStart: true,
             });
         }
 
@@ -3779,6 +3858,7 @@ export default function Audio() {
                 preserveUnlockedOutput: true,
                 fromMediaSession: true,
                 outputAlreadyRestarted,
+                forceIPhoneOutputPostStart: true,
             });
         }
 
@@ -3848,6 +3928,7 @@ export default function Audio() {
                     fromMediaSession: true,
                     preserveUnlockedOutput: true,
                     outputAlreadyRestarted,
+                    forceIPhoneOutputPostStart: true,
                 });
             }
 
@@ -3864,6 +3945,7 @@ export default function Audio() {
             preserveUnlockedOutput: true,
             fromMediaSession: true,
             outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: true,
         });
     }
 
@@ -3884,6 +3966,7 @@ export default function Audio() {
                 fromMediaSession: true,
                 preserveUnlockedOutput: true,
                 outputAlreadyRestarted,
+                forceIPhoneOutputPostStart: true,
             });
             return true;
         }
@@ -3897,6 +3980,7 @@ export default function Audio() {
             preserveUnlockedOutput: true,
             fromMediaSession: true,
             outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: true,
         });
     }
 
@@ -3918,6 +4002,7 @@ export default function Audio() {
             fromMediaSession: true,
             preserveUnlockedOutput: true,
             outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: true,
         });
         updateMediaSessionState(playingRef.current ? "playing" : "paused");
         return true;
@@ -5413,6 +5498,7 @@ export default function Audio() {
             preserveUnlockedOutput = false,
             fromMediaSession = false,
             outputAlreadyRestarted = false,
+            forceIPhoneOutputPostStart = false,
         } = {}
     ) {
         const list = playlistRef.current;
@@ -5459,6 +5545,7 @@ export default function Audio() {
                 preserveUnlockedOutput,
                 fromMediaSession,
                 outputAlreadyRestarted,
+                forceIPhoneOutputPostStart,
                 attemptNumber: step + 1,
                 maxAttempts: list.length,
             });
@@ -5539,6 +5626,7 @@ export default function Audio() {
                             fromMediaSession: Boolean(options.fromMediaSession),
                             preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                             outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                            forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                         }).then((started) => {
                             if (!started && playlistLoadTokenRef.current === loadToken) {
                                 markPlaylistItemFailed(
@@ -5552,6 +5640,7 @@ export default function Audio() {
                                     fromMediaSession: Boolean(options.fromMediaSession),
                                     preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                                     outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                                    forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                                 });
                             }
                         });
@@ -5705,6 +5794,7 @@ export default function Audio() {
                     fromMediaSession: Boolean(options.fromMediaSession),
                     preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                     outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                    forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                 });
             }
 
@@ -6112,6 +6202,23 @@ export default function Audio() {
 
             source.start(0, safeOffset);
 
+            if (isIOSAudioDevice()) {
+                const outputConfirmed = await confirmIPhoneOutputAfterSourceStart(context, {
+                    fromMediaSession: Boolean(options.fromMediaSession),
+                    outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                    forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
+                });
+
+                if (!outputConfirmed) {
+                    stopActiveSource();
+                    setPlayingState(false);
+                    updateMediaSessionState("paused");
+                    throw new Error(
+                        `The iPhone Media Session duration advanced, but the audible output route was not playing. ${buildMobileAudioHint()}`
+                    );
+                }
+            }
+
             setMixerEnabled(true);
             setPlayingState(true);
             updateMediaSessionMetadata();
@@ -6131,7 +6238,7 @@ export default function Audio() {
                         carPlaySafeModeRef.current
                             ? "CarPlay / USB safe mode is active. "
                             : ""
-                    }Playing through the hidden iPhone media element output path. Pause keeps a near-silent stream alive; lock-screen Stop pauses that hidden stream, and lock-screen Play re-arms it before rebuilding the WebAudio effects source from the saved position.`
+                    }Playing through the hidden iPhone media element output path. Pause keeps a near-silent stream alive; lock-screen Stop resets WebAudio but keeps that hidden route armed, and lock-screen Play confirms the route again after starting the audible source.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
@@ -6176,7 +6283,15 @@ export default function Audio() {
             return;
         }
 
-        await startBufferPlayback(false);
+        const outputAlreadyRestarted = isIOSAudioDevice()
+            ? await restartIPhoneOutputStreamForLockScreenPlay("Page Play")
+            : false;
+
+        await startBufferPlayback(false, {
+            preserveUnlockedOutput: isIOSAudioDevice(),
+            outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: isIOSAudioDevice(),
+        });
     }
 
     async function restartPlayback() {
@@ -6207,6 +6322,7 @@ export default function Audio() {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                 outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
             });
             setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
         } else {
