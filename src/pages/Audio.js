@@ -375,6 +375,11 @@ const MAX_PERSISTED_CURRENT_AUDIO_BYTES = 6 * 1024 * 1024;
 const MAX_PERSISTED_PLAYLIST_FILE_BYTES = 3 * 1024 * 1024;
 const MAX_COOKIE_VALUE_LENGTH = 3200;
 
+const PLAYLIST_FILE_DB_NAME = "audiomasterlab-playlist-files-v1";
+const PLAYLIST_FILE_DB_VERSION = 1;
+const PLAYLIST_FILE_STORE_NAME = "uploadedPlaylistFiles";
+const PLAYLIST_FILE_INDEXEDDB_SAVE_LIMIT = 250 * 1024 * 1024;
+
 const PLAYLIST_RECOVERY_SETTINGS = {
     fetchTimeoutMs: 24000,
     autoplayDelayMs: 140,
@@ -772,6 +777,268 @@ function readPersistedPlaylistLinkDraft() {
     return readStorageValue(STORAGE_KEYS.playlistLinkDraft, "");
 }
 
+function playlistFileBlobStorageAvailable() {
+    return typeof window !== "undefined" && Boolean(window.indexedDB);
+}
+
+function buildPlaylistFileStorageKey(item) {
+    const id = String(item?.id || makePlaylistId()).replace(/[^a-z0-9._-]/gi, "_");
+
+    return `playlist-file-${id}`;
+}
+
+function openPlaylistFileDatabase() {
+    if (!playlistFileBlobStorageAvailable()) {
+        return Promise.reject(new Error("IndexedDB is not available in this browser."));
+    }
+
+    return new Promise((resolve, reject) => {
+        const request = window.indexedDB.open(
+            PLAYLIST_FILE_DB_NAME,
+            PLAYLIST_FILE_DB_VERSION
+        );
+
+        request.onupgradeneeded = () => {
+            const database = request.result;
+
+            if (!database.objectStoreNames.contains(PLAYLIST_FILE_STORE_NAME)) {
+                database.createObjectStore(PLAYLIST_FILE_STORE_NAME, { keyPath: "id" });
+            }
+        };
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Could not open playlist file storage."));
+        request.onblocked = () => reject(new Error("Playlist file storage is blocked by another browser tab."));
+    });
+}
+
+function runPlaylistFileStoreTransaction(mode, callback) {
+    return openPlaylistFileDatabase().then(
+        (database) =>
+            new Promise((resolve, reject) => {
+                let settled = false;
+
+                try {
+                    const transaction = database.transaction(PLAYLIST_FILE_STORE_NAME, mode);
+                    const store = transaction.objectStore(PLAYLIST_FILE_STORE_NAME);
+                    const request = callback(store);
+
+                    if (request && "onsuccess" in request) {
+                        request.onsuccess = () => {
+                            settled = true;
+                            resolve(request.result);
+                        };
+                        request.onerror = () => {
+                            settled = true;
+                            reject(request.error || transaction.error || new Error("Playlist file storage request failed."));
+                        };
+                    }
+
+                    transaction.oncomplete = () => {
+                        database.close();
+
+                        if (!settled) {
+                            resolve(true);
+                        }
+                    };
+                    transaction.onerror = () => {
+                        database.close();
+
+                        if (!settled) {
+                            reject(transaction.error || new Error("Playlist file storage transaction failed."));
+                        }
+                    };
+                    transaction.onabort = () => {
+                        database.close();
+
+                        if (!settled) {
+                            reject(transaction.error || new Error("Playlist file storage transaction aborted."));
+                        }
+                    };
+                } catch (error) {
+                    try {
+                        database.close();
+                    } catch {
+                        // Safe to ignore close errors.
+                    }
+
+                    reject(error);
+                }
+            })
+    );
+}
+
+async function putPlaylistFileBlob(storageKey, file) {
+    if (!storageKey || !file || !playlistFileBlobStorageAvailable()) {
+        return false;
+    }
+
+    const size = Number(file.size || 0);
+
+    if (size > PLAYLIST_FILE_INDEXEDDB_SAVE_LIMIT) {
+        return false;
+    }
+
+    try {
+        await runPlaylistFileStoreTransaction("readwrite", (store) =>
+            store.put({
+                id: storageKey,
+                blob: file,
+                name: file.name || "uploaded-playlist-file",
+                type: file.type || "application/octet-stream",
+                size,
+                lastModified: file.lastModified || Date.now(),
+                savedAt: new Date().toISOString(),
+            })
+        );
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function getPlaylistFileBlob(storageKey) {
+    if (!storageKey || !playlistFileBlobStorageAvailable()) {
+        return null;
+    }
+
+    try {
+        const record = await runPlaylistFileStoreTransaction("readonly", (store) =>
+            store.get(storageKey)
+        );
+
+        if (!record?.blob) {
+            return null;
+        }
+
+        const type = record.type || record.blob.type || "application/octet-stream";
+        const name = record.name || "uploaded-playlist-file";
+        const lastModified = record.lastModified || Date.now();
+
+        try {
+            return new File([record.blob], name, { type, lastModified });
+        } catch {
+            const blob = new Blob([record.blob], { type });
+            blob.name = name;
+            blob.lastModified = lastModified;
+            return blob;
+        }
+    } catch {
+        return null;
+    }
+}
+
+async function deletePlaylistFileBlob(storageKey) {
+    if (!storageKey || !playlistFileBlobStorageAvailable()) {
+        return false;
+    }
+
+    try {
+        await runPlaylistFileStoreTransaction("readwrite", (store) => store.delete(storageKey));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function clearPlaylistFileBlobs() {
+    if (!playlistFileBlobStorageAvailable()) {
+        return false;
+    }
+
+    try {
+        await runPlaylistFileStoreTransaction("readwrite", (store) => store.clear());
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function restorePlaylistItemFileFromBrowserStorage(item) {
+    if (!item || item.kind !== "file") {
+        return item;
+    }
+
+    if (item.file) {
+        return {
+            ...item,
+            needsReselect: false,
+        };
+    }
+
+    let restoredFile = null;
+
+    if (item.indexedDbFileKey) {
+        restoredFile = await getPlaylistFileBlob(item.indexedDbFileKey);
+    }
+
+    if (!restoredFile && item.dataUrl) {
+        try {
+            restoredFile = dataUrlToFile(
+                item.dataUrl,
+                item.title || "saved-playlist-audio",
+                item.type || "audio/mpeg"
+            );
+        } catch {
+            restoredFile = null;
+        }
+    }
+
+    if (!restoredFile) {
+        return item;
+    }
+
+    return {
+        ...item,
+        file: restoredFile,
+        size: item.size || restoredFile.size || 0,
+        type: item.type || restoredFile.type || "unknown MIME type",
+        needsReselect: false,
+        restoredFromStorage: true,
+        storageNote: item.indexedDbFileKey
+            ? "Uploaded file restored from browser IndexedDB after refresh."
+            : "Uploaded file restored from localStorage after refresh.",
+    };
+}
+
+async function hydratePlaylistFilesFromBrowserStorage(playlist) {
+    if (!Array.isArray(playlist) || !playlist.length) {
+        return {
+            playlist: Array.isArray(playlist) ? playlist : [],
+            restoredCount: 0,
+            missingCount: 0,
+        };
+    }
+
+    let restoredCount = 0;
+    let missingCount = 0;
+
+    const hydrated = await Promise.all(
+        playlist.map(async (item) => {
+            if (item?.kind !== "file" || item.file || (!item.indexedDbFileKey && !item.dataUrl)) {
+                return item;
+            }
+
+            const restored = await restorePlaylistItemFileFromBrowserStorage(item);
+
+            if (restored?.file) {
+                restoredCount += 1;
+                return restored;
+            }
+
+            missingCount += 1;
+            return restored;
+        })
+    );
+
+    return {
+        playlist: hydrated,
+        restoredCount,
+        missingCount,
+    };
+}
+
 function sanitizePersistedPlaylistItem(item) {
     if (!item || typeof item !== "object") return null;
 
@@ -833,18 +1100,26 @@ function sanitizePersistedPlaylistItem(item) {
             }
         }
 
+        const indexedDbFileKey = item.indexedDbFileKey || item.fileStorageKey || "";
+        const canRestoreLater = Boolean(restoredFile || indexedDbFileKey);
+
         return {
             id: item.id || makePlaylistId(),
             kind: "file",
             title: item.title || "Saved local file",
             file: restoredFile,
             dataUrl: item.dataUrl || "",
+            indexedDbFileKey,
+            persistedIndexedDb: Boolean(item.persistedIndexedDb || indexedDbFileKey),
             size: item.size || restoredFile?.size || 0,
             type: item.type || restoredFile?.type || "unknown MIME type",
             addedAt: item.addedAt || new Date().toISOString(),
             persistedDataUrl: Boolean(item.dataUrl),
             restoredFromStorage: true,
-            needsReselect: !restoredFile,
+            needsReselect: !canRestoreLater,
+            storageNote: indexedDbFileKey && !restoredFile
+                ? "Uploaded file is saved in browser IndexedDB and will be restored after the page loads."
+                : item.storageNote || "",
             artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
@@ -901,6 +1176,8 @@ function serializePlaylistItemForStorage(item) {
     }
 
     if (item.kind === "file") {
+        const indexedDbFileKey = item.indexedDbFileKey || item.fileStorageKey || "";
+
         return {
             id: item.id,
             kind: "file",
@@ -909,8 +1186,11 @@ function serializePlaylistItemForStorage(item) {
             type: item.type || item.file?.type || "unknown MIME type",
             addedAt: item.addedAt,
             dataUrl: item.dataUrl || "",
+            indexedDbFileKey,
+            persistedIndexedDb: Boolean(item.persistedIndexedDb || indexedDbFileKey),
             persistedDataUrl: Boolean(item.dataUrl),
-            needsReselect: !item.dataUrl,
+            needsReselect: !item.dataUrl && !indexedDbFileKey,
+            storageNote: item.storageNote || "",
             artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
@@ -925,45 +1205,62 @@ function serializePlaylistForStorage(playlist) {
 }
 
 async function attachPersistedFileData(item, file, maxBytes = MAX_PERSISTED_PLAYLIST_FILE_BYTES) {
-    if (!file || !item || file.size > maxBytes) {
+    if (!file || !item) {
         return {
-            ...item,
+            ...(item || {}),
             dataUrl: "",
+            indexedDbFileKey: item?.indexedDbFileKey || "",
+            persistedIndexedDb: false,
             persistedDataUrl: false,
             needsReselect: true,
-            storageNote:
-                file && file.size > maxBytes
-                    ? `File metadata saved, but the file is too large for localStorage (${getReadableBytes(
-                        file.size
-                    )}).`
-                    : "File metadata saved. Re-select the file after refresh if needed.",
+            storageNote: "File metadata saved. Re-select the file after refresh if needed.",
         };
     }
 
-    try {
-        const arrayBuffer = await file.arrayBuffer();
+    const indexedDbFileKey = item.indexedDbFileKey || buildPlaylistFileStorageKey(item);
+    const indexedDbSaved = await putPlaylistFileBlob(indexedDbFileKey, file);
+    let dataUrl = "";
+    let dataUrlSaved = false;
 
-        return {
-            ...item,
-            dataUrl: arrayBufferToDataUrl(
+    if (file.size <= maxBytes) {
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            dataUrl = arrayBufferToDataUrl(
                 arrayBuffer,
                 file.type || "application/octet-stream"
-            ),
-            persistedDataUrl: true,
-            needsReselect: false,
-            storageNote: `Saved small local file in localStorage (${getReadableBytes(
-                file.size
-            )}).`,
-        };
-    } catch {
+            );
+            dataUrlSaved = true;
+        } catch {
+            dataUrl = "";
+            dataUrlSaved = false;
+        }
+    }
+
+    if (indexedDbSaved || dataUrlSaved) {
         return {
             ...item,
-            dataUrl: "",
-            persistedDataUrl: false,
-            needsReselect: true,
-            storageNote: "Could not save this local file into localStorage.",
+            file,
+            dataUrl,
+            indexedDbFileKey: indexedDbSaved ? indexedDbFileKey : "",
+            persistedIndexedDb: indexedDbSaved,
+            persistedDataUrl: dataUrlSaved,
+            needsReselect: false,
+            storageNote: indexedDbSaved
+                ? `Uploaded file saved in browser IndexedDB for refresh restore (${getReadableBytes(file.size)}).`
+                : `Uploaded file saved in localStorage for refresh restore (${getReadableBytes(file.size)}).`,
         };
     }
+
+    return {
+        ...item,
+        file,
+        dataUrl: "",
+        indexedDbFileKey: "",
+        persistedIndexedDb: false,
+        persistedDataUrl: false,
+        needsReselect: false,
+        storageNote: `This uploaded file is available in this browser tab, but the browser would not save it for refresh restore (${getReadableBytes(file.size)}).`,
+    };
 }
 
 function persistCurrentFileSnapshot({ file, arrayBuffer, metadata }) {
@@ -1088,6 +1385,7 @@ function persistPlaylistToBrowser(playlist) {
 function clearPersistedBrowserSession() {
     Object.values(STORAGE_KEYS).forEach(removeStorageValue);
     Object.values(COOKIE_NAMES).forEach(deleteCookie);
+    clearPlaylistFileBlobs();
 }
 
 function buildPersistenceInfo() {
@@ -2616,6 +2914,8 @@ function buildPlaylistItemFromFile(file) {
         title: file?.name || "Untitled audio file",
         file,
         dataUrl: "",
+        indexedDbFileKey: "",
+        persistedIndexedDb: false,
         persistedDataUrl: false,
         needsReselect: false,
         storageNote: "",
@@ -2987,6 +3287,8 @@ export default function Audio() {
     const pauseUiQuietUntilRef = useRef(0);
     const pauseUiStatusSettledRef = useRef(false);
     const pauseUiQuietTimerRef = useRef(null);
+    const isPauseUiSettlingRef = useRef(false);
+    const playlistFilesHydratedRef = useRef(false);
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3004,6 +3306,7 @@ export default function Audio() {
     const [isPreloadingPlaylist, setIsPreloadingPlaylist] = useState(false);
     const [playlistPreloadSummary, setPlaylistPreloadSummary] = useState("");
     const [isPlaying, setIsPlaying] = useState(false);
+    const [isPauseUiSettling, setIsPauseUiSettling] = useState(false);
     const [isScrubbing, setIsScrubbing] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
     const [bufferReady, setBufferReady] = useState(false);
@@ -3032,6 +3335,10 @@ export default function Audio() {
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
+    const showPauseForMainControls = Boolean(isPlaying || isPauseUiSettling);
+    const showPauseForPlaylistControls = Boolean(
+        (isPlaying || isPauseUiSettling) && activePlaylistIndex >= 0
+    );
     const activePlaylistItem =
         activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
     const mediaTitle = getMediaDisplayTitle(
@@ -3154,6 +3461,50 @@ export default function Audio() {
             }
         }
     }, [playlist]);
+
+    useEffect(() => {
+        if (playlistFilesHydratedRef.current) {
+            return undefined;
+        }
+
+        playlistFilesHydratedRef.current = true;
+        let cancelled = false;
+
+        async function hydrateUploadedPlaylistFiles() {
+            const currentPlaylist = playlistRef.current;
+
+            if (
+                !Array.isArray(currentPlaylist) ||
+                !currentPlaylist.some(
+                    (item) => item?.kind === "file" && !item.file && (item.indexedDbFileKey || item.dataUrl)
+                )
+            ) {
+                return;
+            }
+
+            const result = await hydratePlaylistFilesFromBrowserStorage(currentPlaylist);
+
+            if (cancelled || !result.restoredCount) {
+                return;
+            }
+
+            setPlaylist(result.playlist);
+            setInfo(
+                `Restored ${result.restoredCount} uploaded playlist file${
+                    result.restoredCount === 1 ? "" : "s"
+                } from browser storage after refresh.`
+            );
+            refreshStorageInfo();
+        }
+
+        hydrateUploadedPlaylistFiles().catch(() => {
+            // Restore is best-effort. Missing files stay visible with their metadata.
+        });
+
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     useEffect(() => {
         activePlaylistIndexRef.current = activePlaylistIndex;
@@ -3395,6 +3746,17 @@ export default function Audio() {
         setCarPlayOutputStatus(safeMessage);
     }
 
+    function setPauseUiSettlingState(nextValue) {
+        const safeValue = Boolean(nextValue);
+
+        if (isPauseUiSettlingRef.current === safeValue) {
+            return;
+        }
+
+        isPauseUiSettlingRef.current = safeValue;
+        setIsPauseUiSettling(safeValue);
+    }
+
     function clearPauseUiQuietTimer() {
         if (pauseUiQuietTimerRef.current) {
             window.clearTimeout(pauseUiQuietTimerRef.current);
@@ -3411,12 +3773,14 @@ export default function Audio() {
             now + safeDuration
         );
         pauseUiStatusSettledRef.current = false;
+        setPauseUiSettlingState(true);
         clearPauseUiQuietTimer();
 
         pauseUiQuietTimerRef.current = window.setTimeout(() => {
             pauseUiQuietTimerRef.current = null;
             pauseUiQuietUntilRef.current = 0;
             pauseUiStatusSettledRef.current = false;
+            setPauseUiSettlingState(false);
         }, safeDuration);
     }
 
@@ -3450,6 +3814,7 @@ export default function Audio() {
         iPhonePauseSquelchUntilRef.current = 0;
         pauseUiQuietUntilRef.current = 0;
         pauseUiStatusSettledRef.current = false;
+        setPauseUiSettlingState(false);
         outputElementActionGuardRef.current = false;
         clearPauseReleaseTimer();
         clearPauseUiQuietTimer();
@@ -4754,7 +5119,7 @@ export default function Audio() {
     function clearSavedBrowserSession() {
         clearPersistedBrowserSession();
         refreshStorageInfo();
-        setInfo("Saved audio/session data cleared from localStorage and cookies. Current in-memory playback remains until you clear media or refresh.");
+        setInfo("Saved audio/session data cleared from localStorage, cookies, and browser IndexedDB uploaded-file storage. Current in-memory playback remains until you clear media or refresh.");
     }
 
     async function restorePersistedMediaOnBoot() {
@@ -5681,13 +6046,16 @@ export default function Audio() {
 
             setPlaylist((current) => [...current, ...nextItems]);
 
-            const savedCount = nextItems.filter((item) => item.persistedDataUrl).length;
-            const placeholderCount = nextItems.length - savedCount;
+            const indexedDbSavedCount = nextItems.filter((item) => item.persistedIndexedDb).length;
+            const localStorageSavedCount = nextItems.filter(
+                (item) => item.persistedDataUrl && !item.persistedIndexedDb
+            ).length;
+            const sessionOnlyCount = nextItems.length - indexedDbSavedCount - localStorageSavedCount;
 
             setInfo(
-                `Added ${nextItems.length} file(s) to the playlist${
+                `Added ${nextItems.length} uploaded file(s) to the playlist${
                     skippedCount ? ` and skipped ${skippedCount} unsupported file(s)` : ""
-                }. ${savedCount} small file(s) were saved in localStorage. ${placeholderCount} larger file(s) were remembered as metadata placeholders.`
+                }. ${indexedDbSavedCount} file(s) were saved in browser IndexedDB for refresh restore, ${localStorageSavedCount} small file(s) used localStorage fallback, and ${sessionOnlyCount} file(s) are available in this tab only.`
             );
         } catch (error) {
             setError(error?.message || "Could not add files to the playlist.");
@@ -5751,9 +6119,11 @@ export default function Audio() {
 
                 setInfo(
                     `Added the currently loaded file "${inputFile.name}" to the playlist. ${
-                        nextItem.persistedDataUrl
-                            ? "It was saved in localStorage for refresh restore."
-                            : "It was saved as a remembered placeholder because it is too large for localStorage."
+                        nextItem.persistedIndexedDb
+                            ? "It was saved in browser IndexedDB so it can stay loaded after refresh."
+                            : nextItem.persistedDataUrl
+                                ? "It was saved in localStorage for refresh restore."
+                                : "It is available in this tab only because browser storage would not save the uploaded file."
                     }`
                 );
             } catch (error) {
@@ -5968,6 +6338,10 @@ export default function Audio() {
 
         let playlistFile = item.file;
 
+        if (!playlistFile && item.indexedDbFileKey) {
+            playlistFile = await getPlaylistFileBlob(item.indexedDbFileKey);
+        }
+
         if (!playlistFile && item.dataUrl) {
             playlistFile = dataUrlToFile(
                 item.dataUrl,
@@ -5978,7 +6352,7 @@ export default function Audio() {
 
         if (!playlistFile) {
             throw new Error(
-                "The actual local file is not available in memory. Re-select it from your device, or keep local playlist files under the localStorage save limit."
+                "The uploaded playlist file is not available in browser storage. Re-select it from your device, or make sure this site has permission/quota to keep uploaded files in IndexedDB."
             );
         }
 
@@ -6329,6 +6703,10 @@ export default function Audio() {
 
             let playlistFile = item.file;
 
+            if (!playlistFile && item.indexedDbFileKey) {
+                playlistFile = await getPlaylistFileBlob(item.indexedDbFileKey);
+            }
+
             if (!playlistFile && item.dataUrl) {
                 try {
                     playlistFile = dataUrlToFile(
@@ -6343,7 +6721,25 @@ export default function Audio() {
 
             if (!playlistFile) {
                 throw new Error(
-                    "The actual local file is not available in memory. Re-select it from your device, or keep local playlist files under the localStorage save limit."
+                    "The uploaded playlist file is not available in browser storage. Re-select it from your device, or make sure this site has permission/quota to keep uploaded files in IndexedDB."
+                );
+            }
+
+            if (!item.file) {
+                setPlaylist((current) =>
+                    current.map((playlistItem, playlistItemIndex) =>
+                        playlistItemIndex === safeIndex
+                            ? {
+                                ...playlistItem,
+                                file: playlistFile,
+                                needsReselect: false,
+                                restoredFromStorage: true,
+                                storageNote: playlistItem.indexedDbFileKey
+                                    ? "Uploaded file restored from browser IndexedDB after refresh."
+                                    : playlistItem.storageNote || "Uploaded file restored from browser storage after refresh.",
+                            }
+                            : playlistItem
+                    )
                 );
             }
 
@@ -6382,9 +6778,11 @@ export default function Audio() {
 
             const { arrayBuffer, metadata } = await readFileMediaArrayBuffer(
                 playlistFile,
-                item.persistedDataUrl || item.dataUrl
-                    ? "Playlist file restored from localStorage"
-                    : "Playlist file"
+                item.persistedIndexedDb || item.indexedDbFileKey
+                    ? "Playlist file restored from browser IndexedDB"
+                    : item.persistedDataUrl || item.dataUrl
+                        ? "Playlist file restored from localStorage"
+                        : "Playlist file"
             );
 
             persistCurrentFileSnapshot({
@@ -6437,9 +6835,14 @@ export default function Audio() {
 
     function removePlaylistItem(id) {
         const currentIndex = activePlaylistIndexRef.current;
+        const removedItem = playlistRef.current.find((item) => item.id === id);
 
         if (id) {
             playlistPreloadCacheRef.current.delete(String(id));
+        }
+
+        if (removedItem?.indexedDbFileKey) {
+            deletePlaylistFileBlob(removedItem.indexedDbFileKey);
         }
 
         setPlaylist((current) => {
@@ -6467,6 +6870,7 @@ export default function Audio() {
         playlistLoadTokenRef.current += 1;
         playlistPreloadTokenRef.current += 1;
         playlistPreloadCacheRef.current.clear();
+        clearPlaylistFileBlobs();
         setIsPreloadingPlaylist(false);
         setPlaylistPreloadSummary("");
         setPlaylist([]);
@@ -6590,6 +6994,10 @@ export default function Audio() {
     }
 
     async function handlePlaylistPrimaryPlay() {
+        if (isPauseUiSettlingRef.current) {
+            return;
+        }
+
         if (playingRef.current && activePlaylistIndexRef.current >= 0) {
             await pausePlayback({ reason: "Playlist pause button" });
             return;
@@ -7024,6 +7432,10 @@ export default function Audio() {
     }
 
     async function handlePlayPause() {
+        if (isPauseUiSettlingRef.current) {
+            return;
+        }
+
         if (playingRef.current) {
             await pausePlayback({ reason: "Main pause button" });
             return;
@@ -7704,14 +8116,14 @@ export default function Audio() {
                                     size="large"
                                     variant="contained"
                                     startIcon={
-                                        isPlaying && activePlaylistIndex >= 0 ? (
+                                        showPauseForPlaylistControls ? (
                                             <PauseRoundedIcon />
                                         ) : (
                                             <PlayArrowRoundedIcon />
                                         )
                                     }
                                     onClick={handlePlaylistPrimaryPlay}
-                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
+                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist || isPauseUiSettling}
                                     sx={{
                                         borderRadius: 5,
                                         py: { xs: 1.9, md: 2.35 },
@@ -7730,7 +8142,7 @@ export default function Audio() {
                                         },
                                     }}
                                 >
-                                    {isPlaying && activePlaylistIndex >= 0
+                                    {showPauseForPlaylistControls
                                         ? "Pause playlist"
                                         : "Start playlist"}
                                 </Button>
@@ -8434,7 +8846,7 @@ export default function Audio() {
                                                 min={0}
                                                 max={duration || 0}
                                                 step={0.01}
-                                                disabled={!hasMedia || isRendering || isLoading}
+                                                disabled={!hasMedia || isRendering || isLoading || isPauseUiSettling}
                                                 onMouseDown={handleScrubStart}
                                                 onTouchStart={handleScrubStart}
                                                 onChange={handleScrubChange}
@@ -8487,10 +8899,10 @@ export default function Audio() {
                                         size="large"
                                         variant="contained"
                                         startIcon={
-                                            isPlaying ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
+                                            showPauseForMainControls ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
                                         }
                                         onClick={handlePlayPause}
-                                        disabled={!hasMedia || isRendering || isLoading}
+                                        disabled={!hasMedia || isRendering || isLoading || isPauseUiSettling}
                                         sx={{
                                             borderRadius: 4,
                                             py: 1.35,
@@ -8499,7 +8911,7 @@ export default function Audio() {
                                             background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
                                         }}
                                     >
-                                        {isPlaying ? "Pause playback" : "Play processed audio"}
+                                        {showPauseForMainControls ? "Pause playback" : "Play processed audio"}
                                     </Button>
 
                                     <Button
