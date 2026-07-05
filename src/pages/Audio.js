@@ -1178,6 +1178,15 @@ function serializePlaylistItemForStorage(item) {
     if (item.kind === "file") {
         const indexedDbFileKey = item.indexedDbFileKey || item.fileStorageKey || "";
 
+        // Important for multiple uploaded files:
+        // When IndexedDB has the real File/Blob, keep localStorage small by storing
+        // only metadata plus the IndexedDB key. Storing every small file as a data URL
+        // in the playlist JSON can overflow localStorage and prevent the whole playlist
+        // from restoring after refresh.
+        const shouldStoreDataUrl = Boolean(item.dataUrl && !indexedDbFileKey);
+        const persistedDataUrl = shouldStoreDataUrl;
+        const persistedIndexedDb = Boolean(item.persistedIndexedDb || indexedDbFileKey);
+
         return {
             id: item.id,
             kind: "file",
@@ -1185,11 +1194,11 @@ function serializePlaylistItemForStorage(item) {
             size: item.size || item.file?.size || 0,
             type: item.type || item.file?.type || "unknown MIME type",
             addedAt: item.addedAt,
-            dataUrl: item.dataUrl || "",
+            dataUrl: shouldStoreDataUrl ? item.dataUrl : "",
             indexedDbFileKey,
-            persistedIndexedDb: Boolean(item.persistedIndexedDb || indexedDbFileKey),
-            persistedDataUrl: Boolean(item.dataUrl),
-            needsReselect: !item.dataUrl && !indexedDbFileKey,
+            persistedIndexedDb,
+            persistedDataUrl,
+            needsReselect: !persistedDataUrl && !indexedDbFileKey,
             storageNote: item.storageNote || "",
             artworkUrl: getPlaylistItemArtworkSource(item),
         };
@@ -1222,7 +1231,11 @@ async function attachPersistedFileData(item, file, maxBytes = MAX_PERSISTED_PLAY
     let dataUrl = "";
     let dataUrlSaved = false;
 
-    if (file.size <= maxBytes) {
+    // Save every uploaded playlist file to IndexedDB first. Only use localStorage
+    // data URLs as a fallback when IndexedDB did not accept the blob. This keeps
+    // multiple uploaded files from overflowing localStorage and wiping out the
+    // persisted playlist metadata on refresh.
+    if (!indexedDbSaved && file.size <= maxBytes) {
         try {
             const arrayBuffer = await file.arrayBuffer();
             dataUrl = arrayBufferToDataUrl(
@@ -1247,7 +1260,7 @@ async function attachPersistedFileData(item, file, maxBytes = MAX_PERSISTED_PLAY
             needsReselect: false,
             storageNote: indexedDbSaved
                 ? `Uploaded file saved in browser IndexedDB for refresh restore (${getReadableBytes(file.size)}).`
-                : `Uploaded file saved in localStorage for refresh restore (${getReadableBytes(file.size)}).`,
+                : `Uploaded file saved in localStorage fallback for refresh restore (${getReadableBytes(file.size)}).`,
         };
     }
 
@@ -1371,10 +1384,25 @@ function persistPlaylistToBrowser(playlist) {
     setCookieJson(COOKIE_NAMES.playlistSummary, {
         count: serializable.length,
         urlCount: serializable.filter((item) => item.kind === "url").length,
-        savedFileCount: serializable.filter((item) => item.kind === "file" && item.dataUrl)
-            .length,
+        savedFileCount: serializable.filter(
+            (item) =>
+                item.kind === "file" &&
+                Boolean(item.indexedDbFileKey || item.dataUrl)
+        ).length,
+        indexedDbFileCount: serializable.filter(
+            (item) => item.kind === "file" && Boolean(item.indexedDbFileKey)
+        ).length,
+        localStorageFileCount: serializable.filter(
+            (item) =>
+                item.kind === "file" &&
+                Boolean(item.dataUrl) &&
+                !item.indexedDbFileKey
+        ).length,
         placeholderFileCount: serializable.filter(
-            (item) => item.kind === "file" && !item.dataUrl
+            (item) =>
+                item.kind === "file" &&
+                !item.indexedDbFileKey &&
+                !item.dataUrl
         ).length,
         updatedAt: new Date().toISOString(),
     });
@@ -1398,10 +1426,24 @@ function buildPersistenceInfo() {
         settingsSaved: Boolean(settings),
         playlistCount: Array.isArray(playlist) ? playlist.length : 0,
         savedPlaylistFiles: Array.isArray(playlist)
-            ? playlist.filter((item) => item.kind === "file" && item.dataUrl).length
+            ? playlist.filter(
+                (item) =>
+                    item.kind === "file" &&
+                    Boolean(item.indexedDbFileKey || item.dataUrl)
+            ).length
+            : 0,
+        savedIndexedDbPlaylistFiles: Array.isArray(playlist)
+            ? playlist.filter(
+                (item) => item.kind === "file" && Boolean(item.indexedDbFileKey)
+            ).length
             : 0,
         placeholderPlaylistFiles: Array.isArray(playlist)
-            ? playlist.filter((item) => item.kind === "file" && !item.dataUrl).length
+            ? playlist.filter(
+                (item) =>
+                    item.kind === "file" &&
+                    !item.indexedDbFileKey &&
+                    !item.dataUrl
+            ).length
             : 0,
         hasSavedCurrentAudio: Boolean(lastMedia?.dataUrl || lastMedia?.url),
         carPlaySafeMode: readPersistedCarPlaySafeMode(),
@@ -6044,7 +6086,14 @@ export default function Audio() {
                 )
             );
 
-            setPlaylist((current) => [...current, ...nextItems]);
+            setPlaylist((current) => {
+                const mergedPlaylist = [...current, ...nextItems];
+
+                // Persist the merged metadata immediately so a quick refresh after
+                // uploading multiple files still restores every uploaded item.
+                persistPlaylistToBrowser(mergedPlaylist);
+                return mergedPlaylist;
+            });
 
             const indexedDbSavedCount = nextItems.filter((item) => item.persistedIndexedDb).length;
             const localStorageSavedCount = nextItems.filter(
@@ -6115,7 +6164,12 @@ export default function Audio() {
                     MAX_PERSISTED_PLAYLIST_FILE_BYTES
                 );
 
-                setPlaylist((current) => [...current, nextItem]);
+                setPlaylist((current) => {
+                    const mergedPlaylist = [...current, nextItem];
+
+                    persistPlaylistToBrowser(mergedPlaylist);
+                    return mergedPlaylist;
+                });
 
                 setInfo(
                     `Added the currently loaded file "${inputFile.name}" to the playlist. ${
