@@ -3301,6 +3301,13 @@ export default function Audio() {
     const mediaTitleRef = useRef("AudioMaster Lab player");
     const mediaDurationRef = useRef(0);
     const mediaPositionRef = useRef(0);
+    const lastMediaSessionPositionPushAtRef = useRef(0);
+    const lastMediaSessionPositionSnapshotRef = useRef({
+        duration: 0,
+        position: 0,
+        playbackRate: 1,
+    });
+    const lastMediaSessionMetadataKeyRef = useRef("");
     const hasMediaRef = useRef(false);
     const lastMediaSessionActionRef = useRef("");
     const outputElementActionGuardRef = useRef(false);
@@ -3331,6 +3338,9 @@ export default function Audio() {
     const pauseUiQuietTimerRef = useRef(null);
     const isPauseUiSettlingRef = useRef(false);
     const playlistFilesHydratedRef = useRef(false);
+    const carPlayRouteDisconnectGuardUntilRef = useRef(0);
+    const carPlayRouteDisengagedBySystemRef = useRef(false);
+    const lastCarPlayRoutePauseReasonRef = useRef("");
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3377,9 +3387,12 @@ export default function Audio() {
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
-    const showPauseForMainControls = Boolean(isPlaying || isPauseUiSettling);
+    // Keep the visual Play/Pause toggle tied to real playback only. The pause
+    // settling flag still disables controls while iOS quiets the route, but it
+    // no longer keeps the Pause icon visible after audio has already paused.
+    const showPauseForMainControls = Boolean(isPlaying);
     const showPauseForPlaylistControls = Boolean(
-        (isPlaying || isPauseUiSettling) && activePlaylistIndex >= 0
+        isPlaying && activePlaylistIndex >= 0
     );
     const activePlaylistItem =
         activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
@@ -3605,8 +3618,20 @@ export default function Audio() {
         }
 
         const recoverFromPageEvent = (event) => {
+            const eventType = event?.type || "resume";
+
             if (
-                event?.type === "visibilitychange" &&
+                eventType === "focus" ||
+                eventType === "pageshow" ||
+                (eventType === "visibilitychange" &&
+                    typeof document !== "undefined" &&
+                    document.visibilityState === "visible")
+            ) {
+                syncVisiblePlaybackUiWithAudioRoute(eventType);
+            }
+
+            if (
+                eventType === "visibilitychange" &&
                 typeof document !== "undefined" &&
                 document.visibilityState !== "visible"
             ) {
@@ -3614,7 +3639,14 @@ export default function Audio() {
                 return;
             }
 
-            scheduleCarPlayOutputRecovery(`iOS page/audio route event: ${event?.type || "resume"}`);
+            if (shouldTreatAsCarPlayRouteDisengage(eventType)) {
+                pauseAfterCarPlayRouteDisengage(`iOS audio route changed after ${eventType}`).catch(() => {});
+                return;
+            }
+
+            scheduleCarPlayOutputRecovery(`iOS page/audio route event: ${eventType}`, {
+                allowAutoResume: false,
+            });
         };
 
         window.addEventListener("focus", recoverFromPageEvent);
@@ -3649,6 +3681,12 @@ export default function Audio() {
         const handleOutputPlay = () => {
             const now = Date.now();
 
+            if (carPlayRouteDisengagedBySystemRef.current && !playingRef.current) {
+                iPhoneLockScreenOutputArmedRef.current = false;
+                updateMediaSessionState("paused", { forcePosition: true });
+                return;
+            }
+
             if (
                 outputElementActionGuardRef.current ||
                 now < (ignoreOutputPlayUntilRef.current || 0) ||
@@ -3663,7 +3701,7 @@ export default function Audio() {
                     holdIPhonePauseSilence("Ignored hidden iPhone output play event during Pause");
                 }
                 if (playingRef.current) {
-                    updateMediaSessionState("playing");
+                    updateMediaSessionState("playing", { forcePosition: true });
                 }
                 return;
             }
@@ -3680,7 +3718,7 @@ export default function Audio() {
         const handleOutputPause = () => {
             if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
                 if (playingRef.current) {
-                    updateMediaSessionState("playing");
+                    updateMediaSessionState("playing", { forcePosition: true });
                 }
                 return;
             }
@@ -3689,6 +3727,11 @@ export default function Audio() {
 
             if (now - lastMediaSessionPauseAtRef.current < 1100) {
                 updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                return;
+            }
+
+            if (shouldTreatAsCarPlayRouteDisengage("hidden-output-pause")) {
+                pauseAfterCarPlayRouteDisengage("iPhone hidden output paused because the CarPlay / USB route changed").catch(() => {});
                 return;
             }
 
@@ -3702,21 +3745,30 @@ export default function Audio() {
             // event while WebAudio is already paused. Re-arming here is what caused
             // the audible flutter/stutter after pressing Pause on the lock screen.
             iPhoneLockScreenOutputArmedRef.current = false;
-            updateMediaSessionState("paused");
+            updateMediaSessionState("paused", { forcePosition: true });
         };
 
         const recoverEvents = ["stalled", "suspend", "waiting", "emptied", "abort", "error"];
         const handleRecoverableOutputEvent = (event) => {
+            const eventType = event?.type || "output-event";
+
             if (isInsideCleanPauseWindow()) {
-                holdIPhonePauseSilence(`Ignored hidden iOS output element ${event.type} during Pause`);
+                holdIPhonePauseSilence(`Ignored hidden iOS output element ${eventType} during Pause`);
                 return;
             }
 
-            if (!playingRef.current && event.type !== "error") {
+            if (shouldTreatAsCarPlayRouteDisengage(`hidden-output-${eventType}`)) {
+                pauseAfterCarPlayRouteDisengage(`iPhone output route changed after hidden output ${eventType}`).catch(() => {});
                 return;
             }
 
-            scheduleCarPlayOutputRecovery(`hidden iOS output element ${event.type}`);
+            if (!playingRef.current && eventType !== "error") {
+                return;
+            }
+
+            scheduleCarPlayOutputRecovery(`hidden iOS output element ${eventType}`, {
+                allowAutoResume: false,
+            });
         };
 
         element.addEventListener("play", handleOutputPlay);
@@ -3749,6 +3801,44 @@ export default function Audio() {
         playingRef.current = safeValue;
         isPlayingStateRef.current = safeValue;
         setIsPlaying((current) => (current === safeValue ? current : safeValue));
+    }
+
+    function syncVisiblePlaybackUiWithAudioRoute(reason = "visible route sync") {
+        const context = audioContextRef.current;
+        const hasLiveSource = Boolean(activeSourceRef.current);
+        const contextRunning = Boolean(context && context.state === "running");
+        const shouldShowPlaying = Boolean(
+            playingRef.current && hasLiveSource && contextRunning
+        );
+
+        if (!shouldShowPlaying) {
+            if (playingRef.current || isPlayingStateRef.current) {
+                playingRef.current = false;
+                isPlayingStateRef.current = false;
+                setIsPlaying(false);
+            }
+
+            if (isPauseUiSettlingRef.current) {
+                setPauseUiSettlingState(false);
+            }
+
+            updateMediaSessionState("paused", {
+                forcePosition: true,
+                reason,
+            });
+            return false;
+        }
+
+        if (!isPlayingStateRef.current) {
+            isPlayingStateRef.current = true;
+            setIsPlaying(true);
+        }
+
+        updateMediaSessionState("playing", {
+            forcePosition: true,
+            reason,
+        });
+        return true;
     }
 
     function setInfo(message) {
@@ -3827,6 +3917,144 @@ export default function Audio() {
     }
 
 
+    function isInsideCarPlayDisconnectGuard() {
+        return Date.now() < (carPlayRouteDisconnectGuardUntilRef.current || 0);
+    }
+
+    function armCarPlayDisconnectGuard(durationMs = 3500) {
+        carPlayRouteDisconnectGuardUntilRef.current = Math.max(
+            carPlayRouteDisconnectGuardUntilRef.current || 0,
+            Date.now() + Math.max(900, Number(durationMs) || 3500)
+        );
+    }
+
+    function shouldTreatAsCarPlayRouteDisengage(eventType = "routechange") {
+        if (!isIOSAudioDevice() || !carPlaySafeModeRef.current) {
+            return false;
+        }
+
+        if (isInsideCleanPauseWindow()) {
+            return false;
+        }
+
+        const cleanType = String(eventType || "routechange").toLowerCase();
+        const element = outputAudioRef.current;
+        const context = audioContextRef.current;
+        const hadActiveRoute = Boolean(
+            playingRef.current ||
+            isPlayingStateRef.current ||
+            iPhoneLockScreenOutputArmedRef.current ||
+            iPhoneOutputHeldForLockScreenRestartRef.current ||
+            activeSourceRef.current
+        );
+
+        if (!hadActiveRoute) {
+            return false;
+        }
+
+        const routeLooksInterrupted = Boolean(
+            !element ||
+            element.paused ||
+            element.ended ||
+            element.error ||
+            !element.srcObject ||
+            context?.state === "suspended" ||
+            context?.state === "interrupted"
+        );
+
+        if (cleanType.includes("devicechange") || cleanType.includes("hidden-output")) {
+            return routeLooksInterrupted || playingRef.current;
+        }
+
+        if (cleanType.includes("pageshow") || cleanType.includes("focus") || cleanType.includes("visibilitychange")) {
+            return routeLooksInterrupted && Boolean(iPhoneLockScreenOutputArmedRef.current || playingRef.current);
+        }
+
+        return false;
+    }
+
+    async function pauseAfterCarPlayRouteDisengage(reason = "CarPlay / USB audio route disconnected") {
+        if (!isIOSAudioDevice()) {
+            return false;
+        }
+
+        if (isInsideCarPlayDisconnectGuard()) {
+            updateMediaSessionState("paused", { forcePosition: true });
+            setPlayingState(false);
+            return true;
+        }
+
+        armCarPlayDisconnectGuard(3800);
+        clearCarPlayRecoveryTimer();
+        beginCleanPauseWindow(2200);
+
+        carPlayRouteDisengagedBySystemRef.current = true;
+        lastCarPlayRoutePauseReasonRef.current = reason;
+        iPhoneLockScreenOutputArmedRef.current = false;
+        iPhoneOutputHeldForLockScreenRestartRef.current = false;
+        manualStopRef.current = true;
+
+        const context = audioContextRef.current;
+        const nextOffset = getCurrentOffset();
+
+        try {
+            if (context && context.state !== "closed") {
+                await fadeMonitorForPause(context, 0.1);
+            } else {
+                holdIPhonePauseSilence(reason);
+            }
+        } catch {
+            holdIPhonePauseSilence(reason);
+        }
+
+        stopActiveSource();
+        stopPositionTimer();
+        stopVisualizer();
+
+        startedOffsetRef.current = nextOffset;
+        startedAtContextTimeRef.current = 0;
+        setPosition(nextOffset);
+        setPlayingState(false);
+        updateMediaSessionState("paused", { forcePosition: true });
+
+        const element = outputAudioRef.current;
+
+        outputElementActionGuardRef.current = true;
+
+        try {
+            if (element) {
+                element.volume = 0;
+                element.muted = false;
+                if (!element.paused) {
+                    element.pause();
+                }
+            }
+        } catch {
+            // Safe to ignore iOS output element pause issues during route loss.
+        } finally {
+            window.setTimeout(() => {
+                outputElementActionGuardRef.current = false;
+            }, 900);
+        }
+
+        try {
+            if (context && context.state === "running") {
+                await context.suspend();
+            }
+        } catch {
+            // iOS may already have interrupted the context.
+        }
+
+        setCarPlayOutputStatusIfChanged(
+            "CarPlay / USB route disconnected, so playback was paused and will not auto-resume. Tap Play after unlocking the phone to start the stream again."
+        );
+        setInfo(
+            "CarPlay / USB route disconnected. Playback is paused so the phone will not auto-play after the car turns off. Tap Play to resume through the current iPhone output."
+        );
+
+        return true;
+    }
+
     function clearCarPlayRecoveryTimer() {
         if (carPlayRecoveryTimerRef.current) {
             window.clearTimeout(carPlayRecoveryTimerRef.current);
@@ -3858,6 +4086,9 @@ export default function Audio() {
         pauseUiStatusSettledRef.current = false;
         setPauseUiSettlingState(false);
         outputElementActionGuardRef.current = false;
+        carPlayRouteDisengagedBySystemRef.current = false;
+        lastCarPlayRoutePauseReasonRef.current = "";
+        carPlayRouteDisconnectGuardUntilRef.current = 0;
         clearPauseReleaseTimer();
         clearPauseUiQuietTimer();
         clearCarPlayRecoveryTimer();
@@ -4065,8 +4296,15 @@ export default function Audio() {
 
     function getMediaSessionPosition() {
         const mediaDuration = getMediaSessionDuration();
-        const liveOffset = getCurrentOffset();
         const refPosition = Number(mediaPositionRef.current);
+
+        if (scrubbingRef.current && Number.isFinite(refPosition)) {
+            return mediaDuration
+                ? clamp(refPosition, 0, mediaDuration)
+                : Math.max(0, refPosition || 0);
+        }
+
+        const liveOffset = getCurrentOffset();
         const nextPosition = Number.isFinite(liveOffset) ? liveOffset : refPosition;
 
         if (!mediaDuration) {
@@ -4111,6 +4349,78 @@ export default function Audio() {
         return "AudioMaster Lab";
     }
 
+    function getMediaSessionPlaybackRate() {
+        const liveRate = Number(currentEffectiveRateRef.current);
+
+        if (Number.isFinite(liveRate) && liveRate > 0) {
+            return clamp(liveRate, 0.0625, 16);
+        }
+
+        return clamp(getEffectivePlaybackRate(latestSettingsRef.current), 0.0625, 16);
+    }
+
+    function updateMediaSessionPositionState(options = {}) {
+        if (!canUseMediaSession() || typeof navigator.mediaSession.setPositionState !== "function") {
+            return;
+        }
+
+        const durationValue = Number(getMediaSessionDuration());
+
+        if (!Number.isFinite(durationValue) || durationValue <= 0) {
+            try {
+                navigator.mediaSession.setPositionState();
+            } catch {
+                // Position state is best-effort only.
+            }
+            return;
+        }
+
+        const positionValue = clamp(
+            Number(getMediaSessionPosition()) || 0,
+            0,
+            durationValue
+        );
+        const playbackRateValue = getMediaSessionPlaybackRate();
+        const now = Date.now();
+        const lastSnapshot = lastMediaSessionPositionSnapshotRef.current || {};
+        const positionChangedEnough = Math.abs(
+            Number(lastSnapshot.position || 0) - positionValue
+        ) >= 0.33;
+        const durationChangedEnough = Math.abs(
+            Number(lastSnapshot.duration || 0) - durationValue
+        ) >= 0.05;
+        const rateChangedEnough = Math.abs(
+            Number(lastSnapshot.playbackRate || 1) - playbackRateValue
+        ) >= 0.01;
+
+        if (
+            !options.forcePosition &&
+            now - (lastMediaSessionPositionPushAtRef.current || 0) < 350 &&
+            !positionChangedEnough &&
+            !durationChangedEnough &&
+            !rateChangedEnough
+        ) {
+            return;
+        }
+
+        lastMediaSessionPositionPushAtRef.current = now;
+        lastMediaSessionPositionSnapshotRef.current = {
+            duration: durationValue,
+            position: positionValue,
+            playbackRate: playbackRateValue,
+        };
+
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: durationValue,
+                playbackRate: playbackRateValue,
+                position: positionValue,
+            });
+        } catch {
+            // Safari can reject position updates while switching audio routes.
+        }
+    }
+
     function updateMediaSessionMetadata() {
         if (!canUseMediaSession()) {
             return;
@@ -4118,24 +4428,37 @@ export default function Audio() {
 
         try {
             if (typeof window === "undefined" || typeof window.MediaMetadata !== "function") {
+                updateMediaSessionPositionState({ forcePosition: true });
                 return;
             }
 
             const title = getMediaSessionTitle();
             const activeItem = playlistRef.current?.[activePlaylistIndexRef.current];
-
-            navigator.mediaSession.metadata = new window.MediaMetadata({
+            const metadataKey = JSON.stringify({
                 title,
-                artist: "AudioMaster Lab",
                 album: getMediaSessionAlbum(),
-                artwork: getMediaSessionArtwork(title, activeItem),
+                artwork: getPlaylistItemArtworkSource(activeItem),
+                duration: Number(getMediaSessionDuration()) || 0,
+                activePlaylistIndex: activePlaylistIndexRef.current,
             });
+
+            if (lastMediaSessionMetadataKeyRef.current !== metadataKey) {
+                navigator.mediaSession.metadata = new window.MediaMetadata({
+                    title,
+                    artist: "AudioMaster Lab",
+                    album: getMediaSessionAlbum(),
+                    artwork: getMediaSessionArtwork(title, activeItem),
+                });
+                lastMediaSessionMetadataKeyRef.current = metadataKey;
+            }
+
+            updateMediaSessionPositionState({ forcePosition: true });
         } catch {
             // MediaMetadata is not available in every Safari/WebView version.
         }
     }
 
-    function updateMediaSessionState(nextState = "none") {
+    function updateMediaSessionState(nextState = "none", options = {}) {
         if (!canUseMediaSession()) {
             return;
         }
@@ -4148,17 +4471,18 @@ export default function Audio() {
             // playbackState is not supported in every browser.
         }
 
-        try {
-            // Keep lock-screen controls as transport controls only. Publishing
-            // Media Session position state can make some mobile lock screens
-            // show previous/next 10-second seek buttons instead of real
-            // previous-track / next-track buttons.
-            if (typeof navigator.mediaSession.setPositionState === "function") {
-                navigator.mediaSession.setPositionState();
+        if (safeState === "none") {
+            try {
+                if (typeof navigator.mediaSession.setPositionState === "function") {
+                    navigator.mediaSession.setPositionState();
+                }
+            } catch {
+                // Position state clearing is best-effort only.
             }
-        } catch {
-            // Position state clearing is best-effort only.
+            return;
         }
+
+        updateMediaSessionPositionState(options);
     }
 
     function clearMediaSession() {
@@ -4169,6 +4493,7 @@ export default function Audio() {
         try {
             navigator.mediaSession.playbackState = "none";
             navigator.mediaSession.metadata = null;
+            lastMediaSessionMetadataKeyRef.current = "";
         } catch {
             // Safe to ignore.
         }
@@ -4583,7 +4908,7 @@ export default function Audio() {
         }
 
         if (pauseActionInFlightRef.current) {
-            updateMediaSessionState("paused");
+            updateMediaSessionState("paused", { forcePosition: true });
             return true;
         }
 
@@ -4619,7 +4944,7 @@ export default function Audio() {
         stopVisualizer();
         setPosition(nextOffset);
         setPlayingState(false);
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
 
         try {
             if (context.state === "running") {
@@ -4706,7 +5031,7 @@ export default function Audio() {
 
             setPlayingState(true);
             updateMediaSessionMetadata();
-            updateMediaSessionState("playing");
+            updateMediaSessionState("playing", { forcePosition: true });
             startPositionTimer();
             startVisualizer();
 
@@ -4749,13 +5074,17 @@ export default function Audio() {
 
                 if (mediaSessionActionSerialRef.current === serial) {
                     updateMediaSessionMetadata();
-                    updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                    updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                        forcePosition: true,
+                    });
                 }
 
                 return result;
             } catch (error) {
                 if (mediaSessionActionSerialRef.current === serial) {
-                    updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                    updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                        forcePosition: true,
+                    });
                     setError(
                         `${actionLabel || "Lock-screen control"} failed. ${
                             error?.message || "Tap the page Play button once to re-arm browser audio."
@@ -4802,7 +5131,7 @@ export default function Audio() {
 
         if (playingRef.current && activeSourceRef.current) {
             forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
-            updateMediaSessionState("playing");
+            updateMediaSessionState("playing", { forcePosition: true });
             return true;
         }
 
@@ -4839,7 +5168,7 @@ export default function Audio() {
         }
 
         setError("Load a media source or playlist before using lock-screen Play.");
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
         return false;
     }
 
@@ -4869,7 +5198,7 @@ export default function Audio() {
             extendCleanPauseWindow(900);
         }
 
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
         return true;
     }
 
@@ -4894,7 +5223,7 @@ export default function Audio() {
 
             iPhoneOutputHeldForLockScreenRestartRef.current = held;
             iPhoneLockScreenOutputArmedRef.current = held;
-            updateMediaSessionState("paused");
+            updateMediaSessionState("paused", { forcePosition: true });
             setInfo(
                 held
                     ? "Lock-screen Stop reset WebAudio to the beginning, restored the hidden output volume path, and kept the iPhone stream alive silently so lock-screen Play can restart without unlocking the phone."
@@ -4903,7 +5232,7 @@ export default function Audio() {
             return true;
         }
 
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
         setInfo("Lock-screen Stop stopped playback and reset the track position.");
         return true;
     }
@@ -4986,6 +5315,45 @@ export default function Audio() {
         });
     }
 
+    async function seekToFromMediaSession(details = {}) {
+        const durationValue = getMediaSessionDuration();
+
+        if (!durationValue) {
+            updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            return true;
+        }
+
+        const requestedSeekTime = Number(details.seekTime);
+        const fallbackSeekTime = Number(mediaPositionRef.current || startedOffsetRef.current || 0);
+        const nextSeekTime = clamp(
+            Number.isFinite(requestedSeekTime) ? requestedSeekTime : fallbackSeekTime,
+            0,
+            durationValue
+        );
+        const wasPlaying = Boolean(playingRef.current);
+        let outputAlreadyRestarted = false;
+
+        if (isIOSAudioDevice() && wasPlaying) {
+            const { context, nodes } = ensureLiveGraph();
+            forceRestoreAudibleWebAudioOutput(context, nodes);
+            outputAlreadyRestarted = isIPhoneOutputRouteArmed();
+        }
+
+        await seekTo(nextSeekTime, wasPlaying, {
+            fromMediaSession: true,
+            preserveUnlockedOutput: isIOSAudioDevice(),
+            outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: isIOSAudioDevice() && wasPlaying,
+        });
+
+        updateMediaSessionState(wasPlaying ? "playing" : "paused", {
+            forcePosition: true,
+        });
+        return true;
+    }
+
     function installMediaSessionHandlers() {
         if (!canUseMediaSession() || typeof navigator.mediaSession.setActionHandler !== "function") {
             return;
@@ -5007,21 +5375,11 @@ export default function Audio() {
             }
         };
 
-        // Clear all seek-style handlers first. When seekbackward/seekforward
-        // are installed, iPhone/Android lock screens commonly show
-        // "previous 10 seconds" and "next 10 seconds" instead of real
-        // previous-track / next-track transport controls.
-        ["seekbackward", "seekforward", "seekto"].forEach(safeClearAction);
-
-        if (isIOSAudioDevice() && typeof navigator.mediaSession.setPositionState === "function") {
-            try {
-                // Clearing position state helps iOS choose transport controls
-                // instead of seek controls on the lock screen.
-                navigator.mediaSession.setPositionState();
-            } catch {
-                // Position state clearing is best-effort only.
-            }
-        }
+        // Keep real previous/next track buttons by clearing 10-second skip
+        // actions, but publish duration/position and install seekto so the lock
+        // screen / CarPlay scrubber can seek through the current song.
+        ["seekbackward", "seekforward"].forEach(safeClearAction);
+        updateMediaSessionPositionState({ forcePosition: true });
 
         safeSetAction("play", () => {
             return runMediaSessionAction("Lock-screen Play", playFromMediaSession);
@@ -5033,6 +5391,12 @@ export default function Audio() {
 
         safeSetAction("stop", () => {
             return runMediaSessionAction("Lock-screen Stop", stopFromMediaSession);
+        });
+
+        safeSetAction("seekto", (details) => {
+            return runMediaSessionAction("Lock-screen Scrub", () =>
+                seekToFromMediaSession(details)
+            );
         });
 
         // Real track controls only. Do not install seekbackward/seekforward.
@@ -5067,6 +5431,16 @@ export default function Audio() {
             return;
         }
 
+        if (carPlayRouteDisengagedBySystemRef.current && !options.forcePlay) {
+            updateMediaSessionState("paused", { forcePosition: true });
+            return;
+        }
+
+        if (!options.forcePlay && shouldTreatAsCarPlayRouteDisengage(reason || "route recovery")) {
+            pauseAfterCarPlayRouteDisengage(reason || "CarPlay / USB route disconnected").catch(() => {});
+            return;
+        }
+
         if (!options.forcePlay && isInsideCleanPauseWindow()) {
             return;
         }
@@ -5090,6 +5464,20 @@ export default function Audio() {
 
     async function recoverCarPlayOutput(reason, options = {}) {
         if (!isIOSAudioDevice()) {
+            return false;
+        }
+
+        if (carPlayRouteDisengagedBySystemRef.current && !options.forcePlay) {
+            updateMediaSessionState("paused", { forcePosition: true });
+            setPlayingState(false);
+            setCarPlayOutputStatusIfChanged(
+                "CarPlay / USB route is disconnected. Playback will stay paused until you press Play again."
+            );
+            return false;
+        }
+
+        if (!options.forcePlay && shouldTreatAsCarPlayRouteDisengage(reason || "route recovery")) {
+            await pauseAfterCarPlayRouteDisengage(reason || "CarPlay / USB route disconnected during recovery");
             return false;
         }
 
@@ -5637,13 +6025,17 @@ export default function Audio() {
 
             const nextOffset = getCurrentOffset();
 
+            mediaPositionRef.current = nextOffset;
             setPosition(nextOffset);
+            updateMediaSessionPositionState();
 
             if (nextOffset >= buffer.duration) {
                 startedOffsetRef.current = 0;
                 startedAtContextTimeRef.current = 0;
+                mediaPositionRef.current = 0;
                 setPosition(0);
                 setPlayingState(false);
+                updateMediaSessionState("paused", { forcePosition: true });
                 stopPositionTimer();
                 stopVisualizer();
             }
@@ -5720,7 +6112,7 @@ export default function Audio() {
             });
         }
 
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
     }
 
     function resetDecodedState() {
@@ -5772,6 +6164,13 @@ export default function Audio() {
         wasPlayingBeforeScrubRef.current = false;
 
         setIsScrubbing(false);
+        mediaDurationRef.current = 0;
+        mediaPositionRef.current = 0;
+        lastMediaSessionPositionSnapshotRef.current = {
+            duration: 0,
+            position: 0,
+            playbackRate: 1,
+        };
         setBufferReady(false);
         setPosition(0);
         setDuration(0);
@@ -5837,7 +6236,7 @@ export default function Audio() {
                 ).catch(() => {
                     // The single hidden iPhone media-element route remains attached.
                 });
-                updateMediaSessionState("playing");
+                updateMediaSessionState("playing", { forcePosition: true });
             } catch {
                 // Do not block playlist loading if iOS route preservation fails.
             }
@@ -5884,6 +6283,14 @@ export default function Audio() {
             latestSettingsRef.current
         );
 
+        mediaDurationRef.current = decodedBuffer.duration;
+        mediaPositionRef.current = 0;
+        lastMediaSessionPositionSnapshotRef.current = {
+            duration: decodedBuffer.duration,
+            position: 0,
+            playbackRate: getMediaSessionPlaybackRate(),
+        };
+
         setBufferReady(true);
         setPosition(0);
         setDuration(decodedBuffer.duration);
@@ -5893,7 +6300,9 @@ export default function Audio() {
         );
 
         updateMediaSessionMetadata();
-        updateMediaSessionState(playingRef.current ? "playing" : "paused");
+        updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+            forcePosition: true,
+        });
 
         return decodedBuffer;
     }
@@ -6648,6 +7057,34 @@ export default function Audio() {
             }
 
             markPlaylistItemLoaded(safeIndex);
+            setPlaylist((current) => {
+                if (!Array.isArray(current) || !current[safeIndex]) {
+                    return current;
+                }
+
+                const currentItem = current[safeIndex];
+                const nextDuration = Number(decodedBuffer.duration) || 0;
+
+                if (Math.abs(Number(currentItem.duration || 0) - nextDuration) < 0.05) {
+                    return current;
+                }
+
+                return current.map((playlistItem, playlistItemIndex) =>
+                    playlistItemIndex === safeIndex
+                        ? {
+                            ...playlistItem,
+                            duration: nextDuration,
+                            durationLabel: formatTime(nextDuration),
+                        }
+                        : playlistItem
+                );
+            });
+            mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
+            mediaPositionRef.current = 0;
+            updateMediaSessionMetadata();
+            updateMediaSessionState(autoplay ? "playing" : "paused", {
+                forcePosition: true,
+            });
             refreshStorageInfo();
 
             const loadMessage = `Loaded playlist item ${safeIndex + 1} of ${
@@ -7330,6 +7767,8 @@ export default function Audio() {
             activeSourceRef.current = source;
             startedOffsetRef.current = safeOffset;
             startedAtContextTimeRef.current = context.currentTime;
+            mediaPositionRef.current = safeOffset;
+            mediaDurationRef.current = Number(buffer.duration) || mediaDurationRef.current;
             currentEffectiveRateRef.current = getEffectivePlaybackRate(
                 latestSettingsRef.current
             );
@@ -7374,7 +7813,7 @@ export default function Audio() {
                     if (!singleIPhoneRouteStillReady) {
                         stopActiveSource();
                         setPlayingState(false);
-                        updateMediaSessionState("paused");
+                        updateMediaSessionState("paused", { forcePosition: true });
                         throw new Error(
                             `The iPhone Media Session duration advanced, but the audible output route was not playing. ${buildMobileAudioHint()}`
                         );
@@ -7389,7 +7828,7 @@ export default function Audio() {
             setMixerEnabled(true);
             setPlayingState(true);
             updateMediaSessionMetadata();
-            updateMediaSessionState("playing");
+            updateMediaSessionState("playing", { forcePosition: true });
             startPositionTimer();
             startVisualizer();
 
@@ -7429,7 +7868,7 @@ export default function Audio() {
         if (isIPhone && pauseActionInFlightRef.current) {
             extendCleanPauseWindow(options.fromMediaSession ? 1600 : 1200);
             holdIPhonePauseSilence(options.reason || "Repeated Pause ignored");
-            updateMediaSessionState("paused");
+            updateMediaSessionState("paused", { forcePosition: true });
             return true;
         }
 
@@ -7451,10 +7890,11 @@ export default function Audio() {
 
         startedOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = nextOffset;
 
         setPosition(nextOffset);
         setPlayingState(false);
-        updateMediaSessionState("paused");
+        updateMediaSessionState("paused", { forcePosition: true });
         stopPositionTimer();
         stopVisualizer();
 
@@ -7525,9 +7965,11 @@ export default function Audio() {
 
         startedOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = nextOffset;
 
         setPosition(nextOffset);
         setPlayingState(false);
+        updateMediaSessionState("paused", { forcePosition: true });
 
         if (shouldResume && nextOffset < buffer.duration) {
             await startBufferPlayback(false, {
@@ -7536,9 +7978,15 @@ export default function Audio() {
                 outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                 forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
             });
-            setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
+            updateMediaSessionState("playing", { forcePosition: true });
+            if (!options.fromMediaSession) {
+                setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
+            }
         } else {
-            setInfo(`Scrubbed to ${formatTime(nextOffset)}.`);
+            updateMediaSessionState("paused", { forcePosition: true });
+            if (!options.fromMediaSession) {
+                setInfo(`Scrubbed to ${formatTime(nextOffset)}.`);
+            }
         }
     }
 
@@ -7557,10 +8005,12 @@ export default function Audio() {
 
         startedOffsetRef.current = currentOffset;
         startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = currentOffset;
 
         setPosition(currentOffset);
         setPlayingState(false);
         setIsScrubbing(true);
+        updateMediaSessionState("paused", { forcePosition: true });
     }
 
     function handleScrubChange(_, nextValue) {
@@ -7572,8 +8022,10 @@ export default function Audio() {
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
 
         scrubbingRef.current = true;
+        mediaPositionRef.current = nextOffset;
         setIsScrubbing(true);
         setPosition(nextOffset);
+        updateMediaSessionPositionState({ forcePosition: true });
     }
 
     async function handleScrubCommit(_, nextValue) {
@@ -7590,7 +8042,10 @@ export default function Audio() {
 
         setIsScrubbing(false);
 
-        await seekTo(nextOffset, shouldResume);
+        await seekTo(nextOffset, shouldResume, {
+            preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
+        });
     }
 
     function updateSetting(key, value) {
