@@ -2968,6 +2968,7 @@ export default function Audio() {
     const lastMediaSessionPauseAtRef = useRef(0);
     const pauseActionInFlightRef = useRef(false);
     const ignoreOutputPauseUntilRef = useRef(0);
+    const ignoreOutputPlayUntilRef = useRef(0);
     const pauseReleaseTimerRef = useRef(null);
     const iPhonePauseSquelchUntilRef = useRef(0);
     const iPhonePauseSerialRef = useRef(0);
@@ -3253,15 +3254,26 @@ export default function Audio() {
         }
 
         const handleOutputPlay = () => {
-            if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
+            const now = Date.now();
+
+            if (
+                outputElementActionGuardRef.current ||
+                now < (ignoreOutputPlayUntilRef.current || 0) ||
+                isInsideCleanPauseWindow()
+            ) {
+                // During Pause, the hidden iPhone MediaStream element can emit a
+                // synthetic play/playing event while Safari settles the route. Do
+                // not convert that event into a real Play action and do not flip
+                // Media Session back and forth; that was the one-frame button flash
+                // and the no-sound-after-pause race.
                 if (isInsideCleanPauseWindow()) {
                     holdIPhonePauseSilence("Ignored hidden iPhone output play event during Pause");
                 }
-                updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                if (playingRef.current) {
+                    updateMediaSessionState("playing");
+                }
                 return;
             }
-
-            const now = Date.now();
 
             if (now - lastOutputElementPlayEventAtRef.current < 350) {
                 return;
@@ -3274,7 +3286,9 @@ export default function Audio() {
 
         const handleOutputPause = () => {
             if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
-                updateMediaSessionState(playingRef.current ? "playing" : "paused");
+                if (playingRef.current) {
+                    updateMediaSessionState("playing");
+                }
                 return;
             }
 
@@ -3406,14 +3420,6 @@ export default function Audio() {
         }, safeDuration);
     }
 
-    function setPauseUiStatusOnce(message) {
-        if (pauseUiStatusSettledRef.current) {
-            return;
-        }
-
-        pauseUiStatusSettledRef.current = true;
-        setCarPlayOutputStatusIfChanged(message);
-    }
 
     function clearCarPlayRecoveryTimer() {
         if (carPlayRecoveryTimerRef.current) {
@@ -3429,6 +3435,34 @@ export default function Audio() {
         }
     }
 
+    function clearIPhonePauseGuardsForPlay() {
+        if (!isIOSAudioDevice()) {
+            return;
+        }
+
+        // A real Play action must cancel every pending Pause quiet/squelch guard
+        // before any output restore or element.play() call. Otherwise Safari can
+        // leave the button in Play while the stream is still volume-squelched.
+        iPhonePauseSerialRef.current += 1;
+        pauseActionInFlightRef.current = false;
+        ignoreOutputPauseUntilRef.current = 0;
+        ignoreOutputPlayUntilRef.current = 0;
+        iPhonePauseSquelchUntilRef.current = 0;
+        pauseUiQuietUntilRef.current = 0;
+        pauseUiStatusSettledRef.current = false;
+        outputElementActionGuardRef.current = false;
+        clearPauseReleaseTimer();
+        clearPauseUiQuietTimer();
+        clearCarPlayRecoveryTimer();
+
+        try {
+            setIPhoneOutputElementVolumeForPause(1);
+            restoreKeepAliveCarrierAfterPlay();
+        } catch {
+            // Best-effort only; the normal Play path still restores the graph.
+        }
+    }
+
     function beginCleanPauseWindow(durationMs = 1400) {
         const now = Date.now();
         const safeDuration = Math.max(450, Number(durationMs) || 1400);
@@ -3436,6 +3470,7 @@ export default function Audio() {
         pauseActionInFlightRef.current = true;
         lastMediaSessionPauseAtRef.current = now;
         ignoreOutputPauseUntilRef.current = now + safeDuration;
+        ignoreOutputPlayUntilRef.current = now + safeDuration + 650;
         iPhonePauseSquelchUntilRef.current = now + safeDuration + 450;
         iPhonePauseSerialRef.current += 1;
         beginPauseUiQuietWindow(safeDuration + 650);
@@ -3455,6 +3490,10 @@ export default function Audio() {
         ignoreOutputPauseUntilRef.current = Math.max(
             ignoreOutputPauseUntilRef.current || 0,
             now + safeDuration
+        );
+        ignoreOutputPlayUntilRef.current = Math.max(
+            ignoreOutputPlayUntilRef.current || 0,
+            now + safeDuration + 650
         );
         iPhonePauseSquelchUntilRef.current = Math.max(
             iPhonePauseSquelchUntilRef.current || 0,
@@ -3584,11 +3623,9 @@ export default function Audio() {
             // Keep pause silence best-effort only.
         }
 
-        if (carPlaySafeModeRef.current) {
-            setPauseUiStatusOnce(
-                "Pause is holding the iPhone output silent until Play. Route recovery, hidden-element play events, monitor gain, base gain, and keep-alive gain are blocked during the pause quiet window."
-            );
-        }
+        // No React/UI status updates here. This function can run many times from
+        // hidden iOS media-element events while Pause is settling, so updating
+        // state here causes the button/card flash even though the audio is fine.
     }
 
     function canUseMediaSession() {
@@ -3974,10 +4011,7 @@ export default function Audio() {
             return true;
         }
 
-        pauseActionInFlightRef.current = false;
-        ignoreOutputPauseUntilRef.current = 0;
-        iPhonePauseSquelchUntilRef.current = 0;
-        clearPauseReleaseTimer();
+        clearIPhonePauseGuardsForPlay();
 
         const restartToken = mediaSessionPlayRestartTokenRef.current + 1;
 
@@ -4207,10 +4241,6 @@ export default function Audio() {
             }
         }, 260);
 
-        setCarPlayOutputStatusIfChanged(
-            "Paused cleanly. The iPhone output is held silent until Play, and repeated lock-screen pause events are ignored so the page does not flash-render the Pause button."
-        );
-
         return true;
     }
 
@@ -4228,7 +4258,7 @@ export default function Audio() {
         }
 
         try {
-            iPhonePauseSquelchUntilRef.current = 0;
+            clearIPhonePauseGuardsForPlay();
             attachOutputElementToCurrentStream(
                 outputAudioRef.current,
                 mediaStreamDestinationRef.current?.stream || null
@@ -4355,9 +4385,7 @@ export default function Audio() {
             }
 
             const { context, nodes } = ensureLiveGraph();
-            if (isIOSAudioDevice()) {
-                iPhonePauseSquelchUntilRef.current = 0;
-            }
+            clearIPhonePauseGuardsForPlay();
             forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Play"
@@ -6762,12 +6790,7 @@ export default function Audio() {
         try {
             const { context, nodes } = ensureLiveGraph();
             if (isIOSAudioDevice()) {
-                pauseActionInFlightRef.current = false;
-                ignoreOutputPauseUntilRef.current = 0;
-                iPhonePauseSquelchUntilRef.current = 0;
-                clearPauseReleaseTimer();
-                setIPhoneOutputElementVolumeForPause(1);
-                restoreKeepAliveCarrierAfterPlay();
+                clearIPhonePauseGuardsForPlay();
             }
             forceRestoreAudibleWebAudioOutput(context, nodes, { allowDuringPause: true });
             const unlocked = await unlockMobileAudioContext(context);
@@ -6993,11 +7016,9 @@ export default function Audio() {
             });
         }
 
-        setInfo(
-            isIPhone
-                ? "Playback paused with hard iPhone pause squelch. The hidden stream stays attached, but monitor/base gain, keep-alive carrier, output-element volume, and route recovery stay at zero until Play."
-                : "Playback paused. Press Play to resume from this position."
-        );
+        if (!isIPhone) {
+            setInfo("Playback paused. Press Play to resume from this position.");
+        }
 
         return true;
     }
@@ -8762,30 +8783,31 @@ export default function Audio() {
                                             const selected = activePresetKey === preset.key;
 
                                             return (
-                                                <Button
-                                                    key={preset.key}
-                                                    role="listitem"
-                                                    type="button"
-                                                    variant={selected ? "contained" : "outlined"}
-                                                    aria-pressed={selected}
-                                                    onClick={() => applyMixerPreset(preset.key)}
-                                                    disabled={isRendering || isLoading}
-                                                    sx={{
-                                                        justifyContent: "flex-start",
-                                                        borderRadius: 3,
-                                                        px: 1.4,
-                                                        py: 1,
-                                                        color: selected ? "#06111e" : "#fff",
-                                                        borderColor: "rgba(255,255,255,0.16)",
-                                                        fontWeight: 950,
-                                                        background: selected
-                                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                            : "rgba(255,255,255,0.03)",
-                                                        textAlign: "left",
-                                                    }}
-                                                >
-                                                    {preset.shortLabel || preset.label}
-                                                </Button>
+                                                <Box key={preset.key} role="listitem">
+                                                    <Button
+                                                        type="button"
+                                                        variant={selected ? "contained" : "outlined"}
+                                                        aria-pressed={selected}
+                                                        onClick={() => applyMixerPreset(preset.key)}
+                                                        disabled={isRendering || isLoading}
+                                                        fullWidth
+                                                        sx={{
+                                                            justifyContent: "flex-start",
+                                                            borderRadius: 3,
+                                                            px: 1.4,
+                                                            py: 1,
+                                                            color: selected ? "#06111e" : "#fff",
+                                                            borderColor: "rgba(255,255,255,0.16)",
+                                                            fontWeight: 950,
+                                                            background: selected
+                                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                                : "rgba(255,255,255,0.03)",
+                                                            textAlign: "left",
+                                                        }}
+                                                    >
+                                                        {preset.shortLabel || preset.label}
+                                                    </Button>
+                                                </Box>
                                             );
                                         })}
                                     </Box>
