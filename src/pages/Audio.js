@@ -21,6 +21,7 @@ import RepeatRoundedIcon from "@mui/icons-material/RepeatRounded";
 import QueueMusicRoundedIcon from "@mui/icons-material/QueueMusicRounded";
 import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
 import SkipNextRoundedIcon from "@mui/icons-material/SkipNextRounded";
+import SkipPreviousRoundedIcon from "@mui/icons-material/SkipPreviousRounded";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import VolumeOffRoundedIcon from "@mui/icons-material/VolumeOffRounded";
 import VolumeUpRoundedIcon from "@mui/icons-material/VolumeUpRounded";
@@ -3421,7 +3422,6 @@ export default function Audio() {
             return;
         }
 
-        const mediaDuration = getMediaSessionDuration();
         const safeState = hasMediaSessionTarget() ? nextState : "none";
 
         try {
@@ -3431,18 +3431,15 @@ export default function Audio() {
         }
 
         try {
-            if (
-                typeof navigator.mediaSession.setPositionState === "function" &&
-                mediaDuration > 0
-            ) {
-                navigator.mediaSession.setPositionState({
-                    duration: mediaDuration,
-                    playbackRate: currentEffectiveRateRef.current || 1,
-                    position: getMediaSessionPosition(),
-                });
+            // Keep lock-screen controls as transport controls only. Publishing
+            // Media Session position state can make some mobile lock screens
+            // show previous/next 10-second seek buttons instead of real
+            // previous-track / next-track buttons.
+            if (typeof navigator.mediaSession.setPositionState === "function") {
+                navigator.mediaSession.setPositionState();
             }
         } catch {
-            // Position state is best-effort only.
+            // Position state clearing is best-effort only.
         }
     }
 
@@ -3487,7 +3484,9 @@ export default function Audio() {
             stream &&
             element.srcObject === stream &&
             !element.paused &&
-            !element.ended
+            !element.ended &&
+            !element.muted &&
+            Number(element.volume) > 0
         );
     }
 
@@ -3932,6 +3931,13 @@ export default function Audio() {
     async function pauseFromMediaSession() {
         if (playingRef.current) {
             pausePlayback();
+
+            if (isIOSAudioDevice()) {
+                await keepIPhoneOutputElementAliveForLockScreen(
+                    "Lock-screen Pause stopped the WebAudio source but kept the hidden iPhone stream alive for Play"
+                );
+            }
+
             forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             return true;
         }
@@ -3996,18 +4002,14 @@ export default function Audio() {
         }
 
         if (!Array.isArray(list) || !list.length) {
-            const mediaDuration = getMediaSessionDuration();
-
-            if (mediaDuration > 0) {
-                await seekTo(mediaDuration, false, {
-                    fromMediaSession: true,
-                    preserveUnlockedOutput: true,
-                    outputAlreadyRestarted,
-                    forceIPhoneOutputPostStart: true,
-                });
+            if (isIPhoneLockScreenAction) {
+                await keepIPhoneOutputElementAliveForLockScreen(
+                    "Lock-screen Next found no playlist but kept the iPhone stream alive"
+                );
+                forceRestoreAudibleWebAudioOutput(audioContextRef.current, liveNodesRef.current);
             }
 
-            setInfo("No playlist is loaded, so lock-screen Next moved to the end of the current media.");
+            setInfo("No playlist is loaded, so lock-screen Next has no track to skip to. It no longer seeks forward by 10 seconds.");
             return true;
         }
 
@@ -4046,6 +4048,7 @@ export default function Audio() {
                 outputAlreadyRestarted,
                 forceIPhoneOutputPostStart: true,
             });
+            setInfo("No playlist is loaded, so lock-screen Previous restarted the current media from the beginning. It no longer seeks backward by 10 seconds.");
             return true;
         }
 
@@ -4062,33 +4065,6 @@ export default function Audio() {
         });
     }
 
-    async function seekFromMediaSession(targetSeconds, shouldResume = playingRef.current) {
-        const mediaDuration = getMediaSessionDuration();
-        const nextPosition = mediaDuration
-            ? clamp(numberOrDefault(targetSeconds, 0), 0, mediaDuration)
-            : Math.max(0, numberOrDefault(targetSeconds, 0));
-
-        let outputAlreadyRestarted = false;
-
-        if (isIOSAudioDevice() && shouldResume) {
-            const { context, nodes } = ensureLiveGraph();
-            forceRestoreAudibleWebAudioOutput(context, nodes);
-            outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
-                "Lock-screen Seek"
-            );
-            forceRestoreAudibleWebAudioOutput(context, nodes);
-        }
-
-        await seekTo(nextPosition, shouldResume, {
-            fromMediaSession: true,
-            preserveUnlockedOutput: true,
-            outputAlreadyRestarted,
-            forceIPhoneOutputPostStart: true,
-        });
-        updateMediaSessionState(playingRef.current ? "playing" : "paused");
-        return true;
-    }
-
     function installMediaSessionHandlers() {
         if (!canUseMediaSession() || typeof navigator.mediaSession.setActionHandler !== "function") {
             return;
@@ -4102,6 +4078,30 @@ export default function Audio() {
             }
         };
 
+        const safeClearAction = (action) => {
+            try {
+                navigator.mediaSession.setActionHandler(action, null);
+            } catch {
+                // Older Safari builds may not support clearing every action.
+            }
+        };
+
+        // Clear all seek-style handlers first. When seekbackward/seekforward
+        // are installed, iPhone/Android lock screens commonly show
+        // "previous 10 seconds" and "next 10 seconds" instead of real
+        // previous-track / next-track transport controls.
+        ["seekbackward", "seekforward", "seekto"].forEach(safeClearAction);
+
+        if (isIOSAudioDevice() && typeof navigator.mediaSession.setPositionState === "function") {
+            try {
+                // Clearing position state helps iOS choose transport controls
+                // instead of seek controls on the lock screen.
+                navigator.mediaSession.setPositionState();
+            } catch {
+                // Position state clearing is best-effort only.
+            }
+        }
+
         safeSetAction("play", () => {
             return runMediaSessionAction("Lock-screen Play", playFromMediaSession);
         });
@@ -4114,38 +4114,13 @@ export default function Audio() {
             return runMediaSessionAction("Lock-screen Stop", stopFromMediaSession);
         });
 
-        // Hardware keys, Bluetooth controls, CarPlay controls, and iOS lock-screen
-        // transport buttons use these exact Media Session action names.
+        // Real track controls only. Do not install seekbackward/seekforward.
         safeSetAction("nexttrack", () => {
-            return runMediaSessionAction("Lock-screen Next", nextTrackFromMediaSession);
+            return runMediaSessionAction("Lock-screen Next Track", nextTrackFromMediaSession);
         });
 
         safeSetAction("previoustrack", () => {
-            return runMediaSessionAction("Lock-screen Previous", previousTrackFromMediaSession);
-        });
-
-        safeSetAction("seekbackward", (details) => {
-            return runMediaSessionAction("Lock-screen Seek Back", () => {
-                const seekSeconds = Number(details?.seekOffset) || 10;
-                return seekFromMediaSession(getMediaSessionPosition() - seekSeconds, playingRef.current);
-            });
-        });
-
-        safeSetAction("seekforward", (details) => {
-            return runMediaSessionAction("Lock-screen Seek Forward", () => {
-                const seekSeconds = Number(details?.seekOffset) || 10;
-                return seekFromMediaSession(getMediaSessionPosition() + seekSeconds, playingRef.current);
-            });
-        });
-
-        safeSetAction("seekto", (details) => {
-            return runMediaSessionAction("Lock-screen Seek", () => {
-                if (!Number.isFinite(details?.seekTime)) {
-                    return false;
-                }
-
-                return seekFromMediaSession(details.seekTime, playingRef.current);
-            });
+            return runMediaSessionAction("Lock-screen Previous Track", previousTrackFromMediaSession);
         });
     }
 
@@ -5982,6 +5957,30 @@ export default function Audio() {
         }
     }
 
+    async function playPreviousPlaylistItem() {
+        const list = playlistRef.current;
+
+        if (!list.length) {
+            setError("Add uploaded files or direct media links to the playlist first.");
+            return;
+        }
+
+        const primed = await primeIPhonePlaylistOutputFromGesture();
+
+        if (!primed) {
+            return;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+        const previousIndex = getPreviousPlaylistIndex(currentIndex, list);
+
+        loadNextPlayablePlaylistItem(previousIndex, {
+            autoplay: true,
+            reason: "Manual previous-track request",
+            preserveUnlockedOutput: isIOSAudioDevice(),
+        });
+    }
+
     async function playNextPlaylistItem() {
         const list = playlistRef.current;
 
@@ -7463,6 +7462,21 @@ export default function Audio() {
                                         <Stack direction="row" flexWrap="wrap" gap={1}>
                                             <Button
                                                 variant="outlined"
+                                                startIcon={<SkipPreviousRoundedIcon />}
+                                                onClick={playPreviousPlaylistItem}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    borderRadius: 999,
+                                                    color: "#fff",
+                                                    borderColor: "rgba(255,255,255,0.18)",
+                                                    fontWeight: 900,
+                                                }}
+                                            >
+                                                Play previous
+                                            </Button>
+
+                                            <Button
+                                                variant="outlined"
                                                 startIcon={<SkipNextRoundedIcon />}
                                                 onClick={playNextPlaylistItem}
                                                 disabled={isRendering || isLoading}
@@ -7868,6 +7882,24 @@ export default function Audio() {
                                         }}
                                     >
                                         {repeatEnabled ? "Repeat on" : "Repeat off"}
+                                    </Button>
+
+                                    <Button
+                                        fullWidth
+                                        size="large"
+                                        variant="outlined"
+                                        startIcon={<SkipPreviousRoundedIcon />}
+                                        onClick={playPreviousPlaylistItem}
+                                        disabled={!playlist.length || isRendering || isLoading}
+                                        sx={{
+                                            borderRadius: 4,
+                                            py: 1.35,
+                                            color: "#fff",
+                                            borderColor: "rgba(255,255,255,0.18)",
+                                            fontWeight: 950,
+                                        }}
+                                    >
+                                        Previous track
                                     </Button>
 
                                     <Button
