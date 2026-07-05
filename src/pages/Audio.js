@@ -6057,7 +6057,7 @@ export default function Audio() {
                         carPlaySafeModeRef.current
                             ? "CarPlay / USB safe mode is active. "
                             : ""
-                    }Playing through the hidden iPhone media element output path. Pause/stop keeps a near-silent stream alive so lock-screen Play can rebuild the WebAudio effects source from the saved position instead of advancing a silent timer.`
+                    }Playing through the hidden iPhone media element output path. Pause keeps a near-silent stream alive; lock-screen Stop pauses that hidden stream, and lock-screen Play re-arms it before rebuilding the WebAudio effects source from the saved position.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
