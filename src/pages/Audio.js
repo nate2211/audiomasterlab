@@ -383,6 +383,8 @@ const PLAYLIST_RECOVERY_SETTINGS = {
     fetchCacheModes: ["no-store", "reload", "default"],
 };
 
+const IPHONE_KEEP_ALIVE_GAIN = 0.0000004;
+
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 
 function isArchiveMediaHost(hostname = "") {
@@ -2967,6 +2969,8 @@ export default function Audio() {
     const pauseActionInFlightRef = useRef(false);
     const ignoreOutputPauseUntilRef = useRef(0);
     const pauseReleaseTimerRef = useRef(null);
+    const iPhonePauseSquelchUntilRef = useRef(0);
+    const iPhonePauseSerialRef = useRef(0);
     const mediaSessionActionQueueRef = useRef(Promise.resolve());
     const mediaSessionActionSerialRef = useRef(0);
     const iPhoneLockScreenOutputArmedRef = useRef(false);
@@ -3240,7 +3244,10 @@ export default function Audio() {
         }
 
         const handleOutputPlay = () => {
-            if (outputElementActionGuardRef.current) {
+            if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
+                if (isInsideCleanPauseWindow()) {
+                    holdIPhonePauseSilence("Ignored hidden iPhone output play event during Pause");
+                }
                 updateMediaSessionState(playingRef.current ? "playing" : "paused");
                 return;
             }
@@ -3284,6 +3291,11 @@ export default function Audio() {
 
         const recoverEvents = ["stalled", "suspend", "waiting", "emptied", "abort", "error"];
         const handleRecoverableOutputEvent = (event) => {
+            if (isInsideCleanPauseWindow()) {
+                holdIPhonePauseSilence(`Ignored hidden iOS output element ${event.type} during Pause`);
+                return;
+            }
+
             if (!playingRef.current && event.type !== "error") {
                 return;
             }
@@ -3347,6 +3359,8 @@ export default function Audio() {
         pauseActionInFlightRef.current = true;
         lastMediaSessionPauseAtRef.current = now;
         ignoreOutputPauseUntilRef.current = now + safeDuration;
+        iPhonePauseSquelchUntilRef.current = now + safeDuration + 450;
+        iPhonePauseSerialRef.current += 1;
         clearCarPlayRecoveryTimer();
         clearPauseReleaseTimer();
 
@@ -3364,6 +3378,10 @@ export default function Audio() {
             ignoreOutputPauseUntilRef.current || 0,
             now + safeDuration
         );
+        iPhonePauseSquelchUntilRef.current = Math.max(
+            iPhonePauseSquelchUntilRef.current || 0,
+            now + safeDuration + 450
+        );
         pauseActionInFlightRef.current = true;
         clearPauseReleaseTimer();
 
@@ -3374,26 +3392,124 @@ export default function Audio() {
     }
 
     function isInsideCleanPauseWindow() {
-        return pauseActionInFlightRef.current || Date.now() < (ignoreOutputPauseUntilRef.current || 0);
+        const now = Date.now();
+        return (
+            pauseActionInFlightRef.current ||
+            now < (ignoreOutputPauseUntilRef.current || 0) ||
+            now < (iPhonePauseSquelchUntilRef.current || 0)
+        );
+    }
+
+    function isIPhonePauseSquelched() {
+        return isIOSAudioDevice() && isInsideCleanPauseWindow();
+    }
+
+    function setIPhoneOutputElementVolumeForPause(volume = 0) {
+        const element = outputAudioRef.current;
+
+        if (!element || !isIOSAudioDevice()) {
+            return;
+        }
+
+        try {
+            element.volume = clamp(numberOrDefault(volume, 0), 0, 1);
+            element.muted = false;
+            element.defaultMuted = false;
+            element.playsInline = true;
+            element.autoplay = true;
+            element.setAttribute("playsinline", "");
+            element.setAttribute("webkit-playsinline", "");
+            element.removeAttribute("muted");
+        } catch {
+            // Safe to ignore iOS element volume issues while locked.
+        }
+    }
+
+    function silenceKeepAliveCarrierForPause() {
+        const keepAlive = iPhoneSilentKeepAliveRef.current;
+        const context = audioContextRef.current;
+
+        if (!keepAlive?.gain || !context || context.state === "closed") {
+            return;
+        }
+
+        try {
+            setAudioParam(keepAlive.gain.gain, 0, context.currentTime || 0, 0.025);
+        } catch {
+            // Safe to ignore.
+        }
+    }
+
+    function restoreKeepAliveCarrierAfterPlay() {
+        const keepAlive = iPhoneSilentKeepAliveRef.current;
+        const context = audioContextRef.current;
+
+        if (!keepAlive?.gain || !context || context.state === "closed") {
+            return;
+        }
+
+        try {
+            setAudioParam(keepAlive.gain.gain, IPHONE_KEEP_ALIVE_GAIN, context.currentTime || 0, 0.04);
+        } catch {
+            // Safe to ignore.
+        }
     }
 
     async function fadeMonitorForPause(context = audioContextRef.current, fadeSeconds = 0.09) {
         if (!context || context.state === "closed") {
+            setIPhoneOutputElementVolumeForPause(0);
             return;
         }
 
         const now = context.currentTime || 0;
-        const safeFade = Math.max(0.04, Math.min(0.18, Number(fadeSeconds) || 0.09));
+        const safeFade = Math.max(0.07, Math.min(0.24, Number(fadeSeconds) || 0.11));
 
         try {
             if (monitorMuteGainRef.current?.gain) {
                 setAudioParam(monitorMuteGainRef.current.gain, 0, now, safeFade);
             }
+
+            if (liveNodesRef.current?.baseVolumeGain?.gain) {
+                setAudioParam(liveNodesRef.current.baseVolumeGain.gain, 0, now, safeFade);
+            }
         } catch {
             // Best-effort click/stutter prevention before pausing or suspending WebAudio.
         }
 
-        await sleep(Math.ceil(safeFade * 1000) + 28);
+        silenceKeepAliveCarrierForPause();
+        await sleep(Math.ceil(safeFade * 1000) + 42);
+        setIPhoneOutputElementVolumeForPause(0);
+    }
+
+    function holdIPhonePauseSilence(reason = "Pause silence guard") {
+        if (!isIOSAudioDevice()) {
+            return;
+        }
+
+        clearCarPlayRecoveryTimer();
+        silenceKeepAliveCarrierForPause();
+        setIPhoneOutputElementVolumeForPause(0);
+
+        const context = audioContextRef.current;
+        const now = context?.currentTime || 0;
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(monitorMuteGainRef.current.gain, 0, now, 0);
+            }
+
+            if (liveNodesRef.current?.baseVolumeGain?.gain) {
+                setAudioParam(liveNodesRef.current.baseVolumeGain.gain, 0, now, 0);
+            }
+        } catch {
+            // Keep pause silence best-effort only.
+        }
+
+        if (carPlaySafeModeRef.current) {
+            setCarPlayOutputStatus(
+                `${reason}: iPhone pause squelch is active, so route recovery and hidden-element play events cannot turn the stream back up during Pause.`
+            );
+        }
     }
 
     function canUseMediaSession() {
@@ -3536,6 +3652,11 @@ export default function Audio() {
     }
 
     async function unlockOutputElementForAppAction(element = outputAudioRef.current) {
+        if (isIPhonePauseSquelched()) {
+            holdIPhonePauseSilence("Blocked hidden iPhone element play() during Pause");
+            return false;
+        }
+
         outputElementActionGuardRef.current = true;
 
         try {
@@ -3656,7 +3777,12 @@ export default function Audio() {
         }
     }
 
-    function forceRestoreAudibleWebAudioOutput(context = audioContextRef.current, nodes = liveNodesRef.current) {
+    function forceRestoreAudibleWebAudioOutput(context = audioContextRef.current, nodes = liveNodesRef.current, options = {}) {
+        if (!options.allowDuringPause && isIPhonePauseSquelched()) {
+            holdIPhonePauseSilence("Blocked output-volume restore during Pause");
+            return 0;
+        }
+
         const safeSettings = normalizeSettings(latestSettingsRef.current);
         const safeBaseVolume = Math.max(
             0.01,
@@ -3687,6 +3813,7 @@ export default function Audio() {
 
         if (element && isIOSAudioDevice()) {
             try {
+                restoreKeepAliveCarrierAfterPlay();
                 element.muted = false;
                 element.defaultMuted = false;
                 element.volume = 1;
@@ -3740,9 +3867,11 @@ export default function Audio() {
                 }
             }
 
+            const insidePause = isInsideCleanPauseWindow();
+
             element.muted = false;
             element.defaultMuted = false;
-            element.volume = 1;
+            element.volume = insidePause ? 0 : 1;
             element.playsInline = true;
             element.autoplay = true;
             element.preload = "auto";
@@ -3768,6 +3897,7 @@ export default function Audio() {
 
         pauseActionInFlightRef.current = false;
         ignoreOutputPauseUntilRef.current = 0;
+        iPhonePauseSquelchUntilRef.current = 0;
         clearPauseReleaseTimer();
 
         const restartToken = mediaSessionPlayRestartTokenRef.current + 1;
@@ -3937,8 +4067,10 @@ export default function Audio() {
             return true;
         }
 
-        beginCleanPauseWindow(1700);
+        beginCleanPauseWindow(2300);
+        const pauseSerial = iPhonePauseSerialRef.current;
         outputElementActionGuardRef.current = true;
+        holdIPhonePauseSilence(`${reason} started`);
 
         const nextOffset = getCurrentOffset();
 
@@ -3947,7 +4079,8 @@ export default function Audio() {
         // command. Those operations restart the MediaStream route for a split
         // second on iOS and sound like stutter or duplicated audio.
         try {
-            await fadeMonitorForPause(context, 0.095);
+            await fadeMonitorForPause(context, 0.14);
+            holdIPhonePauseSilence(`${reason} fade completed`);
         } catch {
             // Best-effort click/stutter prevention before suspending WebAudio.
         }
@@ -3970,7 +4103,9 @@ export default function Audio() {
 
         try {
             if (context.state === "running") {
+                holdIPhonePauseSilence(`${reason} before AudioContext suspend`);
                 await context.suspend();
+                holdIPhonePauseSilence(`${reason} after AudioContext suspend`);
             }
         } catch {
             iPhoneLockScreenLivePauseRef.current = {
@@ -3987,8 +4122,14 @@ export default function Audio() {
             }, 900);
         }
 
+        window.setTimeout(() => {
+            if (iPhonePauseSerialRef.current === pauseSerial && !playingRef.current) {
+                holdIPhonePauseSilence(`${reason} post-pause guard`);
+            }
+        }, 260);
+
         setCarPlayOutputStatus(
-            `${reason}: paused with a quiet gain fade first, then suspended WebAudio. The hidden iPhone stream is not replayed during Pause, so there is no lock-screen stutter, flutter, or doubled/muddy stream.`
+            `${reason}: paused with a hard iPhone squelch. The WebAudio monitor, base volume, keep-alive carrier, hidden media element volume, route recovery, and hidden-element play events are all held at zero during Pause, so the stream cannot stutter louder or double back in.`
         );
 
         return true;
@@ -4008,10 +4149,13 @@ export default function Audio() {
         }
 
         try {
+            iPhonePauseSquelchUntilRef.current = 0;
             attachOutputElementToCurrentStream(
                 outputAudioRef.current,
                 mediaStreamDestinationRef.current?.stream || null
             );
+            setIPhoneOutputElementVolumeForPause(1);
+            restoreKeepAliveCarrierAfterPlay();
 
             try {
                 await unlockOutputElementForAppAction(outputAudioRef.current);
@@ -4132,6 +4276,9 @@ export default function Audio() {
             }
 
             const { context, nodes } = ensureLiveGraph();
+            if (isIOSAudioDevice()) {
+                iPhonePauseSquelchUntilRef.current = 0;
+            }
             forceRestoreAudibleWebAudioOutput(context, nodes);
             outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
                 "Lock-screen Play"
@@ -4432,6 +4579,11 @@ export default function Audio() {
             return false;
         }
 
+        if (!options.forcePlay && isInsideCleanPauseWindow()) {
+            holdIPhonePauseSilence(reason || "Blocked route recovery during Pause");
+            return false;
+        }
+
         const context = audioContextRef.current;
         const element = outputAudioRef.current;
         const shouldForcePlay = Boolean(options.forcePlay);
@@ -4660,8 +4812,8 @@ export default function Audio() {
             // suspend while the phone is locked. Use an ultra-low, practically
             // inaudible carrier only to keep the MediaStream route warm. Keep
             // this gain extremely low so it cannot muddy the real stream.
-            oscillator.frequency.value = 18;
-            gain.gain.value = 0.000005;
+            oscillator.frequency.value = 14;
+            gain.gain.value = isInsideCleanPauseWindow() ? 0 : IPHONE_KEEP_ALIVE_GAIN;
 
             oscillator.connect(gain);
             gain.connect(destinationNode);
@@ -4909,6 +5061,11 @@ export default function Audio() {
         const monitorGain = monitorMuteGainRef.current;
 
         if (!context || !monitorGain) return;
+
+        if (isIPhonePauseSquelched()) {
+            setAudioParam(monitorGain.gain, 0, context.currentTime);
+            return;
+        }
 
         setAudioParam(monitorGain.gain, nextMuted ? 0 : 1, context.currentTime);
     }
@@ -6525,7 +6682,15 @@ export default function Audio() {
 
         try {
             const { context, nodes } = ensureLiveGraph();
-            forceRestoreAudibleWebAudioOutput(context, nodes);
+            if (isIOSAudioDevice()) {
+                pauseActionInFlightRef.current = false;
+                ignoreOutputPauseUntilRef.current = 0;
+                iPhonePauseSquelchUntilRef.current = 0;
+                clearPauseReleaseTimer();
+                setIPhoneOutputElementVolumeForPause(1);
+                restoreKeepAliveCarrierAfterPlay();
+            }
+            forceRestoreAudibleWebAudioOutput(context, nodes, { allowDuringPause: true });
             const unlocked = await unlockMobileAudioContext(context);
 
             if (isIOSAudioDevice()) {
@@ -6676,7 +6841,7 @@ export default function Audio() {
                         carPlaySafeModeRef.current
                             ? "CarPlay / USB safe mode is active. "
                             : ""
-                    }Playing through the hidden iPhone media element output path. Pause keeps a near-silent stream alive; lock-screen Stop resets WebAudio but keeps that hidden route armed, and lock-screen Play confirms the route again after starting the audible source.`
+                    }Playing through the hidden iPhone media element output path. Pause hard-squelches the hidden stream volume and keep-alive carrier; lock-screen Stop resets WebAudio but keeps the hidden route attached, and lock-screen Play turns the single route back up after starting the audible source.`
                     : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
             );
 
@@ -6698,14 +6863,16 @@ export default function Audio() {
         const isIPhone = isIOSAudioDevice();
 
         if (isIPhone) {
-            beginCleanPauseWindow(options.fromMediaSession ? 1700 : 1250);
+            beginCleanPauseWindow(options.fromMediaSession ? 2300 : 1850);
             outputElementActionGuardRef.current = true;
+            holdIPhonePauseSilence(options.reason || "Pause started");
         }
 
         const nextOffset = getCurrentOffset();
 
         if (isIPhone && context && context.state !== "closed") {
-            await fadeMonitorForPause(context, options.fromMediaSession ? 0.095 : 0.075);
+            await fadeMonitorForPause(context, options.fromMediaSession ? 0.14 : 0.12);
+            holdIPhonePauseSilence(`${options.reason || "Pause"} fade completed`);
         }
 
         manualStopRef.current = true;
@@ -6725,9 +6892,14 @@ export default function Audio() {
             // during Pause. Play will re-arm the hidden MediaStream route when the
             // user actually asks to resume, which avoids pause-clicks and flutter.
             iPhoneLockScreenOutputArmedRef.current = false;
+            holdIPhonePauseSilence(`${options.reason || "Pause"} held silent`);
+            const pauseSerial = iPhonePauseSerialRef.current;
             window.setTimeout(() => {
+                if (iPhonePauseSerialRef.current === pauseSerial && !playingRef.current) {
+                    holdIPhonePauseSilence(`${options.reason || "Pause"} post-pause guard`);
+                }
                 outputElementActionGuardRef.current = false;
-            }, options.fromMediaSession ? 900 : 650);
+            }, options.fromMediaSession ? 1150 : 850);
         } else {
             pauseOutputElementForAppAction({
                 keepAlive: false,
@@ -6737,7 +6909,7 @@ export default function Audio() {
 
         setInfo(
             isIPhone
-                ? "Playback paused cleanly with a short fade. Press Play to re-arm the single hidden iPhone output route and restart from this position."
+                ? "Playback paused with hard iPhone pause squelch. The hidden stream stays attached, but monitor/base gain, keep-alive carrier, output-element volume, and route recovery stay at zero until Play."
                 : "Playback paused. Press Play to resume from this position."
         );
 
