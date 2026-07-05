@@ -2983,6 +2983,9 @@ export default function Audio() {
         contextTime: 0,
         reason: "",
     });
+    const pauseUiQuietUntilRef = useRef(0);
+    const pauseUiStatusSettledRef = useRef(false);
+    const pauseUiQuietTimerRef = useRef(null);
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3020,6 +3023,11 @@ export default function Audio() {
         buildCarPlaySafeModeLabel(readPersistedCarPlaySafeMode())
     );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
+
+    const isPlayingStateRef = useRef(isPlaying);
+    const statusMessageRef = useRef(status);
+    const statusToneRef = useRef(statusTone);
+    const carPlayOutputStatusValueRef = useRef(carPlayOutputStatus);
 
     const settingsView = normalizeSettings(settings);
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
@@ -3090,7 +3098,7 @@ export default function Audio() {
     useEffect(() => {
         carPlaySafeModeRef.current = carPlaySafeMode;
         persistCarPlaySafeModeToBrowser(carPlaySafeMode);
-        setCarPlayOutputStatus(buildCarPlaySafeModeLabel(carPlaySafeMode));
+        setCarPlayOutputStatusIfChanged(buildCarPlaySafeModeLabel(carPlaySafeMode));
 
         if (liveNodesRef.current && audioContextRef.current) {
             liveNodesRef.current.carPlaySafeMode = Boolean(
@@ -3162,6 +3170,7 @@ export default function Audio() {
             stopVisualizer();
             clearCarPlayRecoveryTimer();
             clearPauseReleaseTimer();
+            clearPauseUiQuietTimer();
             clearMediaSession();
 
             if (objectUrlRef.current) {
@@ -3324,18 +3333,86 @@ export default function Audio() {
     }, []);
 
     function setPlayingState(nextValue) {
-        playingRef.current = nextValue;
-        setIsPlaying(nextValue);
+        const safeValue = Boolean(nextValue);
+
+        if (playingRef.current === safeValue && isPlayingStateRef.current === safeValue) {
+            return;
+        }
+
+        playingRef.current = safeValue;
+        isPlayingStateRef.current = safeValue;
+        setIsPlaying((current) => (current === safeValue ? current : safeValue));
     }
 
     function setInfo(message) {
-        setStatus(message);
-        setStatusTone("info");
+        const safeMessage = String(message || "");
+
+        if (statusMessageRef.current === safeMessage && statusToneRef.current === "info") {
+            return;
+        }
+
+        statusMessageRef.current = safeMessage;
+        statusToneRef.current = "info";
+        setStatus(safeMessage);
+        setStatusTone((current) => (current === "info" ? current : "info"));
     }
 
     function setError(message) {
-        setStatus(message);
-        setStatusTone("error");
+        const safeMessage = String(message || "");
+
+        if (statusMessageRef.current === safeMessage && statusToneRef.current === "error") {
+            return;
+        }
+
+        statusMessageRef.current = safeMessage;
+        statusToneRef.current = "error";
+        setStatus(safeMessage);
+        setStatusTone((current) => (current === "error" ? current : "error"));
+    }
+
+    function setCarPlayOutputStatusIfChanged(message) {
+        const safeMessage = String(message || "");
+
+        if (!safeMessage || carPlayOutputStatusValueRef.current === safeMessage) {
+            return;
+        }
+
+        carPlayOutputStatusValueRef.current = safeMessage;
+        setCarPlayOutputStatus(safeMessage);
+    }
+
+    function clearPauseUiQuietTimer() {
+        if (pauseUiQuietTimerRef.current) {
+            window.clearTimeout(pauseUiQuietTimerRef.current);
+            pauseUiQuietTimerRef.current = null;
+        }
+    }
+
+    function beginPauseUiQuietWindow(durationMs = 1400) {
+        const now = Date.now();
+        const safeDuration = Math.max(450, Number(durationMs) || 1400);
+
+        pauseUiQuietUntilRef.current = Math.max(
+            pauseUiQuietUntilRef.current || 0,
+            now + safeDuration
+        );
+        pauseUiStatusSettledRef.current = false;
+        clearPauseUiQuietTimer();
+
+        pauseUiQuietTimerRef.current = window.setTimeout(() => {
+            pauseUiQuietTimerRef.current = null;
+            pauseUiQuietUntilRef.current = 0;
+            pauseUiStatusSettledRef.current = false;
+        }, safeDuration);
+    }
+
+    function setPauseUiStatusOnce(message) {
+        if (pauseUiStatusSettledRef.current) {
+            return;
+        }
+
+        pauseUiStatusSettledRef.current = true;
+        setCarPlayOutputStatusIfChanged(message);
     }
 
     function clearCarPlayRecoveryTimer() {
@@ -3361,6 +3438,7 @@ export default function Audio() {
         ignoreOutputPauseUntilRef.current = now + safeDuration;
         iPhonePauseSquelchUntilRef.current = now + safeDuration + 450;
         iPhonePauseSerialRef.current += 1;
+        beginPauseUiQuietWindow(safeDuration + 650);
         clearCarPlayRecoveryTimer();
         clearPauseReleaseTimer();
 
@@ -3383,6 +3461,7 @@ export default function Audio() {
             now + safeDuration + 450
         );
         pauseActionInFlightRef.current = true;
+        beginPauseUiQuietWindow(safeDuration + 650);
         clearPauseReleaseTimer();
 
         pauseReleaseTimerRef.current = window.setTimeout(() => {
@@ -3506,8 +3585,8 @@ export default function Audio() {
         }
 
         if (carPlaySafeModeRef.current) {
-            setCarPlayOutputStatus(
-                `${reason}: iPhone pause squelch is active, so route recovery and hidden-element play events cannot turn the stream back up during Pause.`
+            setPauseUiStatusOnce(
+                "Pause is holding the iPhone output silent until Play. Route recovery, hidden-element play events, monitor gain, base gain, and keep-alive gain are blocked during the pause quiet window."
             );
         }
     }
@@ -3730,7 +3809,7 @@ export default function Audio() {
             iPhoneLockScreenOutputArmedRef.current = armed;
 
             if (armed && carPlaySafeModeRef.current) {
-                setCarPlayOutputStatus(
+                setCarPlayOutputStatusIfChanged(
                     `${reason}: hidden iPhone stream is still alive, so lock-screen Play can restart the WebAudio effects graph without needing the page unlocked.`
                 );
             }
@@ -3960,7 +4039,7 @@ export default function Audio() {
 
             if (armed) {
                 iPhoneOutputHeldForLockScreenRestartRef.current = false;
-                setCarPlayOutputStatus(
+                setCarPlayOutputStatusIfChanged(
                     `${reason} re-armed the hidden iPhone media stream and Media Session can restart the WebAudio source from the saved position.`
                 );
                 return true;
@@ -3968,7 +4047,7 @@ export default function Audio() {
         }
 
         iPhoneLockScreenOutputArmedRef.current = false;
-        setCarPlayOutputStatus(
+        setCarPlayOutputStatusIfChanged(
             `${reason}: the hidden iPhone stream could not prove it was armed, so the player will still try the single hidden iPhone media-element route instead of failing before sound can start.`
         );
         return false;
@@ -4128,8 +4207,8 @@ export default function Audio() {
             }
         }, 260);
 
-        setCarPlayOutputStatus(
-            `${reason}: paused with a hard iPhone squelch. The WebAudio monitor, base volume, keep-alive carrier, hidden media element volume, route recovery, and hidden-element play events are all held at zero during Pause, so the stream cannot stutter louder or double back in.`
+        setCarPlayOutputStatusIfChanged(
+            "Paused cleanly. The iPhone output is held silent until Play, and repeated lock-screen pause events are ignored so the page does not flash-render the Pause button."
         );
 
         return true;
@@ -4203,7 +4282,7 @@ export default function Audio() {
                 // sink if the hidden element cannot prove it is playing while locked.
             });
 
-            setCarPlayOutputStatus(
+            setCarPlayOutputStatusIfChanged(
                 `${reason}: resumed the same suspended WebAudio source and restored monitor/base volume. This avoids the iOS locked-screen bug where a newly-created WebAudio source advances time but does not become audible.`
             );
 
@@ -4561,7 +4640,7 @@ export default function Audio() {
         lastCarPlayRecoveryReasonRef.current = reason || "iOS audio route recovery";
 
         if (carPlaySafeModeRef.current) {
-            setCarPlayOutputStatus(
+            setCarPlayOutputStatusIfChanged(
                 `CarPlay / USB safe mode is watching the iOS audio route. Last event: ${
                     reason || "route recovery"
                 }.`
@@ -4621,7 +4700,7 @@ export default function Audio() {
             updateMediaSessionMetadata();
             updateMediaSessionState(playingRef.current ? "playing" : "paused");
 
-            setCarPlayOutputStatus(
+            setCarPlayOutputStatusIfChanged(
                 carPlaySafeModeRef.current
                     ? `CarPlay / USB safe mode recovered the iOS output route${
                         reason ? ` after ${reason}` : ""
@@ -4631,7 +4710,7 @@ export default function Audio() {
 
             return true;
         } catch (error) {
-            setCarPlayOutputStatus(
+            setCarPlayOutputStatusIfChanged(
                 `CarPlay / USB output recovery needs one more tap on Play. ${
                     error?.message || buildMobileAudioHint()
                 }`
@@ -6591,7 +6670,7 @@ export default function Audio() {
             ensureIPhoneSilentKeepAlive(context, mediaStreamDestination);
 
             if (carPlaySafeModeRef.current) {
-                setCarPlayOutputStatus(
+                setCarPlayOutputStatusIfChanged(
                     "CarPlay / USB safe output path is armed with one hidden iOS media-element route. Direct WebAudio hardware output is not duplicated."
                 );
             }
@@ -6816,7 +6895,7 @@ export default function Audio() {
                         );
                     }
 
-                    setCarPlayOutputStatus(
+                    setCarPlayOutputStatusIfChanged(
                         "The hidden iPhone stream is still attached as the single output route. AudioMaster Lab did not duplicate the stream through direct WebAudio hardware output."
                     );
                 }
@@ -6830,7 +6909,7 @@ export default function Audio() {
             startVisualizer();
 
             if (isIOSAudioDevice() && carPlaySafeModeRef.current) {
-                setCarPlayOutputStatus(
+                setCarPlayOutputStatusIfChanged(
                     "CarPlay / USB safe mode is active: one persistent iOS output route, smoothed effect changes, centered pan, capped wet effects, and Media Session controls are armed."
                 );
             }
@@ -6861,6 +6940,13 @@ export default function Audio() {
 
         const context = audioContextRef.current;
         const isIPhone = isIOSAudioDevice();
+
+        if (isIPhone && pauseActionInFlightRef.current) {
+            extendCleanPauseWindow(options.fromMediaSession ? 1600 : 1200);
+            holdIPhonePauseSilence(options.reason || "Repeated Pause ignored");
+            updateMediaSessionState("paused");
+            return true;
+        }
 
         if (isIPhone) {
             beginCleanPauseWindow(options.fromMediaSession ? 2300 : 1850);
