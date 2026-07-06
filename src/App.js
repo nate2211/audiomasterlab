@@ -17,6 +17,7 @@ import Audio from "./pages/Audio.js";
 import Editor from "./pages/Editor.js";
 import Recorder from "./pages/Recorder.js";
 import ArchiveAudioBrowser from "./pages/Archive";
+import Community from "./pages/Community";
 import {
   Help,
   About,
@@ -376,7 +377,7 @@ export default function App() {
                   <Route path="/editor" element={<Editor />} />
                   <Route path="/youtube" element={<YoutubePage />} />
                   <Route path="/transcribe" element={<Transcripe />} />
-
+                  <Route path="/community" element={<Community />} />
                   <Route path="/visualizer" element={<Visualizer />} />
                   <Route path="/archive" element={<ArchiveAudioBrowser />} />
 

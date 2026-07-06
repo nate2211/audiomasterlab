@@ -391,6 +391,7 @@ const PLAYLIST_RECOVERY_SETTINGS = {
 const IPHONE_KEEP_ALIVE_GAIN = 0.0000004;
 
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
+const COMMUNITY_FEED_POST_URL = "https://scrapewebsite.pages.dev/api/community/posts";
 
 function isArchiveMediaHost(hostname = "") {
     const host = String(hostname || "").toLowerCase();
@@ -3358,6 +3359,7 @@ export default function Audio() {
     const [isRendering, setIsRendering] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [isPreloadingPlaylist, setIsPreloadingPlaylist] = useState(false);
+    const [isPostingCommunityPost, setIsPostingCommunityPost] = useState(false);
     const [playlistPreloadSummary, setPlaylistPreloadSummary] = useState("");
     const [isPlaying, setIsPlaying] = useState(false);
     const [isPauseUiSettling, setIsPauseUiSettling] = useState(false);
@@ -6700,6 +6702,114 @@ export default function Audio() {
         setError("Load a file or direct media link first, then add the loaded source to the playlist.");
     }
 
+    function buildCurrentCommunityPostPayload() {
+        const activeItem = playlistRef.current?.[activePlaylistIndexRef.current] || activePlaylistItem;
+        const playlistAudioUrl =
+            activeItem?.kind === "url" && activeItem?.url ? activeItem.url : "";
+        const loadedAudioUrl = sourceKind === "url" && sourceUrl ? sourceUrl : "";
+        const audioUrl = playlistAudioUrl || loadedAudioUrl;
+
+        if (!audioUrl) {
+            throw new Error(
+                "Load a direct media link or a URL-based playlist track before posting to the community feed. Local uploaded files need an upload backend before other users can play them."
+            );
+        }
+
+        if (/^(blob:|data:)/i.test(audioUrl)) {
+            throw new Error(
+                "This source is only available inside your browser tab. Use a direct media URL or upload the file to the backend before posting it to the community feed."
+            );
+        }
+
+        const canonicalAudioUrl = getCanonicalArchiveMediaUrl(audioUrl);
+        const communityAudioUrl = buildScrapeWebsiteArchiveProxyUrl(
+            canonicalAudioUrl || audioUrl
+        );
+        const isCommunityArchiveProxyUrl =
+            isScrapeWebsiteArchiveProxyUrl(communityAudioUrl);
+        const usesArchiveProxy =
+            isCommunityArchiveProxyUrl || communityAudioUrl !== audioUrl;
+        const title = normalizePlaylistUrlTitle(
+            activeItem?.title || mediaTitle,
+            audioUrl,
+            activeItem?.archiveFileName || cleanMediaFileTitle(canonicalAudioUrl)
+        );
+        const artworkUrl = buildAbsoluteMediaAssetUrl(
+            getPlaylistItemArtworkSource(activeItem)
+        );
+
+        return {
+            userName: "AudioMasterLab listener",
+            title: title || "Community audio post",
+            artist: "",
+            audioUrl: communityAudioUrl,
+            originalUrl: canonicalAudioUrl || audioUrl,
+            directArchiveUrl: canonicalAudioUrl || "",
+            proxiedArchiveUrl: isCommunityArchiveProxyUrl ? communityAudioUrl : "",
+            usesArchiveProxy,
+            artworkUrl,
+            caption: `Listening to ${title || "this track"} on AudioMasterLab.`,
+            duration: Number.isFinite(duration) ? duration : 0,
+            sourceKind: "url",
+            playlistItemId: activeItem?.id || "",
+            postedFrom: "audio-page",
+            createdAt: new Date().toISOString(),
+        };
+    }
+
+    async function postCurrentMediaToCommunityFeed() {
+        if (isPostingCommunityPost || isRendering || isLoading) {
+            return;
+        }
+
+        let payload;
+
+        try {
+            payload = buildCurrentCommunityPostPayload();
+        } catch (error) {
+            setError(error?.message || "Could not prepare this community post.");
+            return;
+        }
+
+        try {
+            setIsPostingCommunityPost(true);
+            setInfo(`Posting "${payload.title}" to the community feed...`);
+
+            const response = await fetch(COMMUNITY_FEED_POST_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+                body: JSON.stringify(payload),
+            });
+            const result = await response.json().catch(() => null);
+
+            if (!response.ok || result?.ok === false) {
+                throw new Error(
+                    result?.error ||
+                    result?.message ||
+                    `Community feed backend returned HTTP ${response.status}.`
+                );
+            }
+
+            setInfo(
+                `Posted "${payload.title}" to the community feed${
+                    payload.usesArchiveProxy
+                        ? " through the scrapewebsite Archive proxy so feed playback avoids Archive.org CORS."
+                        : "."
+                }`
+            );
+        } catch (error) {
+            setError(
+                error?.message ||
+                "Could not post this track to the community feed. Make sure /api/community/posts is deployed in your Cloudflare Pages Functions backend."
+            );
+        } finally {
+            setIsPostingCommunityPost(false);
+        }
+    }
+
     function normalizePlaylistIndex(index, list = playlistRef.current) {
         if (!Array.isArray(list) || !list.length) return -1;
 
@@ -9643,6 +9753,32 @@ export default function Audio() {
                                         Stop and reset position
                                     </Button>
                                 </Stack>
+
+                                <Button
+                                    fullWidth
+                                    size="large"
+                                    variant="contained"
+                                    startIcon={<PlaylistAddRoundedIcon />}
+                                    onClick={postCurrentMediaToCommunityFeed}
+                                    disabled={
+                                        !hasMedia ||
+                                        isRendering ||
+                                        isLoading ||
+                                        isPostingCommunityPost
+                                    }
+                                    sx={{
+                                        borderRadius: 4,
+                                        py: 1.25,
+                                        color: "#06111e",
+                                        fontWeight: 950,
+                                        background:
+                                            "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                    }}
+                                >
+                                    {isPostingCommunityPost
+                                        ? "Posting to community feed..."
+                                        : "Add post to community feed"}
+                                </Button>
 
                                 <StatusBanner status={status} tone={statusTone} />
 
