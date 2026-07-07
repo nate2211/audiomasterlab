@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
     Box,
     Button,
@@ -1085,6 +1085,27 @@ function sanitizePersistedPlaylistItem(item) {
                 proxiedArchiveUrl:
                     item.proxiedArchiveUrl ||
                     (isScrapeWebsiteArchiveProxyUrl(cleanUrl) ? cleanUrl : ""),
+                archiveIdentifier:
+                    item.archiveIdentifier ||
+                    getArchiveIdentifierFromMediaUrl(
+                        item.directArchiveUrl ||
+                        item.directServeUrl ||
+                        item.archiveOriginalUrl ||
+                        canonicalArchiveUrl ||
+                        cleanUrl
+                    ),
+                archiveArtworkUrl:
+                    item.archiveArtworkUrl ||
+                    buildArchiveArtworkUrl(
+                        item.archiveIdentifier ||
+                        getArchiveIdentifierFromMediaUrl(
+                            item.directArchiveUrl ||
+                            item.directServeUrl ||
+                            item.archiveOriginalUrl ||
+                            canonicalArchiveUrl ||
+                            cleanUrl
+                        )
+                    ),
                 artworkUrl: getPlaylistItemArtworkSource(item),
             };
         } catch {
@@ -1227,6 +1248,27 @@ function serializePlaylistItemForStorage(item) {
             proxiedArchiveUrl:
                 item.proxiedArchiveUrl ||
                 (isScrapeWebsiteArchiveProxyUrl(item.url) ? item.url : ""),
+            archiveIdentifier:
+                item.archiveIdentifier ||
+                getArchiveIdentifierFromMediaUrl(
+                    item.directArchiveUrl ||
+                    item.directServeUrl ||
+                    item.archiveOriginalUrl ||
+                    canonicalArchiveUrl ||
+                    item.url
+                ),
+            archiveArtworkUrl:
+                item.archiveArtworkUrl ||
+                buildArchiveArtworkUrl(
+                    item.archiveIdentifier ||
+                    getArchiveIdentifierFromMediaUrl(
+                        item.directArchiveUrl ||
+                        item.directServeUrl ||
+                        item.archiveOriginalUrl ||
+                        canonicalArchiveUrl ||
+                        item.url
+                    )
+                ),
             artworkUrl: getPlaylistItemArtworkSource(item),
         };
     }
@@ -2333,6 +2375,66 @@ function buildAbsoluteMediaAssetUrl(assetPath) {
     }
 }
 
+function getArchiveIdentifierFromMediaUrl(urlValue) {
+    const cleanUrl = getCanonicalArchiveMediaUrl(urlValue);
+
+    if (!cleanUrl) {
+        return "";
+    }
+
+    try {
+        const parsed = new URL(cleanUrl);
+        const host = parsed.hostname.toLowerCase();
+        const parts = parsed.pathname.split("/").filter(Boolean);
+
+        if (!isArchiveMediaHost(host) || !parts.length) {
+            return "";
+        }
+
+        if (
+            (host === "archive.org" || host === "www.archive.org") &&
+            ["download", "serve", "details"].includes(parts[0]) &&
+            parts[1]
+        ) {
+            return parts[1];
+        }
+
+        if (/^ia\d+\.us\.archive\.org$/.test(host)) {
+            return parts[0] || "";
+        }
+
+        return "";
+    } catch {
+        return "";
+    }
+}
+
+function buildArchiveArtworkUrl(identifier) {
+    const cleanIdentifier = String(identifier || "").trim();
+
+    if (!cleanIdentifier) {
+        return "";
+    }
+
+    return `https://archive.org/services/img/${encodeURIComponent(cleanIdentifier)}`;
+}
+
+function inferPlaylistItemArtworkSource(item) {
+    if (!item || typeof item !== "object") {
+        return "";
+    }
+
+    const archiveIdentifier =
+        item.archiveIdentifier ||
+        getArchiveIdentifierFromMediaUrl(item.directArchiveUrl) ||
+        getArchiveIdentifierFromMediaUrl(item.archiveServeUrl) ||
+        getArchiveIdentifierFromMediaUrl(item.archiveDownloadUrl) ||
+        getArchiveIdentifierFromMediaUrl(item.proxiedArchiveUrl) ||
+        getArchiveIdentifierFromMediaUrl(item.url);
+
+    return buildArchiveArtworkUrl(archiveIdentifier);
+}
+
 function getPlaylistItemArtworkSource(item) {
     if (!item || typeof item !== "object") {
         return "";
@@ -2340,6 +2442,7 @@ function getPlaylistItemArtworkSource(item) {
 
     const candidates = [
         item.artworkUrl,
+        item.archiveArtworkUrl,
         item.artwork,
         item.coverUrl,
         item.cover,
@@ -2351,7 +2454,7 @@ function getPlaylistItemArtworkSource(item) {
         item.poster,
     ];
 
-    return String(candidates.find(Boolean) || "").trim();
+    return String(candidates.find(Boolean) || inferPlaylistItemArtworkSource(item) || "").trim();
 }
 
 function createGeneratedMediaSessionArtwork(title, size = 512) {
@@ -2494,6 +2597,16 @@ function getMediaSessionArtwork(title, activeItem) {
             type: "image/png",
         },
     ].filter((artwork) => artwork?.src);
+}
+
+function getPlayerDisplayArtworkSource(title, activeItem) {
+    return (
+        buildAbsoluteMediaAssetUrl(getPlaylistItemArtworkSource(activeItem)) ||
+        createGeneratedMediaSessionArtwork(title, 512) ||
+        buildAbsoluteMediaAssetUrl("/logo512.png") ||
+        buildAbsoluteMediaAssetUrl("/social-preview.png") ||
+        ""
+    );
 }
 
 function drawRoundedCanvasRect(context, x, y, width, height, radius) {
@@ -3066,6 +3179,8 @@ function buildPlaylistItemFromUrl(urlValue) {
     const canonicalArchiveUrl = getCanonicalArchiveMediaUrl(cleanUrl);
     const archiveFileName = cleanMediaFileTitle(canonicalArchiveUrl);
     const title = normalizePlaylistUrlTitle("", cleanUrl, archiveFileName);
+    const archiveIdentifier = getArchiveIdentifierFromMediaUrl(canonicalArchiveUrl);
+    const archiveArtworkUrl = buildArchiveArtworkUrl(archiveIdentifier);
 
     return {
         id: makePlaylistId(),
@@ -3078,6 +3193,9 @@ function buildPlaylistItemFromUrl(urlValue) {
         archiveFileName: archiveFileName || "",
         directArchiveUrl: canonicalArchiveUrl || "",
         proxiedArchiveUrl: isScrapeWebsiteArchiveProxyUrl(cleanUrl) ? cleanUrl : "",
+        archiveIdentifier,
+        archiveArtworkUrl,
+        artworkUrl: archiveArtworkUrl,
     };
 }
 
@@ -3466,6 +3584,13 @@ export default function Audio() {
         sourceUrl,
         activePlaylistItem?.title
     );
+    const activePlaylistArtworkSource = buildAbsoluteMediaAssetUrl(
+        getPlaylistItemArtworkSource(activePlaylistItem)
+    );
+    const playerArtworkSource = useMemo(
+        () => getPlayerDisplayArtworkSource(mediaTitle, activePlaylistItem),
+        [mediaTitle, activePlaylistItem]
+    );
 
     mediaTitleRef.current = mediaTitle;
     mediaDurationRef.current = Number.isFinite(duration) ? duration : 0;
@@ -3691,7 +3816,14 @@ export default function Audio() {
         updateMediaSessionMetadata();
         updateMediaSessionState(playingRef.current ? "playing" : "paused");
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [mediaTitle, duration, activePlaylistIndex, playlist.length]);
+    }, [
+        mediaTitle,
+        duration,
+        activePlaylistIndex,
+        playlist.length,
+        settings.speed,
+        settings.pitchSemitones,
+    ]);
 
     useEffect(() => {
         updateMediaSessionState(isPlaying ? "playing" : "paused");
@@ -4563,6 +4695,8 @@ export default function Audio() {
                 album: getMediaSessionAlbum(),
                 artwork: getPlaylistItemArtworkSource(activeItem),
                 duration: Number(getMediaSessionDuration()) || 0,
+                playbackRate: Number(getMediaSessionPlaybackRate()) || 1,
+                pitchSemitones: Number(latestSettingsRef.current?.pitchSemitones) || 0,
                 activePlaylistIndex: activePlaylistIndexRef.current,
             });
 
@@ -8497,10 +8631,15 @@ export default function Audio() {
                     context.currentTime
                 );
 
-                setPosition(currentOffset);
+                syncPlaybackPosition(currentOffset, {
+                    forceMediaSession: true,
+                });
             } else if (isSourceRateControl) {
                 currentEffectiveRateRef.current =
                     getEffectivePlaybackRate(nextSettings);
+                syncPlaybackPosition(startedOffsetRef.current || mediaPositionRef.current || 0, {
+                    forceMediaSession: true,
+                });
             }
 
             if (liveNodesRef.current && audioContextRef.current) {
@@ -8509,6 +8648,13 @@ export default function Audio() {
                     nextSettings,
                     audioContextRef.current.currentTime
                 );
+            }
+
+            if (isSourceRateControl) {
+                updateMediaSessionMetadata();
+                updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                    forcePosition: true,
+                });
             }
 
             return nextSettings;
@@ -8535,7 +8681,13 @@ export default function Audio() {
                 context.currentTime
             );
 
-            setPosition(currentOffset);
+            syncPlaybackPosition(currentOffset, {
+                forceMediaSession: true,
+            });
+        } else {
+            syncPlaybackPosition(currentOffset, {
+                forceMediaSession: true,
+            });
         }
 
         setSettings(nextSettings);
@@ -8549,6 +8701,10 @@ export default function Audio() {
             );
         }
 
+        updateMediaSessionMetadata();
+        updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+            forcePosition: true,
+        });
         setInfo(`Applied preset: ${preset.label}. ${preset.description}`);
     }
 
@@ -8570,7 +8726,13 @@ export default function Audio() {
                 context.currentTime
             );
 
-            setPosition(currentOffset);
+            syncPlaybackPosition(currentOffset, {
+                forceMediaSession: true,
+            });
+        } else {
+            syncPlaybackPosition(currentOffset, {
+                forceMediaSession: true,
+            });
         }
 
         setSettings(DEFAULT_SETTINGS);
@@ -8584,6 +8746,10 @@ export default function Audio() {
             );
         }
 
+        updateMediaSessionMetadata();
+        updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+            forcePosition: true,
+        });
         setInfo("Mixer settings reset. Visualizer remains connected to the processed signal.");
     }
 
@@ -9346,18 +9512,60 @@ export default function Audio() {
                                             Active playlist track
                                         </Typography>
 
-                                        <Typography
-                                            sx={{
-                                                color: "#fff",
-                                                fontWeight: 900,
-                                                overflow: "hidden",
-                                                textOverflow: "ellipsis",
-                                                whiteSpace: "nowrap",
-                                            }}
-                                            title={activePlaylistItem.title}
+                                        <Stack
+                                            direction="row"
+                                            alignItems="center"
+                                            spacing={1.15}
+                                            sx={{ mt: 0.8, minWidth: 0 }}
                                         >
-                                            {activePlaylistIndex + 1}. {activePlaylistItem.title}
-                                        </Typography>
+                                            {activePlaylistArtworkSource ? (
+                                                <Box
+                                                    component="img"
+                                                    src={activePlaylistArtworkSource}
+                                                    alt=""
+                                                    sx={{
+                                                        width: 46,
+                                                        height: 46,
+                                                        borderRadius: 2.25,
+                                                        objectFit: "cover",
+                                                        flex: "0 0 auto",
+                                                        border: "1px solid rgba(255,255,255,0.16)",
+                                                        background: "rgba(255,255,255,0.08)",
+                                                    }}
+                                                />
+                                            ) : (
+                                                <Box
+                                                    sx={{
+                                                        width: 46,
+                                                        height: 46,
+                                                        borderRadius: 2.25,
+                                                        display: "grid",
+                                                        placeItems: "center",
+                                                        flex: "0 0 auto",
+                                                        color: "#67e8f9",
+                                                        background:
+                                                            "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
+                                                        border: "1px solid rgba(255,255,255,0.12)",
+                                                    }}
+                                                >
+                                                    <AudioFileRoundedIcon sx={{ fontSize: 23 }} />
+                                                </Box>
+                                            )}
+
+                                            <Typography
+                                                sx={{
+                                                    color: "#fff",
+                                                    fontWeight: 900,
+                                                    overflow: "hidden",
+                                                    textOverflow: "ellipsis",
+                                                    whiteSpace: "nowrap",
+                                                    minWidth: 0,
+                                                }}
+                                                title={activePlaylistItem.title}
+                                            >
+                                                {activePlaylistIndex + 1}. {activePlaylistItem.title}
+                                            </Typography>
+                                        </Stack>
                                     </Box>
                                 )}
 
@@ -9377,13 +9585,19 @@ export default function Audio() {
                                     <Stack spacing={1.1}>
                                         {playlist.map((item, index) => {
                                             const active = index === activePlaylistIndex;
+                                            const itemArtworkSource = buildAbsoluteMediaAssetUrl(
+                                                getPlaylistItemArtworkSource(item)
+                                            );
 
                                             return (
                                                 <Box
                                                     key={item.id}
                                                     sx={{
                                                         display: "grid",
-                                                        gridTemplateColumns: "minmax(0, 1fr) auto auto",
+                                                        gridTemplateColumns: {
+                                                            xs: "46px minmax(0, 1fr)",
+                                                            sm: "46px minmax(0, 1fr) auto auto",
+                                                        },
                                                         gap: 1,
                                                         alignItems: "center",
                                                         borderRadius: 3,
@@ -9396,6 +9610,38 @@ export default function Audio() {
                                                             : "1px solid rgba(255,255,255,0.08)",
                                                     }}
                                                 >
+                                                    {itemArtworkSource ? (
+                                                        <Box
+                                                            component="img"
+                                                            src={itemArtworkSource}
+                                                            alt=""
+                                                            sx={{
+                                                                width: 46,
+                                                                height: 46,
+                                                                borderRadius: 2.25,
+                                                                objectFit: "cover",
+                                                                border: "1px solid rgba(255,255,255,0.12)",
+                                                                background: "rgba(255,255,255,0.08)",
+                                                            }}
+                                                        />
+                                                    ) : (
+                                                        <Box
+                                                            sx={{
+                                                                width: 46,
+                                                                height: 46,
+                                                                borderRadius: 2.25,
+                                                                display: "grid",
+                                                                placeItems: "center",
+                                                                color: "#67e8f9",
+                                                                background:
+                                                                    "linear-gradient(135deg, rgba(103,232,249,0.16), rgba(167,139,250,0.12))",
+                                                                border: "1px solid rgba(255,255,255,0.12)",
+                                                            }}
+                                                        >
+                                                            <AudioFileRoundedIcon sx={{ fontSize: 22 }} />
+                                                        </Box>
+                                                    )}
+
                                                     <Box sx={{ minWidth: 0 }}>
                                                         <Typography
                                                             sx={{
@@ -9427,6 +9673,10 @@ export default function Audio() {
                                                             color: "#fff",
                                                             borderColor: "rgba(255,255,255,0.18)",
                                                             fontWeight: 900,
+                                                            gridColumn: {
+                                                                xs: "1 / span 2",
+                                                                sm: "auto",
+                                                            },
                                                         }}
                                                     >
                                                         Play
@@ -9439,6 +9689,14 @@ export default function Audio() {
                                                         sx={{
                                                             minWidth: 42,
                                                             color: "rgba(255,255,255,0.68)",
+                                                            justifySelf: {
+                                                                xs: "end",
+                                                                sm: "auto",
+                                                            },
+                                                            gridColumn: {
+                                                                xs: "1 / span 2",
+                                                                sm: "auto",
+                                                            },
                                                         }}
                                                     >
                                                         <DeleteRoundedIcon fontSize="small" />
@@ -9553,22 +9811,40 @@ export default function Audio() {
                                                         spacing={1.15}
                                                         sx={{ mb: 0.9, minWidth: 0 }}
                                                     >
-                                                        <Box
-                                                            sx={{
-                                                                width: 38,
-                                                                height: 38,
-                                                                borderRadius: 3,
-                                                                display: "grid",
-                                                                placeItems: "center",
-                                                                flex: "0 0 auto",
-                                                                color: "#67e8f9",
-                                                                background:
-                                                                    "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
-                                                                border: "1px solid rgba(255,255,255,0.11)",
-                                                            }}
-                                                        >
-                                                            <AudioFileRoundedIcon sx={{ fontSize: 22 }} />
-                                                        </Box>
+                                                        {playerArtworkSource ? (
+                                                            <Box
+                                                                component="img"
+                                                                src={playerArtworkSource}
+                                                                alt=""
+                                                                sx={{
+                                                                    width: 58,
+                                                                    height: 58,
+                                                                    borderRadius: 3,
+                                                                    objectFit: "cover",
+                                                                    flex: "0 0 auto",
+                                                                    border: "1px solid rgba(255,255,255,0.14)",
+                                                                    background: "rgba(255,255,255,0.08)",
+                                                                    boxShadow: "0 12px 28px rgba(0,0,0,0.22)",
+                                                                }}
+                                                            />
+                                                        ) : (
+                                                            <Box
+                                                                sx={{
+                                                                    width: 58,
+                                                                    height: 58,
+                                                                    borderRadius: 3,
+                                                                    display: "grid",
+                                                                    placeItems: "center",
+                                                                    flex: "0 0 auto",
+                                                                    color: "#67e8f9",
+                                                                    background:
+                                                                        "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
+                                                                    border: "1px solid rgba(255,255,255,0.11)",
+                                                                }}
+                                                            >
+                                                                <AudioFileRoundedIcon sx={{ fontSize: 26 }} />
+                                                            </Box>
+                                                        )}
 
                                                         <Box sx={{ minWidth: 0 }}>
                                                             <Typography
