@@ -1854,6 +1854,16 @@ function mergeArchiveResults(current = [], incoming = []) {
     return dedupeArchiveResults([...current, ...incoming]);
 }
 
+function countMatchingArchiveResultsForSignature(items = [], searchSignature = "") {
+    return (Array.isArray(items) ? items : []).filter((item) => {
+        if (searchSignature && item.searchSignature !== searchSignature) {
+            return false;
+        }
+
+        return item.queryMatched !== false;
+    }).length;
+}
+
 const ArchiveFileRow = React.memo(function ArchiveFileRow({
                                                               file,
                                                               onCopyText,
@@ -2963,15 +2973,37 @@ export default function ArchiveAudioBrowser() {
             setNextCursor(nextCursorValue);
 
             setResults((current) => {
+                let nextResults;
+
                 if (data.directLinkMode && !isLoadMore && !keepExistingResults) {
-                    return incomingResults;
+                    nextResults = incomingResults;
+                } else if (isLoadMore || keepExistingResults) {
+                    nextResults = mergeArchiveResults(current, incomingResults);
+                } else {
+                    nextResults = incomingResults;
                 }
 
-                if (isLoadMore || keepExistingResults) {
-                    return mergeArchiveResults(current, incomingResults);
+                if (isLoadMore && incomingResults.length) {
+                    const nextMatchingCount = countMatchingArchiveResultsForSignature(
+                        nextResults,
+                        requestSignature
+                    );
+                    const incomingMatchingCount =
+                        countMatchingArchiveResultsForSignature(
+                            incomingResults,
+                            requestSignature
+                        );
+
+                    if (incomingMatchingCount > 0) {
+                        setVisibleResultLimit((currentLimit) =>
+                            Math.max(currentLimit, nextMatchingCount)
+                        );
+                    } else {
+                        setShowOffQueryResults(true);
+                    }
                 }
 
-                return incomingResults;
+                return nextResults;
             });
 
             setStatus(
