@@ -392,6 +392,12 @@ const IPHONE_KEEP_ALIVE_GAIN = 0.0000004;
 
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const COMMUNITY_FEED_POST_URL = "https://scrapewebsite.pages.dev/api/community/posts";
+const COMMUNITY_LISTENING_URL = "https://scrapewebsite.pages.dev/api/community/listening";
+const COMMUNITY_LISTENING_SESSION_STORAGE_KEY =
+    "audiomasterlab.community.listening.session.v1";
+const COMMUNITY_LISTENING_USER_NAME_STORAGE_KEY =
+    "audiomasterlab.community.userName.v1";
+const COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS = 15000;
 
 function isArchiveMediaHost(hostname = "") {
     const host = String(hostname || "").toLowerCase();
@@ -1126,6 +1132,55 @@ function sanitizePersistedPlaylistItem(item) {
     }
 
     return null;
+}
+
+function createCommunityListeningSessionId() {
+    if (
+        typeof crypto !== "undefined" &&
+        typeof crypto.randomUUID === "function"
+    ) {
+        return crypto.randomUUID();
+    }
+
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function readPersistedCommunityListeningSessionId() {
+    const existing = readStorageValue(COMMUNITY_LISTENING_SESSION_STORAGE_KEY, "");
+
+    if (existing) {
+        return existing;
+    }
+
+    const sessionId = createCommunityListeningSessionId();
+
+    writeStorageValue(COMMUNITY_LISTENING_SESSION_STORAGE_KEY, sessionId);
+    return sessionId;
+}
+
+function readPersistedCommunityListeningUserName() {
+    return (
+        readStorageValue(
+            COMMUNITY_LISTENING_USER_NAME_STORAGE_KEY,
+            "AudioMasterLab listener"
+        ) || "AudioMasterLab listener"
+    );
+}
+
+function sanitizeCommunityListeningText(value, fallback = "") {
+    return String(value || fallback || "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function sanitizeCommunityListeningSeconds(value, fallback = 0) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+
+    return Math.max(0, number);
 }
 
 function readPersistedPlaylist() {
@@ -3295,6 +3350,11 @@ export default function Audio() {
     const playlistPreloadCacheRef = useRef(new Map());
     const playlistPreloadTokenRef = useRef(0);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
+    const communityListeningSessionIdRef = useRef(
+        readPersistedCommunityListeningSessionId()
+    );
+    const communityListeningHeartbeatTimerRef = useRef(null);
+    const lastCommunityListeningBeatAtRef = useRef(0);
 
     // Media Session / lock-screen refs keep hardware, CarPlay, Bluetooth,
     // and lock-screen controls wired to the latest React state without stale
@@ -3604,6 +3664,7 @@ export default function Audio() {
             clearPauseReleaseTimer();
             clearPauseUiQuietTimer();
             clearMediaSession();
+            stopCommunityListeningHeartbeat(true);
 
             if (objectUrlRef.current) {
                 URL.revokeObjectURL(objectUrlRef.current);
@@ -3826,6 +3887,12 @@ export default function Audio() {
         playingRef.current = safeValue;
         isPlayingStateRef.current = safeValue;
         setIsPlaying((current) => (current === safeValue ? current : safeValue));
+
+        if (safeValue) {
+            startCommunityListeningHeartbeat();
+        } else {
+            stopCommunityListeningHeartbeat(true);
+        }
     }
 
     function syncPlaybackPosition(nextOffset, options = {}) {
@@ -6739,7 +6806,7 @@ export default function Audio() {
         );
 
         return {
-            userName: "AudioMasterLab listener",
+            userName: readPersistedCommunityListeningUserName(),
             title: title || "Community audio post",
             artist: "",
             audioUrl: communityAudioUrl,
@@ -6755,6 +6822,136 @@ export default function Audio() {
             postedFrom: "audio-page",
             createdAt: new Date().toISOString(),
         };
+    }
+
+    function buildCurrentCommunityListeningPayload(options = {}) {
+        const communityPayload = buildCurrentCommunityPostPayload();
+        const bufferDuration = audioBufferRef.current?.duration || 0;
+        const durationCandidates = [
+            duration,
+            communityPayload.duration,
+            bufferDuration,
+        ]
+            .map((value) => sanitizeCommunityListeningSeconds(value, 0))
+            .filter((value) => value > 0);
+        const durationSeconds = durationCandidates.length
+            ? Math.max(...durationCandidates)
+            : 0;
+        const positionSeconds = sanitizeCommunityListeningSeconds(
+            options.positionSeconds,
+            sanitizeCommunityListeningSeconds(getCurrentOffset(), 0)
+        );
+        const isHeartbeatPlaying =
+            typeof options.isPlaying === "boolean"
+                ? options.isPlaying
+                : Boolean(playingRef.current);
+
+        return {
+            session_id: communityListeningSessionIdRef.current,
+            user_name: sanitizeCommunityListeningText(
+                communityPayload.userName,
+                readPersistedCommunityListeningUserName()
+            ),
+            track_title: sanitizeCommunityListeningText(
+                communityPayload.title,
+                "Unknown track"
+            ),
+            artist: sanitizeCommunityListeningText(communityPayload.artist, ""),
+            audio_url: sanitizeCommunityListeningText(communityPayload.audioUrl, ""),
+            artwork_url: sanitizeCommunityListeningText(
+                communityPayload.artworkUrl,
+                ""
+            ),
+            position_seconds: positionSeconds,
+            duration_seconds: durationSeconds,
+            is_playing: isHeartbeatPlaying ? 1 : 0,
+        };
+    }
+
+    async function postCommunityListeningHeartbeat(options = {}) {
+        const now = Date.now();
+
+        if (
+            !options.force &&
+            now - lastCommunityListeningBeatAtRef.current < 4500
+        ) {
+            return null;
+        }
+
+        let payload;
+
+        try {
+            payload = buildCurrentCommunityListeningPayload(options);
+        } catch {
+            return null;
+        }
+
+        if (!payload.audio_url || /^(blob:|data:)/i.test(payload.audio_url)) {
+            return null;
+        }
+
+        lastCommunityListeningBeatAtRef.current = now;
+
+        try {
+            const response = await fetch(COMMUNITY_LISTENING_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+                body: JSON.stringify(payload),
+                keepalive: Boolean(options.keepalive),
+                cache: "no-store",
+            });
+
+            if (!response.ok) {
+                return null;
+            }
+
+            return response.json().catch(() => ({ ok: true }));
+        } catch {
+            return null;
+        }
+    }
+
+    function startCommunityListeningHeartbeat() {
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        if (communityListeningHeartbeatTimerRef.current) {
+            window.clearInterval(communityListeningHeartbeatTimerRef.current);
+            communityListeningHeartbeatTimerRef.current = null;
+        }
+
+        postCommunityListeningHeartbeat({
+            force: true,
+            isPlaying: true,
+        });
+
+        communityListeningHeartbeatTimerRef.current = window.setInterval(() => {
+            postCommunityListeningHeartbeat({
+                isPlaying: true,
+            });
+        }, COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS);
+    }
+
+    function stopCommunityListeningHeartbeat(sendStop = true) {
+        if (
+            typeof window !== "undefined" &&
+            communityListeningHeartbeatTimerRef.current
+        ) {
+            window.clearInterval(communityListeningHeartbeatTimerRef.current);
+            communityListeningHeartbeatTimerRef.current = null;
+        }
+
+        if (sendStop) {
+            postCommunityListeningHeartbeat({
+                force: true,
+                keepalive: true,
+                isPlaying: false,
+            });
+        }
     }
 
     async function postCurrentMediaToCommunityFeed() {

@@ -14,7 +14,24 @@
         <changefreq>weekly</changefreq>
         <priority>0.95</priority>
     </url>
-
+    <url>
+        <loc>https://audiomasterlab.com/youtube</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>weekly</changefreq>
+        <priority>0.95</priority>
+    </url>
+    <url>
+        <loc>https://audiomasterlab.com/archive</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>weekly</changefreq>
+        <priority>0.95</priority>
+    </url>
+    <url>
+        <loc>https://audiomasterlab.com/community</loc>
+        <lastmod>2026-07-02</lastmod>
+        <changefreq>weekly</changefreq>
+        <priority>0.95</priority>
+    </url>
     <url>
         <loc>https://audiomasterlab.com/editor</loc>
         <lastmod>2026-07-02</lastmod>
