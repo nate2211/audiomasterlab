@@ -274,6 +274,26 @@ const ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM = 4;
 const ARCHIVE_FILE_BATCH_SIZE = 12;
 const ARCHIVE_SEARCH_BATCH_SIZE = 100;
 
+function makeArchivePageCursor(pageNumber) {
+    const safePageNumber = Math.max(1, Number(pageNumber) || 1);
+
+    return `page:${safePageNumber}`;
+}
+
+function getArchivePageFromCursor(cursor = "") {
+    const text = String(cursor || "").trim();
+
+    if (!text) return 1;
+
+    const pageMatch = text.match(/^page:(\d+)$/i);
+
+    if (pageMatch) {
+        return Math.max(1, Number(pageMatch[1]) || 1);
+    }
+
+    return Math.max(1, Number(text) || 1);
+}
+
 function makeArchivePlaylistId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
@@ -858,23 +878,50 @@ async function searchArchiveItems(
     useArchiveProxy = false
 ) {
     const archiveQuery = buildArchiveSearchQuery(query, selectedCollections);
-
+    const pageNumber = getArchivePageFromCursor(cursor);
     const params = new URLSearchParams({
         q: archiveQuery,
-        fields:
-            "identifier,title,creator,collection,date,licenseurl,downloads,description,subject",
-        sorts: "downloads desc,identifier",
-        count: String(ARCHIVE_SEARCH_BATCH_SIZE),
+        rows: String(ARCHIVE_SEARCH_BATCH_SIZE),
+        page: String(pageNumber),
+        output: "json",
     });
 
-    if (cursor) {
-        params.set("cursor", cursor);
-    }
+    [
+        "identifier",
+        "title",
+        "creator",
+        "collection",
+        "date",
+        "licenseurl",
+        "downloads",
+        "description",
+        "subject",
+    ].forEach((field) => params.append("fl[]", field));
 
-    return fetchJson(`https://archive.org/services/search/v1/scrape?${params}`, {
+    params.append("sort[]", "downloads desc");
+    params.append("sort[]", "identifier asc");
+
+    const data = await fetchJson(`https://archive.org/advancedsearch.php?${params}`, {
         signal,
         useArchiveProxy,
     });
+    const response = data?.response || {};
+    const docs = Array.isArray(response.docs) ? response.docs : [];
+    const rows = Number(response.rows || ARCHIVE_SEARCH_BATCH_SIZE);
+    const start = Number(response.start || (pageNumber - 1) * ARCHIVE_SEARCH_BATCH_SIZE);
+    const numFound = Number(response.numFound || docs.length);
+    const hasMorePages = start + docs.length < numFound && docs.length > 0;
+
+    return {
+        ...data,
+        items: docs,
+        cursor: hasMorePages ? makeArchivePageCursor(pageNumber + 1) : "",
+        page: pageNumber,
+        start,
+        rows,
+        numFound,
+        hasMorePages,
+    };
 }
 
 async function fetchArchiveMetadata(identifier, signal, useArchiveProxy = false) {
@@ -1384,12 +1431,6 @@ function throwIfSearchAborted(signal) {
     }
 }
 
-function isBadArchiveCursorError(error) {
-    const message = String(error?.message || error || "").toLowerCase();
-
-    return message.includes("bad cursor");
-}
-
 async function buildArchiveResultFromMetadata({
                                                   identifier,
                                                   forcedFiles = [],
@@ -1603,33 +1644,13 @@ async function searchSafeAudio({
         throw new Error("Choose at least one safe Archive collection.");
     }
 
-    let searchData;
-    let cursorReset = false;
-
-    try {
-        searchData = await searchArchiveItems(
-            safeQuery,
-            selectedCollections,
-            cursor,
-            signal,
-            useArchiveProxy
-        );
-    } catch (err) {
-        if (cursor && isBadArchiveCursorError(err)) {
-            // Archive.org cursors are tied to the exact search/sort and can expire or
-            // reject on the next request. Do not crash the UI or leak old results.
-            cursorReset = true;
-            searchData = await searchArchiveItems(
-                safeQuery,
-                selectedCollections,
-                "",
-                signal,
-                useArchiveProxy
-            );
-        } else {
-            throw err;
-        }
-    }
+    const searchData = await searchArchiveItems(
+        safeQuery,
+        selectedCollections,
+        cursor,
+        signal,
+        useArchiveProxy
+    );
 
     throwIfSearchAborted(signal);
 
@@ -1722,7 +1743,7 @@ async function searchSafeAudio({
                     batchStartIndex: safeBatchStartIndex,
                     totalCandidates: safeBatchStartIndex + items.length,
                     batchCandidateCount: items.length,
-                    cursorReset,
+                    cursorReset: false,
                 });
             }
 
@@ -1739,13 +1760,15 @@ async function searchSafeAudio({
     }
 
     return {
-        cursor: cursorReset ? "" : searchData.cursor || "",
+        cursor: searchData.cursor || "",
         requestedCursor: cursor || "",
-        cursorReset,
+        cursorReset: false,
         batchStartIndex: safeBatchStartIndex,
         batchCandidateCount: items.length,
         inspectedCandidateCount: safeBatchStartIndex + items.length,
-        hasMoreArchivePages: Boolean(!cursorReset && searchData.cursor),
+        hasMoreArchivePages: Boolean(searchData.cursor),
+        page: searchData.page || getArchivePageFromCursor(cursor),
+        totalArchiveCandidates: searchData.numFound || safeBatchStartIndex + items.length,
         results: dedupeArchiveResults(results),
     };
 }
@@ -2336,6 +2359,11 @@ export default function ArchiveAudioBrowser() {
     const selectedCollectionSet = useMemo(() => {
         return new Set(selectedCollections);
     }, [selectedCollections]);
+    const nextLoadStart = Math.max(
+        1,
+        Number(lastSubmittedSearchRef.current?.loadedCandidateCount || 0) + 1
+    );
+    const nextLoadEnd = nextLoadStart + ARCHIVE_SEARCH_BATCH_SIZE - 1;
 
     useEffect(() => {
         latestSearchInputRef.current = {
@@ -2943,20 +2971,16 @@ export default function ArchiveAudioBrowser() {
                 Array.isArray(data.results) ? data.results : [],
                 requestSignature
             );
-            const nextCursorValue = data.cursorReset ? "" : data.cursor || "";
+            const nextCursorValue = data.cursor || "";
             const nextLoadedCandidateCount = data.directLinkMode
                 ? 0
-                : data.cursorReset
-                    ? Number(data.batchCandidateCount || 0)
-                    : Number(
-                        data.inspectedCandidateCount ??
-                        batchStartIndex + Number(data.batchCandidateCount || 0)
-                    );
+                : Number(
+                    data.inspectedCandidateCount ??
+                    batchStartIndex + Number(data.batchCandidateCount || 0)
+                );
             const nextBatchCount = data.directLinkMode
                 ? 0
-                : data.cursorReset
-                    ? 1
-                    : currentBatchCount + 1;
+                : currentBatchCount + 1;
 
             lastSubmittedSearchRef.current = {
                 query: queryForRequest,
@@ -3007,17 +3031,15 @@ export default function ArchiveAudioBrowser() {
             });
 
             setStatus(
-                data.cursorReset
-                    ? `Archive reset an expired cursor for "${safeQuery}". Results stayed on the current query; press Search Archive Audio for a fresh first page.`
-                    : data.directLinkMode
-                        ? `Loaded ${incomingResults.length} direct Archive item(s)${archiveRouteLabel}, including all playable files found in each item.`
-                        : incomingResults.length
-                            ? isLoadMore
-                                ? `Added ${incomingResults.length} more Archive item(s) from candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount}${archiveRouteLabel}. ${nextCursorValue ? "Load More will continue from the next Archive cursor." : "Archive did not return another cursor, so this is the last page for now."}`
-                                : `Found ${incomingResults.length} Archive item(s) with playable audio from the first ${nextLoadedCandidateCount || ARCHIVE_SEARCH_BATCH_SIZE} candidates${archiveRouteLabel}.`
-                            : nextCursorValue
-                                ? `No playable matches in candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount} for "${safeQuery}"${archiveRouteLabel}. Press Load More to continue with the next Archive page.`
-                                : `No safe playable audio files found for "${safeQuery}"${archiveRouteLabel}.`
+                data.directLinkMode
+                    ? `Loaded ${incomingResults.length} direct Archive item(s)${archiveRouteLabel}, including all playable files found in each item.`
+                    : incomingResults.length
+                        ? isLoadMore
+                            ? `Added ${incomingResults.length} more Archive item(s) from candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount}${archiveRouteLabel}. ${nextCursorValue ? "Load More will fetch the next 100-candidate page." : "Archive did not return another page, so this is the last page for now."}`
+                            : `Found ${incomingResults.length} Archive item(s) with playable audio from the first ${nextLoadedCandidateCount || ARCHIVE_SEARCH_BATCH_SIZE} candidates${archiveRouteLabel}.`
+                        : nextCursorValue
+                            ? `No playable matches in candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount} for "${safeQuery}"${archiveRouteLabel}. Press Load More to fetch the next 100-candidate page.`
+                            : `No safe playable audio files found for "${safeQuery}"${archiveRouteLabel}.`
             );
         } catch (err) {
             if (isAbortError(err)) {
@@ -3025,21 +3047,6 @@ export default function ArchiveAudioBrowser() {
             }
 
             if (searchId !== searchRunRef.current) {
-                return;
-            }
-
-            if (isLoadMore && isBadArchiveCursorError(err)) {
-                lastSubmittedSearchRef.current = {
-                    ...lastSubmittedSearchRef.current,
-                    cursor: "",
-                    loadedCandidateCount: 0,
-                    batchCount: 0,
-                };
-                setNextCursor("");
-                setError("");
-                setStatus(
-                    "Archive rejected the saved cursor, so Load More was reset. Your current results are still valid; press Search Archive Audio to run a fresh first page."
-                );
                 return;
             }
 
@@ -3203,7 +3210,9 @@ export default function ArchiveAudioBrowser() {
                                     disabled={loading || !nextCursor || hasUnsubmittedSearchChanges}
                                     onClick={handleLoadMoreButtonClick}
                                 >
-                                    Load More
+                                    {nextCursor
+                                        ? `Load More ${nextLoadStart}-${nextLoadEnd}`
+                                        : "No More Pages"}
                                 </Button>
 
                                 <Button
@@ -3346,7 +3355,7 @@ export default function ArchiveAudioBrowser() {
                         <Chip label={`${offQueryResults.length} hidden off-query item(s)`} color={offQueryResults.length ? "warning" : "default"} />
                         <Chip label={`${totalPlayableFiles} playable file(s) loaded`} />
                         <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
-                        <Chip label={`Next cursor: ${nextCursor ? "available" : "none"}`} />
+                        <Chip label={nextCursor ? `Next page: ${nextLoadStart}-${nextLoadEnd}` : "Next page: none"} />
                         <Button
                             type="button"
                             size="small"
