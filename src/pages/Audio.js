@@ -30,6 +30,7 @@ import GraphicEqRoundedIcon from "@mui/icons-material/GraphicEqRounded";
 import EqualizerRoundedIcon from "@mui/icons-material/EqualizerRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
+import DragIndicatorRoundedIcon from "@mui/icons-material/DragIndicatorRounded";
 import { Helmet } from "react-helmet-async";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -523,6 +524,10 @@ const PLAYLIST_RECOVERY_SETTINGS = {
 };
 
 const IPHONE_KEEP_ALIVE_GAIN = 0.0000004;
+const STREAM_FINAL_CEILING_GAIN = 0.94;
+const STREAM_EFFECT_SMOOTH_SECONDS = 0.09;
+const IOS_STREAM_EFFECT_SMOOTH_SECONDS = 0.24;
+const PLAYLIST_DRAG_MIME = "application/x-audiomasterlab-playlist-index";
 
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const COMMUNITY_FEED_POST_URL = "https://scrapewebsite.pages.dev/api/community/posts";
@@ -1779,14 +1784,25 @@ function createSoftDistortionCurve(amount = 0) {
     const drive = clamp(numberOrDefault(amount, 0), 0, 1);
     const sampleCount = 2048;
     const curve = new Float32Array(sampleCount);
-    const k = 1 + drive * 48;
+
+    if (drive <= 0.001) {
+        for (let index = 0; index < sampleCount; index += 1) {
+            curve[index] = (index * 2) / sampleCount - 1;
+        }
+
+        return curve;
+    }
+
+    const k = 1 + drive * 18;
+    const wet = clamp(drive * 0.42, 0, 0.42);
 
     for (let index = 0; index < sampleCount; index += 1) {
         const x = (index * 2) / sampleCount - 1;
         const shaped = ((1 + k) * x) / (1 + k * Math.abs(x));
-        const warmSaturation = Math.tanh(x * (1.1 + drive * 2.7));
+        const warmSaturation = Math.tanh(x * (1.04 + drive * 1.65));
+        const colored = shaped * 0.56 + warmSaturation * 0.44;
 
-        curve[index] = shaped * (0.66 + drive * 0.2) + warmSaturation * (0.34 - drive * 0.1);
+        curve[index] = clamp(x * (1 - wet) + colored * wet, -0.985, 0.985);
     }
 
     return curve;
@@ -1806,17 +1822,17 @@ function createWarmBitcrusherCurve(warmth = 0, variance = 0.12) {
         return curve;
     }
 
-    const bitDepth = clamp(16 - warmAmount * 5 - varianceAmount * 1.5, 10, 16);
+    const bitDepth = clamp(16 - warmAmount * 3.2 - varianceAmount * 0.9, 12, 16);
     const quantizeStep = 2 / Math.pow(2, bitDepth);
-    const wet = clamp(warmAmount * 0.62, 0, 0.36);
+    const wet = clamp(warmAmount * 0.42, 0, 0.22);
 
     for (let index = 0; index < sampleCount; index += 1) {
         const x = (index * 2) / sampleCount - 1;
-        const movingStep = quantizeStep * (1 + Math.sin(index * 0.041) * varianceAmount * 0.18);
+        const movingStep = quantizeStep * (1 + Math.sin(index * 0.041) * varianceAmount * 0.08);
         const quantized = Math.round(x / movingStep) * movingStep;
-        const rounded = Math.tanh(quantized * (1.08 + warmAmount * 0.7));
+        const rounded = Math.tanh(quantized * (1.03 + warmAmount * 0.45));
 
-        curve[index] = x * (1 - wet) + rounded * wet;
+        curve[index] = clamp(x * (1 - wet) + rounded * wet, -0.985, 0.985);
     }
 
     return curve;
@@ -2999,7 +3015,10 @@ function applySettingsToNodes(nodes, rawSettings, currentTime) {
     const settings = nodes.carPlaySafeMode
         ? getCarPlaySafeSettings(rawSettings)
         : normalizeSettings(rawSettings);
-    const smoothingSeconds = nodes.carPlaySafeMode ? 0.18 : 0.045;
+    const smoothingSeconds =
+        nodes.carPlaySafeMode || isIOSAudioDevice()
+            ? IOS_STREAM_EFFECT_SMOOTH_SECONDS
+            : STREAM_EFFECT_SMOOTH_SECONDS;
 
     setAudioParam(
         nodes.baseVolumeGain.gain,
@@ -3064,8 +3083,8 @@ function applySettingsToNodes(nodes, rawSettings, currentTime) {
     setAudioParam(nodes.compressor.threshold, settings.compressorThreshold, currentTime, smoothingSeconds);
     setAudioParam(nodes.compressor.knee, 14, currentTime, smoothingSeconds);
     setAudioParam(nodes.compressor.ratio, settings.compressorRatio, currentTime, smoothingSeconds);
-    setAudioParam(nodes.compressor.attack, 0.008, currentTime, smoothingSeconds);
-    setAudioParam(nodes.compressor.release, 0.22, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.attack, 0.012, currentTime, smoothingSeconds);
+    setAudioParam(nodes.compressor.release, 0.28, currentTime, smoothingSeconds);
 
     setAudioParam(nodes.dryGain.gain, 1, currentTime, smoothingSeconds);
 
@@ -3092,6 +3111,23 @@ function applySettingsToNodes(nodes, rawSettings, currentTime) {
     applyPanner(nodes, settings.pan, currentTime);
 
     setAudioParam(nodes.masterGain.gain, dbToGain(settings.outputGain), currentTime, smoothingSeconds);
+
+    if (nodes.finalLimiter) {
+        setAudioParam(nodes.finalLimiter.threshold, -5, currentTime, smoothingSeconds);
+        setAudioParam(nodes.finalLimiter.knee, 18, currentTime, smoothingSeconds);
+        setAudioParam(nodes.finalLimiter.ratio, 10, currentTime, smoothingSeconds);
+        setAudioParam(nodes.finalLimiter.attack, 0.003, currentTime, smoothingSeconds);
+        setAudioParam(nodes.finalLimiter.release, 0.18, currentTime, smoothingSeconds);
+    }
+
+    if (nodes.streamSafetyGain) {
+        setAudioParam(
+            nodes.streamSafetyGain.gain,
+            STREAM_FINAL_CEILING_GAIN,
+            currentTime,
+            smoothingSeconds
+        );
+    }
 }
 
 function createProcessingGraph(context, destination, rawSettings, options = {}) {
@@ -3154,6 +3190,8 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
     const pannerStage = createPannerStage(context);
 
     const masterGain = context.createGain();
+    const finalLimiter = context.createDynamicsCompressor();
+    const streamSafetyGain = context.createGain();
 
     const nodes = {
         context,
@@ -3196,9 +3234,13 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
         pannerKind: pannerStage.kind,
 
         masterGain,
+        finalLimiter,
+        streamSafetyGain,
 
         carPlaySafeMode,
     };
+
+    convolver.normalize = true;
 
     baseVolumeGain
         .connect(demudHighPass)
@@ -3233,7 +3275,9 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
 
     pannerInputGain.connect(pannerStage.node);
     pannerStage.node.connect(masterGain);
-    masterGain.connect(destination);
+    masterGain.connect(finalLimiter);
+    finalLimiter.connect(streamSafetyGain);
+    streamSafetyGain.connect(destination);
 
     applySettingsToNodes(nodes, settings, context.currentTime || 0);
 
@@ -3681,6 +3725,8 @@ export default function Audio() {
     const playlistAdvanceTokenRef = useRef(0);
     const playlistPreloadCacheRef = useRef(new Map());
     const playlistPreloadTokenRef = useRef(0);
+    const playlistDragIndexRef = useRef(-1);
+    const playlistDragOverIndexRef = useRef(-1);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
     const communityListeningSessionIdRef = useRef(
         readPersistedCommunityListeningSessionId()
@@ -3767,6 +3813,10 @@ export default function Audio() {
     const [duration, setDuration] = useState(0);
     const [mediaInfo, setMediaInfo] = useState("");
     const [playlist, setPlaylist] = useState(() => readPersistedPlaylist());
+    const [playlistDragState, setPlaylistDragState] = useState({
+        fromIndex: -1,
+        overIndex: -1,
+    });
     const [activePlaylistIndex, setActivePlaylistIndex] = useState(() => {
         const storedIndex = Number(readStorageValue(STORAGE_KEYS.activePlaylistIndex, "-1"));
         return Number.isFinite(storedIndex) ? storedIndex : -1;
@@ -5955,10 +6005,11 @@ export default function Audio() {
         if (isIOSAudioDevice() && wasPlaying) {
             try {
                 const { context, nodes } = ensureLiveGraph();
-                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
-                    rampSeconds: 0.05,
-                });
-                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
+                forceRestoreAudibleWebAudioOutput(context, nodes);
+                outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
+                    "Lock-screen Scrub"
+                );
+                forceRestoreAudibleWebAudioOutput(context, nodes);
             } catch {
                 outputAlreadyRestarted = false;
             }
@@ -8367,6 +8418,153 @@ export default function Audio() {
         }
     }
 
+    function getReorderedActivePlaylistIndex(currentActiveIndex, fromIndex, toIndex) {
+        if (currentActiveIndex < 0 || fromIndex === toIndex) {
+            return currentActiveIndex;
+        }
+
+        if (currentActiveIndex === fromIndex) {
+            return toIndex;
+        }
+
+        if (fromIndex < currentActiveIndex && toIndex >= currentActiveIndex) {
+            return currentActiveIndex - 1;
+        }
+
+        if (fromIndex > currentActiveIndex && toIndex <= currentActiveIndex) {
+            return currentActiveIndex + 1;
+        }
+
+        return currentActiveIndex;
+    }
+
+    function reorderPlaylistItems(fromIndex, toIndex) {
+        const safeFromIndex = Number(fromIndex);
+        const safeToIndex = Number(toIndex);
+
+        if (
+            !Number.isInteger(safeFromIndex) ||
+            !Number.isInteger(safeToIndex) ||
+            safeFromIndex === safeToIndex
+        ) {
+            return false;
+        }
+
+        setPlaylist((current) => {
+            if (
+                safeFromIndex < 0 ||
+                safeFromIndex >= current.length ||
+                safeToIndex < 0 ||
+                safeToIndex >= current.length ||
+                current.length < 2
+            ) {
+                return current;
+            }
+
+            const nextPlaylist = [...current];
+            const [movedItem] = nextPlaylist.splice(safeFromIndex, 1);
+            nextPlaylist.splice(safeToIndex, 0, movedItem);
+
+            const nextActiveIndex = getReorderedActivePlaylistIndex(
+                activePlaylistIndexRef.current,
+                safeFromIndex,
+                safeToIndex
+            );
+
+            setActivePlaylistIndex(nextActiveIndex);
+            activePlaylistIndexRef.current = nextActiveIndex;
+
+            setInfo(
+                `Moved "${movedItem?.title || "playlist item"}" to position ${
+                    safeToIndex + 1
+                }.`
+            );
+
+            return nextPlaylist;
+        });
+
+        return true;
+    }
+
+    function resetPlaylistDragState() {
+        playlistDragIndexRef.current = -1;
+        playlistDragOverIndexRef.current = -1;
+        setPlaylistDragState({
+            fromIndex: -1,
+            overIndex: -1,
+        });
+    }
+
+    function handlePlaylistDragStart(event, index) {
+        if (isRendering || isLoading || isPreloadingPlaylist || playlistRef.current.length < 2) {
+            event.preventDefault();
+            resetPlaylistDragState();
+            return;
+        }
+
+        playlistDragIndexRef.current = index;
+        playlistDragOverIndexRef.current = index;
+        setPlaylistDragState({
+            fromIndex: index,
+            overIndex: index,
+        });
+
+        try {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData(PLAYLIST_DRAG_MIME, String(index));
+            event.dataTransfer.setData("text/plain", String(index));
+        } catch {
+            // Some mobile browsers expose a limited DataTransfer implementation.
+        }
+    }
+
+    function handlePlaylistDragOver(event, index) {
+        const fromIndex = playlistDragIndexRef.current;
+
+        if (fromIndex < 0 || fromIndex === index) {
+            return;
+        }
+
+        event.preventDefault();
+
+        try {
+            event.dataTransfer.dropEffect = "move";
+        } catch {
+            // Safe to ignore.
+        }
+
+        if (playlistDragOverIndexRef.current !== index) {
+            playlistDragOverIndexRef.current = index;
+            setPlaylistDragState({
+                fromIndex,
+                overIndex: index,
+            });
+        }
+    }
+
+    function handlePlaylistDrop(event, index) {
+        event.preventDefault();
+
+        let fromIndex = playlistDragIndexRef.current;
+
+        try {
+            const transferred = Number(event.dataTransfer.getData(PLAYLIST_DRAG_MIME));
+
+            if (Number.isInteger(transferred)) {
+                fromIndex = transferred;
+            }
+        } catch {
+            // Fall back to the ref set by the handle drag start.
+        }
+
+        reorderPlaylistItems(fromIndex, index);
+        resetPlaylistDragState();
+    }
+
+    function handlePlaylistDragEnd() {
+        resetPlaylistDragState();
+    }
+
     function removePlaylistItem(id) {
         const currentIndex = activePlaylistIndexRef.current;
         const removedItem = playlistRef.current.find((item) => item.id === id);
@@ -10318,6 +10516,11 @@ export default function Audio() {
                                     <Stack spacing={1.1}>
                                         {playlist.map((item, index) => {
                                             const active = index === activePlaylistIndex;
+                                            const isDragSource =
+                                                playlistDragState.fromIndex === index;
+                                            const isDropTarget =
+                                                playlistDragState.overIndex === index &&
+                                                playlistDragState.fromIndex !== index;
                                             const itemArtworkSource = buildAbsoluteMediaAssetUrl(
                                                 getPlaylistItemArtworkSource(item)
                                             );
@@ -10325,22 +10528,39 @@ export default function Audio() {
                                             return (
                                                 <Box
                                                     key={item.id}
+                                                    onDragOver={(event) => handlePlaylistDragOver(event, index)}
+                                                    onDrop={(event) => handlePlaylistDrop(event, index)}
                                                     sx={{
                                                         display: "grid",
                                                         gridTemplateColumns: {
                                                             xs: "46px minmax(0, 1fr)",
-                                                            sm: "46px minmax(0, 1fr) auto auto",
+                                                            sm: "46px minmax(0, 1fr) auto auto 44px",
                                                         },
                                                         gap: 1,
                                                         alignItems: "center",
                                                         borderRadius: 3,
                                                         p: 1.25,
+                                                        transform: isDragSource
+                                                            ? "scale(0.985)"
+                                                            : isDropTarget
+                                                                ? "translateY(-2px)"
+                                                                : "none",
+                                                        transition:
+                                                            "transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease",
                                                         background: active
                                                             ? "rgba(103,232,249,0.14)"
-                                                            : "rgba(255,255,255,0.06)",
+                                                            : isDropTarget
+                                                                ? "rgba(167,139,250,0.13)"
+                                                                : "rgba(255,255,255,0.06)",
                                                         border: active
                                                             ? "1px solid rgba(103,232,249,0.3)"
-                                                            : "1px solid rgba(255,255,255,0.08)",
+                                                            : isDropTarget
+                                                                ? "1px solid rgba(167,139,250,0.45)"
+                                                                : "1px solid rgba(255,255,255,0.08)",
+                                                        boxShadow: isDropTarget
+                                                            ? "0 18px 36px rgba(167,139,250,0.15)"
+                                                            : "none",
+                                                        opacity: isDragSource ? 0.72 : 1,
                                                     }}
                                                 >
                                                     {itemArtworkSource ? (
@@ -10433,6 +10653,55 @@ export default function Audio() {
                                                         }}
                                                     >
                                                         <DeleteRoundedIcon fontSize="small" />
+                                                    </Button>
+
+                                                    <Button
+                                                        size="small"
+                                                        draggable={
+                                                            !isRendering &&
+                                                            !isLoading &&
+                                                            !isPreloadingPlaylist &&
+                                                            playlist.length > 1
+                                                        }
+                                                        onDragStart={(event) =>
+                                                            handlePlaylistDragStart(event, index)
+                                                        }
+                                                        onDragEnd={handlePlaylistDragEnd}
+                                                        disabled={
+                                                            isRendering ||
+                                                            isLoading ||
+                                                            isPreloadingPlaylist ||
+                                                            playlist.length < 2
+                                                        }
+                                                        aria-label={`Drag ${item.title} to reorder playlist`}
+                                                        title="Drag from here to reorder"
+                                                        sx={{
+                                                            minWidth: 42,
+                                                            width: 42,
+                                                            height: 42,
+                                                            borderRadius: 2.5,
+                                                            color: "rgba(255,255,255,0.72)",
+                                                            cursor: playlist.length > 1 ? "grab" : "default",
+                                                            justifySelf: "end",
+                                                            gridColumn: {
+                                                                xs: "2",
+                                                                sm: "auto",
+                                                            },
+                                                            touchAction: "none",
+                                                            userSelect: "none",
+                                                            border: "1px solid rgba(255,255,255,0.12)",
+                                                            background: "rgba(255,255,255,0.045)",
+                                                            "&:active": {
+                                                                cursor: "grabbing",
+                                                            },
+                                                            "&:hover": {
+                                                                color: "#fff",
+                                                                borderColor: "rgba(167,139,250,0.42)",
+                                                                background: "rgba(167,139,250,0.12)",
+                                                            },
+                                                        }}
+                                                    >
+                                                        <DragIndicatorRoundedIcon fontSize="small" />
                                                     </Button>
                                                 </Box>
                                             );
