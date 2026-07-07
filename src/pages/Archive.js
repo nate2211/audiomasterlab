@@ -14,9 +14,11 @@ import {
     Divider,
     FormControlLabel,
     Grid,
+    IconButton,
     Stack,
     Switch,
     TextField,
+    Tooltip,
     Typography,
 } from "@mui/material";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
@@ -26,7 +28,10 @@ import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
 import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
-import {Helmet} from "react-helmet-async";
+import AddRoundedIcon from "@mui/icons-material/AddRounded";
+import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
+import { Helmet } from "react-helmet-async";
+
 const AUDIO_EXTENSIONS = [
     ".mp3",
     ".m4a",
@@ -65,9 +70,7 @@ const ARCHIVE_SKIP_EXTENSIONS = [
     ".pdf",
 ];
 
-const BLOCKED_TERMS = [
-
-];
+const BLOCKED_TERMS = [];
 
 const SAFE_COLLECTION_OPTIONS = [
     {
@@ -105,8 +108,6 @@ const SAFE_COLLECTION_OPTIONS = [
         label: "Folksonomy Audio",
         description: "Tagged audio collections with broad public discovery.",
     },
-
-    // Music-heavy Archive.org collections
     {
         id: "audio_music",
         label: "Music, Arts & Culture",
@@ -135,7 +136,7 @@ const SAFE_COLLECTION_OPTIONS = [
     {
         id: "GratefulDead",
         label: "Grateful Dead",
-        description: "Live Grateful Dead recordings from Archive’s live music archive.",
+        description: "Live Grateful Dead recordings from Archive's live music archive.",
     },
     {
         id: "ektoplazm",
@@ -217,8 +218,6 @@ const SAFE_COLLECTION_OPTIONS = [
         label: "Phlow",
         description: "Creative Commons music, netaudio, electronic, indie, and music culture releases.",
     },
-
-    // Radio, broadcast, and mixed audio collections
     {
         id: "audio_tech",
         label: "Computers, Technology & Science",
@@ -249,8 +248,6 @@ const SAFE_COLLECTION_OPTIONS = [
         label: "Amateur Radio & Communications",
         description: "Ham radio, radio history, communications podcasts, broadcasts, and related media.",
     },
-
-    // Spoken word / educational / cultural audio
     {
         id: "audio_religion",
         label: "Spirituality & Religion",
@@ -264,32 +261,58 @@ const SAFE_COLLECTION_OPTIONS = [
 ];
 
 const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
-
 const AUDIO_PLAYLIST_STORAGE_KEY = "audiomasterlab.audio.playlist.v4";
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const ARCHIVE_PROXY_STORAGE_KEY = "audiomasterlab.archive.useProxy.v1";
-const ARCHIVE_BROWSER_STORAGE_KEY = "audiomasterlab.archive.browser.session.v2";
+const ARCHIVE_BROWSER_STORAGE_KEY = "audiomasterlab.archive.browser.session.v3";
+const ARCHIVE_CUSTOM_COLLECTIONS_STORAGE_KEY = "audiomasterlab.archive.customCollections.v1";
 const ARCHIVE_VISIBLE_RESULT_BATCH_SIZE = 12;
 const ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM = 4;
 const ARCHIVE_FILE_BATCH_SIZE = 12;
 const ARCHIVE_SEARCH_BATCH_SIZE = 100;
 
-function makeArchivePageCursor(pageNumber) {
-    const safePageNumber = Math.max(1, Number(pageNumber) || 1);
+const ARCHIVE_QUERY_STOP_WORDS = new Set([
+    "a",
+    "an",
+    "and",
+    "archive",
+    "archives",
+    "audio",
+    "by",
+    "cc",
+    "commons",
+    "creative",
+    "domain",
+    "download",
+    "downloads",
+    "for",
+    "from",
+    "in",
+    "listen",
+    "mediatype",
+    "music",
+    "of",
+    "official",
+    "on",
+    "or",
+    "public",
+    "safe",
+    "stream",
+    "the",
+    "to",
+    "with",
+]);
 
-    return `page:${safePageNumber}`;
+function makeArchivePageCursor(pageNumber) {
+    return `page:${Math.max(1, Number(pageNumber) || 1)}`;
 }
 
 function getArchivePageFromCursor(cursor = "") {
     const text = String(cursor || "").trim();
-
     if (!text) return 1;
 
     const pageMatch = text.match(/^page:(\d+)$/i);
-
-    if (pageMatch) {
-        return Math.max(1, Number(pageMatch[1]) || 1);
-    }
+    if (pageMatch) return Math.max(1, Number(pageMatch[1]) || 1);
 
     return Math.max(1, Number(text) || 1);
 }
@@ -298,31 +321,134 @@ function makeArchivePlaylistId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function readAudioPlaylistFromStorage() {
-    if (typeof window === "undefined" || !window.localStorage) return [];
+function normalizeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function hasBlockedTerm(value) {
+    const lower = String(value || "").toLowerCase();
+    return BLOCKED_TERMS.some((term) => lower.includes(term));
+}
+
+function sanitizeArchiveQuery(value) {
+    return normalizeText(value)
+        .replace(/[^\w\s'"@:./-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 120);
+}
+
+function getArchiveSearchTextFromInput(value) {
+    const advancedSearchTarget = extractArchiveTargets(value).find(
+        (target) => target.type === "advancedSearch"
+    );
+
+    return advancedSearchTarget?.query || value;
+}
+
+function cleanArchiveRequestText(value) {
+    return normalizeText(getArchiveSearchTextFromInput(value))
+        .replace(/https?:\/\/\S+/gi, " ")
+        .replace(/\b(?:AND|OR|NOT)\b/gi, " ")
+        .replace(/\b(?:mediatype|collection|title|creator|subject|description|identifier|date|licenseurl):\s*"[^"]*"/gi, " ")
+        .replace(/\b(?:mediatype|collection|title|creator|subject|description|identifier|date|licenseurl):[^\s)]+/gi, " ")
+        .replace(/[()[\]{}<>]/g, " ")
+        .replace(/[\u201c\u201d]/g, '"')
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getSterileArchiveQuery(value) {
+    return sanitizeArchiveQuery(cleanArchiveRequestText(value))
+        .replace(/[:/]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function escapeArchivePhrase(value) {
+    return String(value || "")
+        .replace(/["]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function escapeArchiveToken(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "")
+        .trim();
+}
+
+function sanitizeArchiveCollectionId(value) {
+    return String(value || "")
+        .trim()
+        .replace(/^collection:/i, "")
+        .replace(/^https?:\/\/archive\.org\/details\//i, "")
+        .split(/[/?#\s]/)[0]
+        .replace(/[^a-zA-Z0-9_.-]/g, "")
+        .slice(0, 80);
+}
+
+function escapeArchiveCollectionId(value) {
+    return sanitizeArchiveCollectionId(value).replace(/"/g, "");
+}
+
+function normalizeCollectionIds(value) {
+    const source = Array.isArray(value) ? value : [];
+    return Array.from(
+        new Set(source.map(sanitizeArchiveCollectionId).filter(Boolean))
+    );
+}
+
+function normalizeArray(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value.map(String).filter(Boolean);
+    return [String(value)].filter(Boolean);
+}
+
+function readJsonStorage(key, fallback) {
+    if (typeof window === "undefined" || !window.localStorage) return fallback;
 
     try {
-        const raw = window.localStorage.getItem(AUDIO_PLAYLIST_STORAGE_KEY);
-        const parsed = raw ? JSON.parse(raw) : [];
-
-        return Array.isArray(parsed) ? parsed : [];
+        const raw = window.localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
     } catch {
-        return [];
+        return fallback;
     }
 }
 
-function writeAudioPlaylistToStorage(playlist) {
+function writeJsonStorage(key, value) {
     if (typeof window === "undefined" || !window.localStorage) return false;
 
     try {
-        window.localStorage.setItem(
-            AUDIO_PLAYLIST_STORAGE_KEY,
-            JSON.stringify(playlist)
-        );
+        window.localStorage.setItem(key, JSON.stringify(value));
         return true;
     } catch {
         return false;
     }
+}
+
+function readAudioPlaylistFromStorage() {
+    const parsed = readJsonStorage(AUDIO_PLAYLIST_STORAGE_KEY, []);
+    return Array.isArray(parsed) ? parsed : [];
+}
+
+function writeAudioPlaylistToStorage(playlist) {
+    return writeJsonStorage(AUDIO_PLAYLIST_STORAGE_KEY, playlist);
+}
+
+function readCustomCollectionsFromStorage() {
+    return normalizeCollectionIds(
+        readJsonStorage(ARCHIVE_CUSTOM_COLLECTIONS_STORAGE_KEY, [])
+    );
+}
+
+function writeCustomCollectionsToStorage(collections) {
+    return writeJsonStorage(
+        ARCHIVE_CUSTOM_COLLECTIONS_STORAGE_KEY,
+        normalizeCollectionIds(collections)
+    );
 }
 
 function readArchiveProxySetting() {
@@ -339,25 +465,38 @@ function writeArchiveProxySetting(value) {
     if (typeof window === "undefined" || !window.localStorage) return false;
 
     try {
-        window.localStorage.setItem(
-            ARCHIVE_PROXY_STORAGE_KEY,
-            value ? "true" : "false"
-        );
+        window.localStorage.setItem(ARCHIVE_PROXY_STORAGE_KEY, value ? "true" : "false");
         return true;
     } catch {
         return false;
     }
 }
 
+function buildSearchSignature(
+    query,
+    selectedCollections,
+    allowZipInternalPaths,
+    useArchiveProxy = false
+) {
+    return JSON.stringify({
+        query: getSterileArchiveQuery(query),
+        collections: normalizeCollectionIds(selectedCollections).sort(),
+        allowZipInternalPaths: Boolean(allowZipInternalPaths),
+        useArchiveProxy: Boolean(useArchiveProxy),
+    });
+}
+
 function getDefaultArchiveBrowserSession() {
     const useArchiveProxy = readArchiveProxySetting();
+    const customCollections = readCustomCollectionsFromStorage();
 
     return {
         query: "old radio",
         selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
+        customCollections,
+        customCollectionInput: "",
         allowZipInternalPaths: false,
         useArchiveProxy,
-        results: [],
         nextCursor: "",
         status: "",
         error: "",
@@ -381,9 +520,8 @@ function getDefaultArchiveBrowserSession() {
 function sanitizeSavedArchiveBrowserSession(value) {
     const fallback = getDefaultArchiveBrowserSession();
     const parsed = value && typeof value === "object" ? value : {};
-    const selectedCollections = Array.isArray(parsed.selectedCollections)
-        ? parsed.selectedCollections.filter(Boolean)
-        : fallback.selectedCollections;
+    const selectedCollections = normalizeCollectionIds(parsed.selectedCollections);
+    const customCollections = normalizeCollectionIds(parsed.customCollections);
     const lastSubmittedSearch =
         parsed.lastSubmittedSearch && typeof parsed.lastSubmittedSearch === "object"
             ? parsed.lastSubmittedSearch
@@ -408,11 +546,10 @@ function sanitizeSavedArchiveBrowserSession(value) {
         ...fallback,
         query: nextQuery,
         selectedCollections: nextSelectedCollections,
+        customCollections,
+        customCollectionInput: String(parsed.customCollectionInput || ""),
         allowZipInternalPaths: nextAllowZipInternalPaths,
         useArchiveProxy: nextUseArchiveProxy,
-        // Results are intentionally never restored. Old saved result arrays were
-        // the main source of wrong-query cards after a later search.
-        results: [],
         nextCursor: "",
         status: "",
         error: "",
@@ -420,9 +557,10 @@ function sanitizeSavedArchiveBrowserSession(value) {
         lastSearchSignature: "",
         lastSubmittedSearch: {
             query: savedSignatureIsCurrent ? String(lastSubmittedSearch.query || "") : "",
-            selectedCollections: savedSignatureIsCurrent && Array.isArray(lastSubmittedSearch.selectedCollections)
-                ? lastSubmittedSearch.selectedCollections.filter(Boolean)
-                : nextSelectedCollections,
+            selectedCollections:
+                savedSignatureIsCurrent && Array.isArray(lastSubmittedSearch.selectedCollections)
+                    ? normalizeCollectionIds(lastSubmittedSearch.selectedCollections)
+                    : nextSelectedCollections,
             allowZipInternalPaths: savedSignatureIsCurrent
                 ? Boolean(lastSubmittedSearch.allowZipInternalPaths)
                 : nextAllowZipInternalPaths,
@@ -446,7 +584,6 @@ function readArchiveBrowserSession() {
 
     try {
         const raw = window.localStorage.getItem(ARCHIVE_BROWSER_STORAGE_KEY);
-
         return sanitizeSavedArchiveBrowserSession(raw ? JSON.parse(raw) : {});
     } catch {
         return getDefaultArchiveBrowserSession();
@@ -483,125 +620,22 @@ function clearArchiveBrowserSession() {
     }
 }
 
-function shouldUseArchiveProxyForUrl(url, useArchiveProxy) {
-    if (!useArchiveProxy) return false;
-
-    try {
-        const parsedUrl = new URL(url);
-
-        return parsedUrl.protocol === "https:" && isArchiveHost(parsedUrl.hostname);
-    } catch {
-        return false;
-    }
-}
-
-function buildArchiveProxyUrl(url, useArchiveProxy) {
-    if (!shouldUseArchiveProxyForUrl(url, useArchiveProxy)) {
-        return url;
-    }
-
-    return `${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}?url=${encodeURIComponent(url)}`;
-}
-
-function getArchiveAudioPlaylistTitle(file) {
-    const name = file?.name || "";
-
-    if (name) return name;
-
-    const url = file?.serveUrl || file?.url || file?.downloadUrl || "";
-
-    try {
-        const parsed = new URL(url);
-        const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
-
-        return decodeURIComponent(lastPart || "Archive audio");
-    } catch {
-        return "Archive audio";
-    }
-}
-function normalizeText(value) {
-    return String(value || "")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function hasBlockedTerm(value) {
-    const lower = String(value || "").toLowerCase();
-
-    return BLOCKED_TERMS.some((term) => lower.includes(term));
-}
-
-function sanitizeArchiveQuery(value) {
-    return normalizeText(value)
-        .replace(/[^\w\s'"@:./-]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 120);
-}
-
-function cleanArchiveRequestText(value) {
-    return normalizeText(getArchiveSearchTextFromInput(value))
-        .replace(/https?:\/\/\S+/gi, " ")
-        .replace(/\b(?:AND|OR|NOT)\b/gi, " ")
-        .replace(/\b(?:mediatype|collection|title|creator|subject|description|identifier|date|licenseurl):\s*"[^"]*"/gi, " ")
-        .replace(/\b(?:mediatype|collection|title|creator|subject|description|identifier|date|licenseurl):[^\s)]+/gi, " ")
-        .replace(/[()[\]{}<>]/g, " ")
-        .replace(/[“”]/g, '"')
-        .replace(/[‘’]/g, "'")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function getSterileArchiveQuery(value) {
-    return sanitizeArchiveQuery(cleanArchiveRequestText(value))
-        .replace(/[:/]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function escapeArchivePhrase(value) {
-    return String(value || "")
-        .replace(/[\"]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function escapeArchiveToken(value) {
-    return String(value || "")
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]/g, "")
-        .trim();
-}
-
-function normalizeArray(value) {
-    if (!value) return [];
-
-    if (Array.isArray(value)) {
-        return value.map(String).filter(Boolean);
-    }
-
-    return [String(value)].filter(Boolean);
-}
-
 function getLowerFileName(name = "") {
     return String(name || "").toLowerCase().split("?")[0].split("#")[0];
 }
 
 function isAudioFile(name = "") {
     const lower = getLowerFileName(name);
-
     return AUDIO_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
 function isImageFile(name = "") {
     const lower = getLowerFileName(name);
-
     return IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
 function isSkipFile(name = "") {
     const lower = getLowerFileName(name);
-
     return ARCHIVE_SKIP_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
@@ -617,13 +651,45 @@ function encodeArchivePath(path) {
 }
 
 function buildDownloadUrl(identifier, fileName) {
-    return `https://archive.org/download/${encodeURIComponent(
-        identifier
-    )}/${encodeArchivePath(fileName)}`;
+    return `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeArchivePath(fileName)}`;
+}
+
+function buildServeUrl(identifier, fileName) {
+    return `https://archive.org/serve/${encodeURIComponent(identifier)}/${encodeArchivePath(fileName)}`;
 }
 
 function buildDetailsUrl(identifier) {
     return `https://archive.org/details/${encodeURIComponent(identifier)}`;
+}
+
+function buildArchiveImageServiceUrl(identifier) {
+    return `https://archive.org/services/img/${encodeURIComponent(identifier)}`;
+}
+
+function isArchiveHost(host = "") {
+    const lower = String(host || "").toLowerCase();
+
+    return (
+        lower === "archive.org" ||
+        lower === "www.archive.org" ||
+        /^ia\d+\.us\.archive\.org$/.test(lower)
+    );
+}
+
+function shouldUseArchiveProxyForUrl(url, useArchiveProxy) {
+    if (!useArchiveProxy) return false;
+
+    try {
+        const parsedUrl = new URL(url);
+        return parsedUrl.protocol === "https:" && isArchiveHost(parsedUrl.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function buildArchiveProxyUrl(url, useArchiveProxy) {
+    if (!shouldUseArchiveProxyForUrl(url, useArchiveProxy)) return url;
+    return `${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}?url=${encodeURIComponent(url)}`;
 }
 
 function getLicense(metadata = {}) {
@@ -643,10 +709,11 @@ function getItemCollections(item = {}, metadata = {}) {
     ];
 }
 
-function itemHasSelectedSafeCollection(item = {}, metadata = {}, selected = []) {
+function itemHasSelectedCollection(item = {}, metadata = {}, selected = []) {
+    const selectedSet = new Set(normalizeCollectionIds(selected));
     const collections = getItemCollections(item, metadata);
 
-    return collections.some((collection) => selected.includes(collection));
+    return collections.some((collection) => selectedSet.has(collection));
 }
 
 function getMetadataText(item = {}, metadata = {}) {
@@ -667,158 +734,37 @@ function getMetadataText(item = {}, metadata = {}) {
         .map(String)
         .join(" ");
 }
-function buildServeUrl(identifier, fileName) {
-    return `https://archive.org/serve/${encodeURIComponent(
-        identifier
-    )}/${encodeArchivePath(fileName)}`;
-}
-
-function buildArchiveImageServiceUrl(identifier) {
-    return `https://archive.org/services/img/${encodeURIComponent(identifier)}`;
-}
-
-function isArchiveWaveformImage(file = {}) {
-    const lowerName = getLowerFileName(file.name);
-    const format = String(file.format || "").toLowerCase();
-    const source = String(file.source || "").toLowerCase();
-    const combined = `${lowerName} ${format} ${source}`;
-
-    return (
-        /(^|[\s_.\-/])(spectrogram|spectrograph|spectrum|spectral|sonogram|waveform|waveforms|frequency|freq|oscilloscope)([\s_.\-/]|$)/i.test(combined) ||
-        /_spectrogram\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName) ||
-        /_waveform\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName)
-    );
-}
-
-function getArchiveImageScore(file = {}) {
-    if (isArchiveWaveformImage(file)) return -10000;
-
-    const lowerName = getLowerFileName(file.name);
-    const format = String(file.format || "").toLowerCase();
-    let score = 10;
-
-    if (/\b(cover|front|folder|artwork|album|poster)\b/i.test(lowerName)) score += 120;
-    if (lowerName.includes("__ia_thumb")) score += 95;
-    if (format.includes("item tile")) score += 90;
-    if (format.includes("jpeg thumb") || format.includes("thumbnail")) score += 85;
-    if (/\b(thumb|image|scan|jacket|sleeve)\b/i.test(lowerName)) score += 70;
-    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) score += 12;
-    if (lowerName.endsWith(".webp")) score += 10;
-    if (lowerName.endsWith(".png")) score += 4;
-    if (lowerName.endsWith(".gif")) score -= 20;
-
-    const size = Number(file.size);
-    if (Number.isFinite(size) && size > 0) {
-        if (size < 1500) score -= 45;
-        if (size > 5000) score += 8;
-        if (size > 25000) score += 6;
-        if (size > 2500000) score -= 12;
-    }
-
-    return score;
-}
-
-function getArchiveItemImages(
-    identifier,
-    metadata = {},
-    files = [],
-    useArchiveProxy = false
-) {
-    const title = metadata.title || identifier || "Archive item";
-    const serviceImageUrl = buildArchiveImageServiceUrl(identifier);
-
-    const metadataImages = (Array.isArray(files) ? files : [])
-        .filter((file) => file?.name)
-        .filter((file) => isImageFile(file.name))
-        .filter((file) => !hasBlockedTerm(file.name))
-        .filter((file) => !isZipInternalPath(file.name))
-        .filter((file) => !isArchiveWaveformImage(file))
-        .map((file) => {
-            const directUrl = buildDownloadUrl(identifier, file.name);
-            const imageUrl = buildArchiveProxyUrl(directUrl, useArchiveProxy);
-
-            return {
-                name: file.name,
-                format: file.format || "",
-                size: file.size || "",
-                source: file.source || "archive metadata",
-                url: imageUrl,
-                imageUrl,
-                directUrl,
-                proxied: Boolean(useArchiveProxy),
-                alt: `${title} artwork from Archive.org`,
-                score: getArchiveImageScore(file),
-            };
-        })
-        .filter((image) => image.score > -1000)
-        .sort((a, b) => b.score - a.score);
-
-    if (metadataImages.length) {
-        return dedupeArchiveImages(metadataImages).slice(0, 1);
-    }
-
-    const serviceImage = {
-        name: "Archive item thumbnail",
-        format: "Archive thumbnail fallback",
-        size: "",
-        source: "archive services image",
-        url: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
-        imageUrl: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
-        directUrl: serviceImageUrl,
-        proxied: Boolean(useArchiveProxy),
-        alt: `${title} Archive.org thumbnail`,
-        score: 1,
-    };
-
-    return dedupeArchiveImages([serviceImage]).slice(0, 1);
-}
 
 function looksRightsSafer(item = {}, metadata = {}, selectedCollections = []) {
     const combined = getMetadataText(item, metadata);
+    if (hasBlockedTerm(combined)) return false;
 
-    if (hasBlockedTerm(combined)) {
-        return false;
-    }
-
-    const hasSafeCollection = itemHasSelectedSafeCollection(
+    const hasSelectedCollection = itemHasSelectedCollection(
         item,
         metadata,
         selectedCollections
     );
-
     const hasLicense = Boolean(getLicense(metadata));
 
-    return hasSafeCollection || hasLicense;
+    return hasSelectedCollection || hasLicense;
 }
 
 function buildArchiveSearchQuery(query, selectedCollections) {
     const safeQuery = getSterileArchiveQuery(query);
     const tokens = getArchiveQueryTokens(safeQuery);
     const phrase = escapeArchivePhrase(safeQuery);
-
-    const collectionQuery = selectedCollections
-        .map((collection) => `collection:${collection}`)
+    const collectionIds = normalizeCollectionIds(selectedCollections);
+    const collectionQuery = collectionIds
+        .map((collection) => `collection:${escapeArchiveCollectionId(collection)}`)
         .join(" OR ");
-
-    const fields = [
-        "title",
-        "creator",
-        "subject",
-        "description",
-        "identifier",
-    ];
-
+    const fields = ["title", "creator", "subject", "description", "identifier"];
     const phraseClause = phrase
-        ? fields
-            .map((field) => `${field}:"${phrase}"`)
-            .join(" OR ")
+        ? fields.map((field) => `${field}:"${phrase}"`).join(" OR ")
         : "";
-
     const tokenClause = tokens.length
         ? tokens
             .map((token) => {
                 const safeToken = escapeArchiveToken(token);
-
                 if (!safeToken) return "";
 
                 return `(${fields
@@ -828,24 +774,24 @@ function buildArchiveSearchQuery(query, selectedCollections) {
             .filter(Boolean)
             .join(" AND ")
         : "";
-
-    const queryClause = [phraseClause && `(${phraseClause})`, tokenClause && `(${tokenClause})`]
+    const queryClause = [
+        phraseClause && `(${phraseClause})`,
+        tokenClause && `(${tokenClause})`,
+    ]
         .filter(Boolean)
         .join(" OR ");
 
-    // Build a sterile Archive request from only the current input.
-    // Do not send loose raw text, previous query terms, old cursors, or user-pasted
-    // Archive/Google operators into the next request.
     return [
         "mediatype:audio",
-        `(${collectionQuery})`,
+        collectionQuery ? `(${collectionQuery})` : "",
         `(${queryClause || safeQuery})`,
-    ].join(" AND ");
+    ]
+        .filter(Boolean)
+        .join(" AND ");
 }
 
 async function fetchJson(url, options = {}) {
     const requestUrl = buildArchiveProxyUrl(url, Boolean(options.useArchiveProxy));
-
     const response = await fetch(requestUrl, {
         method: "GET",
         signal: options.signal,
@@ -907,35 +853,32 @@ async function searchArchiveItems(
     });
     const response = data?.response || {};
     const docs = Array.isArray(response.docs) ? response.docs : [];
-    const rows = Number(response.rows || ARCHIVE_SEARCH_BATCH_SIZE);
     const start = Number(response.start || (pageNumber - 1) * ARCHIVE_SEARCH_BATCH_SIZE);
     const numFound = Number(response.numFound || docs.length);
     const hasMorePages = start + docs.length < numFound && docs.length > 0;
 
     return {
         ...data,
+        archiveQuery,
         items: docs,
         cursor: hasMorePages ? makeArchivePageCursor(pageNumber + 1) : "",
         page: pageNumber,
         start,
-        rows,
         numFound,
         hasMorePages,
     };
 }
 
 async function fetchArchiveMetadata(identifier, signal, useArchiveProxy = false) {
-    return fetchJson(
-        `https://archive.org/metadata/${encodeURIComponent(identifier)}`,
-        { signal, useArchiveProxy }
-    );
+    return fetchJson(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
+        signal,
+        useArchiveProxy,
+    });
 }
+
 function formatSize(value) {
     const bytes = Number(value);
-
-    if (!Number.isFinite(bytes) || bytes <= 0) {
-        return "";
-    }
+    if (!Number.isFinite(bytes) || bytes <= 0) return "";
 
     const units = ["B", "KB", "MB", "GB"];
     const index = Math.min(
@@ -943,27 +886,122 @@ function formatSize(value) {
         Math.floor(Math.log(bytes) / Math.log(1024))
     );
 
-    return `${(bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${
-        units[index]
-    }`;
+    return `${(bytes / Math.pow(1024, index)).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
 function formatFileLabel(file = {}) {
     const pieces = [];
-
     if (file.format) pieces.push(file.format);
     if (file.length) pieces.push(file.length);
     if (file.size) pieces.push(formatSize(file.size));
 
-    return pieces.filter(Boolean).join(" • ") || "audio file";
+    return pieces.filter(Boolean).join(" - ") || "audio file";
 }
 
-function getPlayableFiles(
-    identifier,
-    files,
-    allowZipInternalPaths,
-    useArchiveProxy = false
-) {
+function getArchiveAudioPlaylistTitle(file) {
+    const name = file?.name || "";
+    if (name) return name;
+
+    const url = file?.serveUrl || file?.url || file?.downloadUrl || "";
+
+    try {
+        const parsed = new URL(url);
+        const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
+        return decodeURIComponent(lastPart || "Archive audio");
+    } catch {
+        return "Archive audio";
+    }
+}
+
+function isArchiveWaveformImage(file = {}) {
+    const lowerName = getLowerFileName(file.name);
+    const format = String(file.format || "").toLowerCase();
+    const source = String(file.source || "").toLowerCase();
+    const combined = `${lowerName} ${format} ${source}`;
+
+    return (
+        /(^|[\s_.\-/])(spectrogram|spectrograph|spectrum|spectral|sonogram|waveform|waveforms|frequency|freq|oscilloscope)([\s_.\-/]|$)/i.test(combined) ||
+        /_spectrogram\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName) ||
+        /_waveform\.(png|jpg|jpeg|webp|gif)$/i.test(lowerName)
+    );
+}
+
+function getArchiveImageScore(file = {}) {
+    if (isArchiveWaveformImage(file)) return -10000;
+
+    const lowerName = getLowerFileName(file.name);
+    const format = String(file.format || "").toLowerCase();
+    let score = 10;
+
+    if (/\b(cover|front|folder|artwork|album|poster)\b/i.test(lowerName)) score += 120;
+    if (lowerName.includes("__ia_thumb")) score += 95;
+    if (format.includes("item tile")) score += 90;
+    if (format.includes("jpeg thumb") || format.includes("thumbnail")) score += 85;
+    if (/\b(thumb|image|scan|jacket|sleeve)\b/i.test(lowerName)) score += 70;
+    if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) score += 12;
+    if (lowerName.endsWith(".webp")) score += 10;
+    if (lowerName.endsWith(".png")) score += 4;
+    if (lowerName.endsWith(".gif")) score -= 20;
+
+    const size = Number(file.size);
+    if (Number.isFinite(size) && size > 0) {
+        if (size < 1500) score -= 45;
+        if (size > 5000) score += 8;
+        if (size > 25000) score += 6;
+        if (size > 2500000) score -= 12;
+    }
+
+    return score;
+}
+
+function getArchiveItemImages(identifier, metadata = {}, files = [], useArchiveProxy = false) {
+    const title = metadata.title || identifier || "Archive item";
+    const serviceImageUrl = buildArchiveImageServiceUrl(identifier);
+    const metadataImages = (Array.isArray(files) ? files : [])
+        .filter((file) => file?.name)
+        .filter((file) => isImageFile(file.name))
+        .filter((file) => !hasBlockedTerm(file.name))
+        .filter((file) => !isZipInternalPath(file.name))
+        .filter((file) => !isArchiveWaveformImage(file))
+        .map((file) => {
+            const directUrl = buildDownloadUrl(identifier, file.name);
+            const imageUrl = buildArchiveProxyUrl(directUrl, useArchiveProxy);
+
+            return {
+                name: file.name,
+                format: file.format || "",
+                size: file.size || "",
+                source: file.source || "archive metadata",
+                url: imageUrl,
+                imageUrl,
+                directUrl,
+                proxied: Boolean(useArchiveProxy),
+                alt: `${title} artwork from Archive.org`,
+                score: getArchiveImageScore(file),
+            };
+        })
+        .filter((image) => image.score > -1000)
+        .sort((a, b) => b.score - a.score);
+
+    if (metadataImages.length) return dedupeArchiveImages(metadataImages).slice(0, 1);
+
+    return [
+        {
+            name: "Archive item thumbnail",
+            format: "Archive thumbnail fallback",
+            size: "",
+            source: "archive services image",
+            url: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
+            imageUrl: buildArchiveProxyUrl(serviceImageUrl, useArchiveProxy),
+            directUrl: serviceImageUrl,
+            proxied: Boolean(useArchiveProxy),
+            alt: `${title} Archive.org thumbnail`,
+            score: 1,
+        },
+    ];
+}
+
+function getPlayableFiles(identifier, files, allowZipInternalPaths, useArchiveProxy = false) {
     const playableFiles = (Array.isArray(files) ? files : [])
         .filter((file) => file?.name)
         .filter((file) => isAudioFile(file.name))
@@ -973,10 +1011,7 @@ function getPlayableFiles(
         .map((file) => {
             const directDownloadUrl = buildDownloadUrl(identifier, file.name);
             const directServeUrl = buildServeUrl(identifier, file.name);
-            const downloadUrl = buildArchiveProxyUrl(
-                directDownloadUrl,
-                useArchiveProxy
-            );
+            const downloadUrl = buildArchiveProxyUrl(directDownloadUrl, useArchiveProxy);
             const serveUrl = buildArchiveProxyUrl(directServeUrl, useArchiveProxy);
 
             return {
@@ -985,7 +1020,7 @@ function getPlayableFiles(
                 size: file.size || "",
                 length: file.length || "",
                 source: file.source || "",
-                url: serveUrl,          // main player source
+                url: serveUrl,
                 serveUrl,
                 downloadUrl,
                 directServeUrl,
@@ -995,20 +1030,9 @@ function getPlayableFiles(
             };
         });
 
-    // Important: do not slice this list.
-    // Archive items/collections can contain more than 20 playable files, and
-    // cutting here was the main reason only part of a collection appeared.
     return dedupeArchiveFiles(playableFiles);
 }
 
-function mergeForcedAndMetadataPlayableFiles(forcedFiles = [], metadataFiles = []) {
-    // Pasted direct audio URLs should appear first, but the rest of the Archive
-    // item's playable files should still load underneath them.
-    return dedupeArchiveFiles([
-        ...(Array.isArray(forcedFiles) ? forcedFiles : []),
-        ...(Array.isArray(metadataFiles) ? metadataFiles : []),
-    ]);
-}
 function stripUrlPunctuation(value) {
     return String(value || "").replace(/[),.;\]]+$/g, "");
 }
@@ -1031,34 +1055,19 @@ function splitJoinedUrls(value) {
 function extractUrls(value) {
     const text = splitJoinedUrls(value);
     const matches = text.match(/https?:\/\/[^\s<>"']+/gi);
-
     return matches ? matches.map(stripUrlPunctuation) : [];
-}
-function isArchiveHost(host = "") {
-    const lower = String(host || "").toLowerCase();
-
-    return (
-        lower === "archive.org" ||
-        lower === "www.archive.org" ||
-        /^ia\d+\.us\.archive\.org$/.test(lower)
-    );
 }
 
 function normalizeAdvancedSearchQuery(value) {
     return sanitizeArchiveQuery(
         normalizeText(value)
-            // Remove Google-style site operators if someone pastes a Google/Bing query.
             .replace(/\(?\s*site:archive\.org\s*\)?/gi, " ")
             .replace(/-site:[^\s)]+/gi, " ")
-
-            // These terms are not useful once we already force mediatype:audio.
             .replace(/\bofficial\s+audio\b/gi, " ")
             .replace(/\bdownload\b/gi, " ")
             .replace(/\bstream\b/gi, " ")
             .replace(/\blisten\b/gi, " ")
             .replace(/\baudio\b/gi, " ")
-
-            // Keep the human query words.
             .replace(/\bOR\b/gi, " ")
             .replace(/\bAND\b/gi, " ")
             .replace(/[()"]/g, " ")
@@ -1069,23 +1078,18 @@ function parseArchiveTarget(rawUrl) {
     try {
         const url = new URL(rawUrl);
         const host = url.hostname.toLowerCase();
-
-        if (!isArchiveHost(host)) {
-            return null;
-        }
+        if (!isArchiveHost(host)) return null;
 
         const parts = url.pathname
             .split("/")
             .filter(Boolean)
             .map(decodeArchivePathPart);
 
-        // archive.org/advancedsearch.php?q=...
         if (
             (host === "archive.org" || host === "www.archive.org") &&
             parts[0] === "advancedsearch.php"
         ) {
             const q = normalizeAdvancedSearchQuery(url.searchParams.get("q") || "");
-
             if (!q) return null;
 
             return {
@@ -1098,7 +1102,6 @@ function parseArchiveTarget(rawUrl) {
         let identifier = "";
         let fileName = "";
 
-        // archive.org/details/IDENTIFIER
         if (
             (host === "archive.org" || host === "www.archive.org") &&
             parts[0] === "details" &&
@@ -1114,8 +1117,6 @@ function parseArchiveTarget(rawUrl) {
             };
         }
 
-        // archive.org/download/IDENTIFIER/file.mp3
-        // archive.org/serve/IDENTIFIER/file.mp3
         if (
             (host === "archive.org" || host === "www.archive.org") &&
             (parts[0] === "download" || parts[0] === "serve") &&
@@ -1125,21 +1126,16 @@ function parseArchiveTarget(rawUrl) {
             fileName = parts.slice(2).join("/");
         }
 
-        // ia801607.us.archive.org/35/items/IDENTIFIER/file.ext
         if (/^ia\d+\.us\.archive\.org$/.test(host)) {
             const itemsIndex = parts.indexOf("items");
-
             if (itemsIndex >= 0 && parts.length >= itemsIndex + 2) {
                 identifier = parts[itemsIndex + 1];
                 fileName = parts.slice(itemsIndex + 2).join("/");
             }
         }
 
-        if (!identifier) {
-            return null;
-        }
+        if (!identifier) return null;
 
-        // If it is a direct playable audio file, load that exact file.
         if (fileName && isAudioFile(fileName) && !isSkipFile(fileName)) {
             return {
                 type: "audioFile",
@@ -1153,7 +1149,6 @@ function parseArchiveTarget(rawUrl) {
             };
         }
 
-        // If it is a .gif/.jpg/.xml/etc inside an Archive item, use it as an item pointer.
         return {
             type: "item",
             identifier,
@@ -1177,75 +1172,29 @@ function extractArchiveTargets(value) {
                     ? `search:${target.query}`
                     : `${target.type}:${target.identifier}:${target.fileName || ""}`;
 
-            if (seen.has(key)) {
-                return false;
-            }
+            if (seen.has(key)) return false;
 
             seen.add(key);
             return true;
         });
 }
 
-function getArchiveSearchTextFromInput(value) {
-    const advancedSearchTarget = extractArchiveTargets(value).find(
-        (target) => target.type === "advancedSearch"
-    );
-
-    if (advancedSearchTarget?.query) {
-        return advancedSearchTarget.query;
-    }
-
-    return value;
-}
-
-const ARCHIVE_QUERY_STOP_WORDS = new Set([
-    "a",
-    "an",
-    "and",
-    "archive",
-    "archives",
-    "audio",
-    "by",
-    "cc",
-    "commons",
-    "creative",
-    "domain",
-    "download",
-    "downloads",
-    "for",
-    "from",
-    "in",
-    "listen",
-    "mediatype",
-    "music",
-    "of",
-    "official",
-    "on",
-    "or",
-    "public",
-    "safe",
-    "stream",
-    "the",
-    "to",
-    "with",
-]);
-
 function getArchiveQueryTokens(value) {
     const safeQuery = getSterileArchiveQuery(value)
         .toLowerCase()
         .replace(/https?:\/\/\S+/g, " ");
-
     const rawTokens = safeQuery
         .split(/[^a-z0-9]+/i)
         .map((token) => token.trim().toLowerCase())
         .filter((token) => token.length >= 2);
-
     const meaningfulTokens = rawTokens.filter(
         (token) => !ARCHIVE_QUERY_STOP_WORDS.has(token)
     );
 
-    return Array.from(new Set(meaningfulTokens.length ? meaningfulTokens : rawTokens))
-        .slice(0, 10);
+    return Array.from(new Set(meaningfulTokens.length ? meaningfulTokens : rawTokens)).slice(
+        0,
+        10
+    );
 }
 
 function getArchiveCandidateSearchText(item = {}, metadata = {}, files = []) {
@@ -1295,7 +1244,6 @@ function getArchiveHighSignalSearchText(item = {}, metadata = {}, files = []) {
 
 function tokenAppearsInText(text, token) {
     const escaped = String(token || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
     if (!escaped) return false;
 
     return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i").test(
@@ -1318,13 +1266,10 @@ function archiveTokensAppearInText(text, tokens = []) {
     return tokens.reduce((count, token) => {
         const safeToken = String(token || "").trim();
         const compactToken = compactArchiveMatchText(safeToken);
-
         if (!safeToken) return count;
 
-        return (
-            tokenAppearsInText(normalizedText, safeToken) ||
-            (compactToken && compactText.includes(compactToken))
-        )
+        return tokenAppearsInText(normalizedText, safeToken) ||
+        (compactToken && compactText.includes(compactToken))
             ? count + 1
             : count;
     }, 0);
@@ -1332,24 +1277,16 @@ function archiveTokensAppearInText(text, tokens = []) {
 
 function archivePhraseAppearsInText(text, tokens = []) {
     const compactPhrase = tokens.map(compactArchiveMatchText).join("");
-
-    if (!compactPhrase || compactPhrase.length < 4) {
-        return false;
-    }
+    if (!compactPhrase || compactPhrase.length < 4) return false;
 
     return compactArchiveMatchText(text).includes(compactPhrase);
 }
 
-function getArchiveQueryRelevance({
-                                      query,
-                                      queryTokens,
-                                      item,
-                                      metadata,
-                                      files,
-                                  }) {
-    const tokens = Array.isArray(queryTokens) && queryTokens.length
-        ? queryTokens
-        : getArchiveQueryTokens(query);
+function getArchiveQueryRelevance({ query, queryTokens, item, metadata, files }) {
+    const tokens =
+        Array.isArray(queryTokens) && queryTokens.length
+            ? queryTokens
+            : getArchiveQueryTokens(query);
 
     if (!tokens.length) {
         return {
@@ -1362,31 +1299,16 @@ function getArchiveQueryRelevance({
 
     const highSignalHaystack = getArchiveHighSignalSearchText(item, metadata, files);
     const fullHaystack = getArchiveCandidateSearchText(item, metadata, files);
-    const highSignalMatchedCount = archiveTokensAppearInText(
-        highSignalHaystack,
-        tokens
-    );
+    const highSignalMatchedCount = archiveTokensAppearInText(highSignalHaystack, tokens);
     const fullMatchedCount = archiveTokensAppearInText(fullHaystack, tokens);
-    const highSignalPhraseMatch = archivePhraseAppearsInText(
-        highSignalHaystack,
-        tokens
-    );
+    const highSignalPhraseMatch = archivePhraseAppearsInText(highSignalHaystack, tokens);
     const fullPhraseMatch = archivePhraseAppearsInText(fullHaystack, tokens);
-    const missingTokens = tokens.filter(
-        (token) => !tokenAppearsInText(fullHaystack, token)
-    );
-
+    const missingTokens = tokens.filter((token) => !tokenAppearsInText(fullHaystack, token));
     let matches;
 
     if (tokens.length === 1) {
-        // A single-word query like "yeat" should match the current query in
-        // title/creator/subject/identifier/file name, not only a stale broad
-        // description from an older or unrelated Archive item.
         matches = highSignalMatchedCount === 1 || highSignalPhraseMatch;
     } else {
-        // Multi-word artist searches should stay tight. "lil uzi vert" should
-        // not let broad radio or unrelated collection metadata into the main
-        // list unless the artist/name tokens appear in high-signal fields.
         matches =
             highSignalMatchedCount === tokens.length ||
             highSignalPhraseMatch ||
@@ -1401,10 +1323,6 @@ function getArchiveQueryRelevance({
         fullMatchedCount,
         missingTokens,
     };
-}
-
-function archiveItemMatchesActiveQuery(args) {
-    return getArchiveQueryRelevance(args).matches;
 }
 
 function isAbortError(error) {
@@ -1426,9 +1344,7 @@ function createAbortError() {
 }
 
 function throwIfSearchAborted(signal) {
-    if (signal?.aborted) {
-        throw createAbortError();
-    }
+    if (signal?.aborted) throw createAbortError();
 }
 
 async function buildArchiveResultFromMetadata({
@@ -1440,16 +1356,9 @@ async function buildArchiveResultFromMetadata({
                                                   useArchiveProxy = false,
                                                   allowDirectUrlResult = false,
                                               }) {
-    const metadataData = await fetchArchiveMetadata(
-        identifier,
-        signal,
-        useArchiveProxy
-    );
+    const metadataData = await fetchArchiveMetadata(identifier, signal, useArchiveProxy);
     const metadata = metadataData.metadata || {};
-    const metadataFiles = Array.isArray(metadataData.files)
-        ? metadataData.files
-        : [];
-
+    const metadataFiles = Array.isArray(metadataData.files) ? metadataData.files : [];
     const itemLike = {
         identifier,
         title: metadata.title || identifier,
@@ -1458,18 +1367,9 @@ async function buildArchiveResultFromMetadata({
         description: metadata.description || "",
         subject: metadata.subject || "",
     };
+    const rightsSafer = looksRightsSafer(itemLike, metadata, selectedCollections);
 
-    const rightsSafer = looksRightsSafer(
-        itemLike,
-        metadata,
-        selectedCollections
-    );
-
-    // Normal search remains rights/collection filtered. Direct URL mode can still
-    // show the exact item the user pasted, but the UI labels it as not verified.
-    if (!rightsSafer && !allowDirectUrlResult) {
-        return null;
-    }
+    if (!rightsSafer && !allowDirectUrlResult) return null;
 
     const metadataPlayableFiles = getPlayableFiles(
         identifier,
@@ -1477,14 +1377,11 @@ async function buildArchiveResultFromMetadata({
         allowZipInternalPaths,
         useArchiveProxy
     );
-
     const playableFiles = forcedFiles.length
-        ? mergeForcedAndMetadataPlayableFiles(forcedFiles, metadataPlayableFiles)
+        ? dedupeArchiveFiles([...forcedFiles, ...metadataPlayableFiles])
         : metadataPlayableFiles;
 
-    if (!playableFiles.length) {
-        return null;
-    }
+    if (!playableFiles.length) return null;
 
     return {
         identifier,
@@ -1507,12 +1404,7 @@ async function buildArchiveResultFromMetadata({
         },
         downloads: "",
         detailsUrl: buildDetailsUrl(identifier),
-        images: getArchiveItemImages(
-            identifier,
-            metadata,
-            metadataFiles,
-            useArchiveProxy
-        ),
+        images: getArchiveItemImages(identifier, metadata, metadataFiles, useArchiveProxy),
         files: playableFiles,
     };
 }
@@ -1526,14 +1418,11 @@ async function loadDirectArchiveAudioLinks({
                                                onResult = null,
                                            }) {
     const targets = extractArchiveTargets(query);
-
     const directTargets = targets.filter(
         (target) => target.type === "audioFile" || target.type === "item"
     );
 
-    if (!directTargets.length) {
-        return null;
-    }
+    if (!directTargets.length) return null;
 
     const grouped = new Map();
 
@@ -1546,18 +1435,10 @@ async function loadDirectArchiveAudioLinks({
         }
 
         if (target.type === "audioFile") {
-            if (!allowZipInternalPaths && target.zipInternal) {
-                continue;
-            }
+            if (!allowZipInternalPaths && target.zipInternal) continue;
 
-            const serveUrl = buildArchiveProxyUrl(
-                target.serveUrl,
-                useArchiveProxy
-            );
-            const downloadUrl = buildArchiveProxyUrl(
-                target.downloadUrl,
-                useArchiveProxy
-            );
+            const serveUrl = buildArchiveProxyUrl(target.serveUrl, useArchiveProxy);
+            const downloadUrl = buildArchiveProxyUrl(target.downloadUrl, useArchiveProxy);
 
             grouped.get(target.identifier).forcedFiles.push({
                 name: target.fileName,
@@ -1590,6 +1471,7 @@ async function loadDirectArchiveAudioLinks({
                 useArchiveProxy,
                 allowDirectUrlResult: true,
             });
+
             if (result) {
                 results.push(result);
 
@@ -1598,16 +1480,11 @@ async function loadDirectArchiveAudioLinks({
                         accepted: results.length,
                         inspected: results.length,
                         totalCandidates: grouped.size,
-                        cursorReset: false,
                     });
                 }
             }
         } catch (err) {
-            if (isAbortError(err)) {
-                throw err;
-            }
-
-            // Skip bad Archive items so one broken URL does not crash the page.
+            if (isAbortError(err)) throw err;
         }
     }
 
@@ -1617,6 +1494,7 @@ async function loadDirectArchiveAudioLinks({
         directLinkMode: true,
     };
 }
+
 async function searchSafeAudio({
                                    query,
                                    cursor = "",
@@ -1629,10 +1507,9 @@ async function searchSafeAudio({
                                }) {
     const safeQuery = getSterileArchiveQuery(query);
     const queryTokens = getArchiveQueryTokens(safeQuery);
+    const collectionIds = normalizeCollectionIds(selectedCollections);
 
-    if (!safeQuery) {
-        throw new Error("Type a search query first.");
-    }
+    if (!safeQuery) throw new Error("Type a search query first.");
 
     if (hasBlockedTerm(safeQuery)) {
         throw new Error(
@@ -1640,13 +1517,13 @@ async function searchSafeAudio({
         );
     }
 
-    if (!selectedCollections.length) {
-        throw new Error("Choose at least one safe Archive collection.");
+    if (!collectionIds.length) {
+        throw new Error("Choose at least one Archive collection or add a custom collection ID.");
     }
 
     const searchData = await searchArchiveItems(
         safeQuery,
-        selectedCollections,
+        collectionIds,
         cursor,
         signal,
         useArchiveProxy
@@ -1659,15 +1536,9 @@ async function searchSafeAudio({
     const seenIdentifiers = new Set();
     const safeBatchStartIndex = Math.max(0, Number(batchStartIndex) || 0);
 
-    // Inspect more than we display because the extra query verification can remove broad matches.
     for (const item of items.slice(0, ARCHIVE_SEARCH_BATCH_SIZE)) {
-        if (!item.identifier || hasBlockedTerm(item.identifier)) {
-            continue;
-        }
-
-        if (seenIdentifiers.has(item.identifier)) {
-            continue;
-        }
+        if (!item.identifier || hasBlockedTerm(item.identifier)) continue;
+        if (seenIdentifiers.has(item.identifier)) continue;
 
         seenIdentifiers.add(item.identifier);
 
@@ -1684,7 +1555,6 @@ async function searchSafeAudio({
 
             const metadata = metadataData.metadata || {};
             const files = Array.isArray(metadataData.files) ? metadataData.files : [];
-
             const queryRelevance = getArchiveQueryRelevance({
                 query: safeQuery,
                 queryTokens,
@@ -1693,9 +1563,7 @@ async function searchSafeAudio({
                 files,
             });
 
-            if (!looksRightsSafer(item, metadata, selectedCollections)) {
-                continue;
-            }
+            if (!looksRightsSafer(item, metadata, collectionIds)) continue;
 
             const playableFiles = getPlayableFiles(
                 item.identifier,
@@ -1704,9 +1572,7 @@ async function searchSafeAudio({
                 useArchiveProxy
             );
 
-            if (!playableFiles.length) {
-                continue;
-            }
+            if (!playableFiles.length) continue;
 
             const nextResult = {
                 identifier: item.identifier,
@@ -1743,48 +1609,25 @@ async function searchSafeAudio({
                     batchStartIndex: safeBatchStartIndex,
                     totalCandidates: safeBatchStartIndex + items.length,
                     batchCandidateCount: items.length,
-                    cursorReset: false,
                 });
             }
-
-            // Do not stop at 50. The Archive scrape page already caps the
-            // request batch, and every returned item may contain multiple files.
         } catch (err) {
-            if (isAbortError(err)) {
-                throw err;
-            }
-
-            // Some Archive items have incomplete metadata or temporary errors.
-            // Skip those so one bad item does not break the whole browser.
+            if (isAbortError(err)) throw err;
         }
     }
 
     return {
         cursor: searchData.cursor || "",
         requestedCursor: cursor || "",
-        cursorReset: false,
         batchStartIndex: safeBatchStartIndex,
         batchCandidateCount: items.length,
         inspectedCandidateCount: safeBatchStartIndex + items.length,
         hasMoreArchivePages: Boolean(searchData.cursor),
         page: searchData.page || getArchivePageFromCursor(cursor),
         totalArchiveCandidates: searchData.numFound || safeBatchStartIndex + items.length,
+        archiveQuery: searchData.archiveQuery,
         results: dedupeArchiveResults(results),
     };
-}
-
-function buildSearchSignature(
-    query,
-    selectedCollections,
-    allowZipInternalPaths,
-    useArchiveProxy = false
-) {
-    return JSON.stringify({
-        query: getSterileArchiveQuery(query),
-        collections: [...selectedCollections].sort(),
-        allowZipInternalPaths: Boolean(allowZipInternalPaths),
-        useArchiveProxy: Boolean(useArchiveProxy),
-    });
 }
 
 function makeArchiveResultKey(item = {}) {
@@ -1805,10 +1648,7 @@ function dedupeArchiveImages(images = []) {
 
     for (const image of Array.isArray(images) ? images : []) {
         const key = makeArchiveImageKey(image);
-
-        if (!key || seen.has(key)) {
-            continue;
-        }
+        if (!key || seen.has(key)) continue;
 
         seen.add(key);
         uniqueImages.push(image);
@@ -1823,10 +1663,7 @@ function dedupeArchiveFiles(files = []) {
 
     for (const file of Array.isArray(files) ? files : []) {
         const key = makeArchiveFileKey(file);
-
-        if (!key || seen.has(key)) {
-            continue;
-        }
+        if (!key || seen.has(key)) continue;
 
         seen.add(key);
         uniqueFiles.push(file);
@@ -1841,10 +1678,7 @@ function dedupeArchiveResults(items = []) {
 
     for (const item of Array.isArray(items) ? items : []) {
         const key = makeArchiveResultKey(item);
-
-        if (!key || seen.has(key)) {
-            continue;
-        }
+        if (!key || seen.has(key)) continue;
 
         seen.add(key);
         uniqueItems.push({
@@ -1879,10 +1713,7 @@ function mergeArchiveResults(current = [], incoming = []) {
 
 function countMatchingArchiveResultsForSignature(items = [], searchSignature = "") {
     return (Array.isArray(items) ? items : []).filter((item) => {
-        if (searchSignature && item.searchSignature !== searchSignature) {
-            return false;
-        }
-
+        if (searchSignature && item.searchSignature !== searchSignature) return false;
         return item.queryMatched !== false;
     }).length;
 }
@@ -1910,12 +1741,7 @@ const ArchiveFileRow = React.memo(function ArchiveFileRow({
                     justifyContent="space-between"
                     alignItems={{ xs: "flex-start", sm: "center" }}
                 >
-                    <Stack
-                        direction="row"
-                        spacing={1}
-                        alignItems="center"
-                        sx={{ minWidth: 0 }}
-                    >
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
                         <AudiotrackRoundedIcon fontSize="small" />
 
                         <Box sx={{ minWidth: 0 }}>
@@ -2253,17 +2079,21 @@ export default function ArchiveAudioBrowser() {
     const restoredSession = restoredSessionRef.current;
 
     const [query, setQuery] = useState(restoredSession.query || "old radio");
-    const [results, setResults] = useState(restoredSession.results || []);
+    const [results, setResults] = useState([]);
     const [nextCursor, setNextCursor] = useState(restoredSession.nextCursor || "");
-    const [status, setStatus] = useState(
-        restoredSession.loading
-            ? "Restored a search that was fetching before refresh. Continuing from saved results..."
-            : restoredSession.status || ""
-    );
+    const [status, setStatus] = useState(restoredSession.status || "");
     const [error, setError] = useState(restoredSession.error || "");
     const [loading, setLoading] = useState(false);
     const [selectedCollections, setSelectedCollections] = useState(
-        restoredSession.selectedCollections || DEFAULT_SELECTED_COLLECTIONS
+        normalizeCollectionIds(
+            restoredSession.selectedCollections || DEFAULT_SELECTED_COLLECTIONS
+        )
+    );
+    const [customCollections, setCustomCollections] = useState(
+        normalizeCollectionIds(restoredSession.customCollections)
+    );
+    const [customCollectionInput, setCustomCollectionInput] = useState(
+        restoredSession.customCollectionInput || ""
     );
     const [allowZipInternalPaths, setAllowZipInternalPaths] = useState(
         Boolean(restoredSession.allowZipInternalPaths)
@@ -2278,6 +2108,9 @@ export default function ArchiveAudioBrowser() {
     );
     const [expandedFileLimits, setExpandedFileLimits] = useState({});
     const [showOffQueryResults, setShowOffQueryResults] = useState(false);
+    const [lastSearchSignature, setLastSearchSignature] = useState(
+        restoredSession.lastSearchSignature || ""
+    );
 
     const searchRunRef = useRef(0);
     const abortControllerRef = useRef(null);
@@ -2286,11 +2119,12 @@ export default function ArchiveAudioBrowser() {
         query: restoredSession.query || "old radio",
         selectedCollections:
             restoredSession.selectedCollections || DEFAULT_SELECTED_COLLECTIONS,
+        customCollections: restoredSession.customCollections || [],
+        customCollectionInput: restoredSession.customCollectionInput || "",
         allowZipInternalPaths: Boolean(restoredSession.allowZipInternalPaths),
         useArchiveProxy: Boolean(restoredSession.useArchiveProxy),
     });
     const browserSessionRef = useRef(restoredSession);
-    const shouldResumeRestoredSearchRef = useRef(Boolean(restoredSession.loading));
 
     const lastSubmittedSearchRef = useRef({
         ...(restoredSession.lastSubmittedSearch || {}),
@@ -2311,10 +2145,6 @@ export default function ArchiveAudioBrowser() {
         batchCount: Number(restoredSession.lastSubmittedSearch?.batchCount || 0),
     });
 
-    const [lastSearchSignature, setLastSearchSignature] = useState(
-        restoredSession.lastSearchSignature || ""
-    );
-
     const currentSearchSignature = useMemo(() => {
         return buildSearchSignature(
             query,
@@ -2331,10 +2161,7 @@ export default function ArchiveAudioBrowser() {
     }, [currentSearchSignature, lastSearchSignature]);
 
     const activeResults = useMemo(() => {
-        if (!lastSearchSignature) {
-            return results;
-        }
-
+        if (!lastSearchSignature) return results;
         return results.filter((item) => item.searchSignature === lastSearchSignature);
     }, [results, lastSearchSignature]);
 
@@ -2359,28 +2186,48 @@ export default function ArchiveAudioBrowser() {
     const selectedCollectionSet = useMemo(() => {
         return new Set(selectedCollections);
     }, [selectedCollections]);
+
     const nextLoadStart = Math.max(
         1,
         Number(lastSubmittedSearchRef.current?.loadedCandidateCount || 0) + 1
     );
     const nextLoadEnd = nextLoadStart + ARCHIVE_SEARCH_BATCH_SIZE - 1;
+    const archiveQueryPreview = useMemo(() => {
+        const safeQuery = getSterileArchiveQuery(query);
+        if (!safeQuery || !selectedCollections.length) return "";
+        return buildArchiveSearchQuery(safeQuery, selectedCollections);
+    }, [query, selectedCollections]);
 
     useEffect(() => {
         latestSearchInputRef.current = {
             query,
             selectedCollections: [...selectedCollections],
+            customCollections: [...customCollections],
+            customCollectionInput,
             allowZipInternalPaths,
             useArchiveProxy,
         };
-    }, [query, selectedCollections, allowZipInternalPaths, useArchiveProxy]);
+    }, [
+        query,
+        selectedCollections,
+        customCollections,
+        customCollectionInput,
+        allowZipInternalPaths,
+        useArchiveProxy,
+    ]);
+
+    useEffect(() => {
+        writeCustomCollectionsToStorage(customCollections);
+    }, [customCollections]);
 
     useEffect(() => {
         const snapshot = {
             query,
             selectedCollections: [...selectedCollections],
+            customCollections: [...customCollections],
+            customCollectionInput,
             allowZipInternalPaths,
             useArchiveProxy,
-            results: [],
             nextCursor,
             status,
             error,
@@ -2395,6 +2242,8 @@ export default function ArchiveAudioBrowser() {
     }, [
         query,
         selectedCollections,
+        customCollections,
+        customCollectionInput,
         allowZipInternalPaths,
         useArchiveProxy,
         nextCursor,
@@ -2415,21 +2264,6 @@ export default function ArchiveAudioBrowser() {
         };
     }, []);
 
-    useEffect(() => {
-        if (!shouldResumeRestoredSearchRef.current) {
-            return;
-        }
-
-        shouldResumeRestoredSearchRef.current = false;
-
-        const restoredActiveSearch = restoredSessionRef.current?.activeSearch || {};
-        const shouldLoadMore = Boolean(restoredActiveSearch.isLoadMore);
-
-        window.setTimeout(() => {
-            runSearch(shouldLoadMore, { keepExistingResults: true });
-        }, 0);
-    }, []);
-
     function scheduleBrowserSessionWrite(snapshot, delay = 300) {
         if (typeof window === "undefined") {
             writeArchiveBrowserSession(snapshot);
@@ -2446,34 +2280,15 @@ export default function ArchiveAudioBrowser() {
         }, delay);
     }
 
-    function saveBrowserSnapshot(overrides = {}) {
-        const latestInput = latestSearchInputRef.current;
-        const snapshot = {
-            ...browserSessionRef.current,
-            query: latestInput.query,
-            selectedCollections: [...(latestInput.selectedCollections || [])],
-            allowZipInternalPaths: Boolean(latestInput.allowZipInternalPaths),
-            useArchiveProxy: Boolean(latestInput.useArchiveProxy),
-            lastSubmittedSearch: lastSubmittedSearchRef.current,
-            ...overrides,
-            results: [],
-        };
-
-        browserSessionRef.current = snapshot;
-        scheduleBrowserSessionWrite(snapshot);
-    }
-
     function stopActiveSearchAndClearResults(nextStatus = "") {
         abortControllerRef.current?.abort();
         searchRunRef.current += 1;
 
-        const latestInput = latestSearchInputRef.current;
-
         lastSubmittedSearchRef.current = {
             query: "",
-            selectedCollections: [...(latestInput.selectedCollections || [])],
-            allowZipInternalPaths: Boolean(latestInput.allowZipInternalPaths),
-            useArchiveProxy: Boolean(latestInput.useArchiveProxy),
+            selectedCollections: [...selectedCollections],
+            allowZipInternalPaths,
+            useArchiveProxy,
             cursor: "",
             signature: "",
             loadedCandidateCount: 0,
@@ -2488,7 +2303,6 @@ export default function ArchiveAudioBrowser() {
         setActiveSearch(null);
         resetRenderWindows();
         clearArchiveBrowserSession();
-
         setStatus(nextStatus || "");
     }
 
@@ -2559,13 +2373,59 @@ export default function ArchiveAudioBrowser() {
     }
 
     function toggleCollection(collectionId) {
-        const nextSelected = selectedCollections.includes(collectionId)
-            ? selectedCollections.filter((id) => id !== collectionId)
-            : [...selectedCollections, collectionId];
+        const safeId = sanitizeArchiveCollectionId(collectionId);
+        if (!safeId) return;
+
+        const nextSelected = selectedCollections.includes(safeId)
+            ? selectedCollections.filter((id) => id !== safeId)
+            : normalizeCollectionIds([...selectedCollections, safeId]);
 
         setSelectedCollections(nextSelected);
         stopActiveSearchAndKeepResults(
-            "Collection filters changed. Press Search Archive Audio when ready."
+            `Collection filters changed. The next query will include ${nextSelected.length} collection filter(s).`
+        );
+    }
+
+    function addCustomCollection(event) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+
+        const safeId = sanitizeArchiveCollectionId(customCollectionInput);
+
+        if (!safeId) {
+            setError("Enter an Archive collection ID like netlabels, etree, or GratefulDead.");
+            return;
+        }
+
+        const nextCustomCollections = normalizeCollectionIds([
+            ...customCollections,
+            safeId,
+        ]);
+        const nextSelectedCollections = normalizeCollectionIds([
+            ...selectedCollections,
+            safeId,
+        ]);
+
+        setCustomCollections(nextCustomCollections);
+        setSelectedCollections(nextSelectedCollections);
+        setCustomCollectionInput("");
+        setError("");
+        stopActiveSearchAndKeepResults(
+            `Added custom collection "${safeId}" and checked it for the next Archive query.`
+        );
+    }
+
+    function removeCustomCollection(collectionId) {
+        const safeId = sanitizeArchiveCollectionId(collectionId);
+
+        setCustomCollections((current) =>
+            normalizeCollectionIds(current).filter((id) => id !== safeId)
+        );
+        setSelectedCollections((current) =>
+            normalizeCollectionIds(current).filter((id) => id !== safeId)
+        );
+        stopActiveSearchAndKeepResults(
+            `Removed custom collection "${safeId}". Press Search Archive Audio when ready.`
         );
     }
 
@@ -2597,10 +2457,7 @@ export default function ArchiveAudioBrowser() {
 
     function createPlaylistItemFromArchiveFile(file) {
         const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
-
-        if (!selectedUrl) {
-            return null;
-        }
+        if (!selectedUrl) return null;
 
         return {
             id: makeArchivePlaylistId(),
@@ -2627,7 +2484,6 @@ export default function ArchiveAudioBrowser() {
 
         try {
             const playlist = readAudioPlaylistFromStorage();
-
             const alreadyExists = playlist.some(
                 (item) => item?.kind === "url" && item?.url === selectedUrl
             );
@@ -2676,7 +2532,6 @@ export default function ArchiveAudioBrowser() {
                     .filter((item) => item?.kind === "url" && item?.url)
                     .map((item) => item.url)
             );
-
             const newItems = playableFiles
                 .filter((file) => {
                     const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
@@ -2744,14 +2599,10 @@ export default function ArchiveAudioBrowser() {
                 })
             );
 
-            window.localStorage.setItem(
-                "audiomasterlab.audio.directLink.v4",
-                selectedUrl
-            );
+            window.localStorage.setItem("audiomasterlab.audio.directLink.v4", selectedUrl);
         } catch {
-            // Query param still works even if localStorage is blocked.
+            // Query-param fallback can still work in callers that support it.
         }
-
 
         setError("");
         setStatus("Saved this Archive audio link for the Audio page without leaving or refreshing this page.");
@@ -2789,19 +2640,15 @@ export default function ArchiveAudioBrowser() {
                 batchCount: 0,
                 signature: visibleSignature,
             };
-
         const queryForRequest = searchSource.query;
-        const collectionsForRequest = [...searchSource.selectedCollections];
+        const collectionsForRequest = normalizeCollectionIds(searchSource.selectedCollections);
         const allowZipForRequest = Boolean(searchSource.allowZipInternalPaths);
         const proxyForRequest = Boolean(searchSource.useArchiveProxy);
-        const cursorForRequest = isLoadMore
-            ? searchSource.cursor || nextCursor || ""
-            : "";
+        const cursorForRequest = isLoadMore ? searchSource.cursor || nextCursor || "" : "";
         const batchStartIndex = isLoadMore
             ? Math.max(0, Number(searchSource.loadedCandidateCount || 0))
             : 0;
         const currentBatchCount = Math.max(0, Number(searchSource.batchCount || 0));
-
         const safeQuery = getSterileArchiveQuery(queryForRequest);
         const requestSignature = buildSearchSignature(
             queryForRequest,
@@ -2820,7 +2667,7 @@ export default function ArchiveAudioBrowser() {
         }
 
         if (!collectionsForRequest.length) {
-            setError("Choose at least one safe Archive collection.");
+            setError("Choose at least one Archive collection or add a custom collection ID.");
             setStatus("");
             return;
         }
@@ -2835,7 +2682,6 @@ export default function ArchiveAudioBrowser() {
 
         const searchId = searchRunRef.current + 1;
         searchRunRef.current = searchId;
-
         abortControllerRef.current?.abort();
 
         const controller = new AbortController();
@@ -2874,23 +2720,15 @@ export default function ArchiveAudioBrowser() {
 
             setStatus(
                 isLoadMore
-                    ? `Loading Archive candidates ${batchStartIndex + 1}-${batchStartIndex + ARCHIVE_SEARCH_BATCH_SIZE} for "${safeQuery}"${archiveRouteLabel}...`
-                    : `Searching Archive audio for "${safeQuery}"${archiveRouteLabel}...`
+                    ? `Loading Archive candidates ${batchStartIndex + 1}-${batchStartIndex + ARCHIVE_SEARCH_BATCH_SIZE} for "${safeQuery}" from ${collectionsForRequest.length} collection filter(s)${archiveRouteLabel}...`
+                    : `Searching Archive audio for "${safeQuery}" in ${collectionsForRequest.length} selected collection filter(s)${archiveRouteLabel}...`
             );
 
             const handleIncrementalResult = (result, progress = {}) => {
-                if (controller.signal.aborted || searchId !== searchRunRef.current) {
-                    return;
-                }
+                if (controller.signal.aborted || searchId !== searchRunRef.current) return;
 
-                const stampedResult = stampArchiveResults(
-                    [result],
-                    requestSignature
-                );
-
-                if (!stampedResult.length) {
-                    return;
-                }
+                const stampedResult = stampArchiveResults([result], requestSignature);
+                if (!stampedResult.length) return;
 
                 const progressBatchStart = Math.max(
                     0,
@@ -2904,23 +2742,21 @@ export default function ArchiveAudioBrowser() {
                     progressInspected,
                     Number(progress.totalCandidates || progressInspected)
                 );
-                const progressStatus = `Loaded ${progress.accepted || 1} Archive item(s) for "${safeQuery}"${archiveRouteLabel}; inspected candidates ${progressBatchStart + 1}-${progressInspected} of at least ${progressTotal}.`;
 
                 setResults((current) => {
-                    const nextResults =
-                        isLoadMore || keepExistingResults
-                            ? mergeArchiveResults(current, stampedResult)
-                            : mergeArchiveResults(
-                                current.filter(
-                                    (item) => item.searchSignature === requestSignature
-                                ),
-                                stampedResult
-                            );
-
-                    return nextResults;
+                    return isLoadMore || keepExistingResults
+                        ? mergeArchiveResults(current, stampedResult)
+                        : mergeArchiveResults(
+                            current.filter(
+                                (item) => item.searchSignature === requestSignature
+                            ),
+                            stampedResult
+                        );
                 });
 
-                setStatus(progressStatus);
+                setStatus(
+                    `Loaded ${progress.accepted || 1} Archive item(s) for "${safeQuery}" from ${collectionsForRequest.length} selected collection filter(s); inspected candidates ${progressBatchStart + 1}-${progressInspected} of at least ${progressTotal}.`
+                );
             };
 
             const directData = !isLoadMore
@@ -2934,24 +2770,20 @@ export default function ArchiveAudioBrowser() {
                 })
                 : null;
 
-            const data =
-                directData?.results?.length
-                    ? directData
-                    : await searchSafeAudio({
-                        query: queryForRequest,
-                        cursor: cursorForRequest,
-                        batchStartIndex,
-                        selectedCollections: collectionsForRequest,
-                        allowZipInternalPaths: allowZipForRequest,
-                        signal: controller.signal,
-                        useArchiveProxy: proxyForRequest,
-                        onResult: handleIncrementalResult,
-                    });
+            const data = directData?.results?.length
+                ? directData
+                : await searchSafeAudio({
+                    query: queryForRequest,
+                    cursor: cursorForRequest,
+                    batchStartIndex,
+                    selectedCollections: collectionsForRequest,
+                    allowZipInternalPaths: allowZipForRequest,
+                    signal: controller.signal,
+                    useArchiveProxy: proxyForRequest,
+                    onResult: handleIncrementalResult,
+                });
 
-            // Ignore stale results from an older search.
-            if (controller.signal.aborted || searchId !== searchRunRef.current) {
-                return;
-            }
+            if (controller.signal.aborted || searchId !== searchRunRef.current) return;
 
             if (!isLoadMore) {
                 const latestInput = latestSearchInputRef.current;
@@ -2962,9 +2794,7 @@ export default function ArchiveAudioBrowser() {
                     latestInput.useArchiveProxy
                 );
 
-                if (requestSignature !== latestSignature) {
-                    return;
-                }
+                if (requestSignature !== latestSignature) return;
             }
 
             const incomingResults = stampArchiveResults(
@@ -2978,9 +2808,7 @@ export default function ArchiveAudioBrowser() {
                     data.inspectedCandidateCount ??
                     batchStartIndex + Number(data.batchCandidateCount || 0)
                 );
-            const nextBatchCount = data.directLinkMode
-                ? 0
-                : currentBatchCount + 1;
+            const nextBatchCount = data.directLinkMode ? 0 : currentBatchCount + 1;
 
             lastSubmittedSearchRef.current = {
                 query: queryForRequest,
@@ -3012,11 +2840,10 @@ export default function ArchiveAudioBrowser() {
                         nextResults,
                         requestSignature
                     );
-                    const incomingMatchingCount =
-                        countMatchingArchiveResultsForSignature(
-                            incomingResults,
-                            requestSignature
-                        );
+                    const incomingMatchingCount = countMatchingArchiveResultsForSignature(
+                        incomingResults,
+                        requestSignature
+                    );
 
                     if (incomingMatchingCount > 0) {
                         setVisibleResultLimit((currentLimit) =>
@@ -3035,20 +2862,15 @@ export default function ArchiveAudioBrowser() {
                     ? `Loaded ${incomingResults.length} direct Archive item(s)${archiveRouteLabel}, including all playable files found in each item.`
                     : incomingResults.length
                         ? isLoadMore
-                            ? `Added ${incomingResults.length} more Archive item(s) from candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount}${archiveRouteLabel}. ${nextCursorValue ? "Load More will fetch the next 100-candidate page." : "Archive did not return another page, so this is the last page for now."}`
-                            : `Found ${incomingResults.length} Archive item(s) with playable audio from the first ${nextLoadedCandidateCount || ARCHIVE_SEARCH_BATCH_SIZE} candidates${archiveRouteLabel}.`
+                            ? `Added ${incomingResults.length} more Archive item(s) from candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount} using ${collectionsForRequest.length} selected collection filter(s)${archiveRouteLabel}. ${nextCursorValue ? "Load More will fetch the next 100-candidate page." : "Archive did not return another page, so this is the last page for now."}`
+                            : `Found ${incomingResults.length} Archive item(s) with playable audio from the first ${nextLoadedCandidateCount || ARCHIVE_SEARCH_BATCH_SIZE} candidates using ${collectionsForRequest.length} selected collection filter(s)${archiveRouteLabel}.`
                         : nextCursorValue
-                            ? `No playable matches in candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount} for "${safeQuery}"${archiveRouteLabel}. Press Load More to fetch the next 100-candidate page.`
-                            : `No safe playable audio files found for "${safeQuery}"${archiveRouteLabel}.`
+                            ? `No playable matches in candidates ${batchStartIndex + 1}-${nextLoadedCandidateCount} for "${safeQuery}" using the selected collection filters${archiveRouteLabel}. Press Load More to fetch the next 100-candidate page.`
+                            : `No safe playable audio files found for "${safeQuery}" using the selected collection filters${archiveRouteLabel}.`
             );
         } catch (err) {
-            if (isAbortError(err)) {
-                return;
-            }
-
-            if (searchId !== searchRunRef.current) {
-                return;
-            }
+            if (isAbortError(err)) return;
+            if (searchId !== searchRunRef.current) return;
 
             setError(err?.message || "Archive search failed.");
             setStatus("");
@@ -3118,7 +2940,6 @@ export default function ArchiveAudioBrowser() {
                     content="Search safe public Archive.org audio collections, load direct media links, build playlists, and play browser-supported audio files."
                 />
                 <link rel="canonical" href="https://audiomasterlab.com/archive" />
-
                 <meta property="og:title" content="Archive Audio Browser | AudioMaster Lab" />
                 <meta
                     property="og:description"
@@ -3126,6 +2947,7 @@ export default function ArchiveAudioBrowser() {
                 />
                 <meta property="og:url" content="https://audiomasterlab.com/archive" />
             </Helmet>
+
             <Stack spacing={3}>
                 <Box>
                     <Stack direction="row" spacing={1.5} alignItems="center">
@@ -3147,10 +2969,9 @@ export default function ArchiveAudioBrowser() {
                 </Box>
 
                 <Alert severity="info">
-                    This page uses Archive.org public JSON endpoints from the browser. It
-                    does not bypass CORS, scrape blocked websites, or verify copyright for
-                    you. Archive metadata can be user supplied, so always check rights
-                    before reusing or redistributing audio.
+                    Selected collection filters are now sent directly into every Archive query as
+                    collection clauses. Custom collection IDs are treated the same way as the built-in
+                    checkboxes.
                 </Alert>
 
                 <Card
@@ -3160,11 +2981,7 @@ export default function ArchiveAudioBrowser() {
                         borderRadius: 4,
                     }}
                 >
-                    <CardContent
-                        component="form"
-                        noValidate
-                        onSubmit={handleSearchSubmit}
-                    >
+                    <CardContent component="form" noValidate onSubmit={handleSearchSubmit}>
                         <Stack spacing={2.5}>
                             <TextField
                                 label="Search safe Archive audio"
@@ -3227,6 +3044,13 @@ export default function ArchiveAudioBrowser() {
                                 </Button>
                             </Stack>
 
+                            {!!archiveQueryPreview && (
+                                <Alert severity="success">
+                                    Archive query includes {selectedCollections.length} selected collection
+                                    filter(s): {selectedCollections.join(", ")}
+                                </Alert>
+                            )}
+
                             <Divider />
 
                             <Box>
@@ -3237,9 +3061,15 @@ export default function ArchiveAudioBrowser() {
                                     alignItems={{ xs: "flex-start", sm: "center" }}
                                     sx={{ mb: 1 }}
                                 >
-                                    <Typography variant="h6" sx={{ fontWeight: 900 }}>
-                                        Safe collection filters
-                                    </Typography>
+                                    <Box>
+                                        <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                                            Safe collection filters
+                                        </Typography>
+                                        <Typography variant="body2" color="text.secondary">
+                                            Check any collections you want included. Results are fetched from
+                                            those collection IDs, then verified for playable audio files.
+                                        </Typography>
+                                    </Box>
 
                                     <Button type="button" size="small" onClick={resetCollections}>
                                         Reset collections
@@ -3258,6 +3088,7 @@ export default function ArchiveAudioBrowser() {
                                                         borderRadius: 3,
                                                         height: "100%",
                                                         opacity: checked ? 1 : 0.68,
+                                                        borderColor: checked ? "primary.main" : "divider",
                                                     }}
                                                 >
                                                     <CardContent sx={{ py: 1.5 }}>
@@ -3280,7 +3111,7 @@ export default function ArchiveAudioBrowser() {
                                                                         variant="caption"
                                                                         color="text.secondary"
                                                                     >
-                                                                        {collection.id}
+                                                                        collection:{collection.id}
                                                                     </Typography>
                                                                 </Box>
                                                             }
@@ -3299,6 +3130,129 @@ export default function ArchiveAudioBrowser() {
                                         );
                                     })}
                                 </Grid>
+                            </Box>
+
+                            <Divider />
+
+                            <Box>
+                                <Typography variant="h6" sx={{ fontWeight: 900, mb: 1 }}>
+                                    Custom Archive collection
+                                </Typography>
+
+                                <Stack
+                                    direction={{ xs: "column", sm: "row" }}
+                                    spacing={1}
+                                    sx={{ mb: 1.5 }}
+                                >
+                                    <TextField
+                                        label="Custom collection ID"
+                                        value={customCollectionInput}
+                                        onChange={(event) =>
+                                            setCustomCollectionInput(event.target.value)
+                                        }
+                                        onKeyDown={(event) => {
+                                            if (event.key === "Enter") {
+                                                addCustomCollection(event);
+                                            }
+                                        }}
+                                        placeholder="Example: netlabels, GratefulDead, fmradioarchive"
+                                        fullWidth
+                                        helperText="Use the Archive collection identifier, not the display name. It will be added as collection:your_id."
+                                        inputProps={{
+                                            enterKeyHint: "done",
+                                            autoComplete: "off",
+                                        }}
+                                    />
+
+                                    <Button
+                                        type="button"
+                                        variant="contained"
+                                        startIcon={<AddRoundedIcon />}
+                                        onClick={addCustomCollection}
+                                        sx={{ minWidth: 150, alignSelf: { sm: "flex-start" } }}
+                                    >
+                                        Add
+                                    </Button>
+                                </Stack>
+
+                                {!customCollections.length && (
+                                    <Alert severity="info">
+                                        Add a custom collection ID, then leave its checkbox enabled to make its
+                                        results appear in the search.
+                                    </Alert>
+                                )}
+
+                                {!!customCollections.length && (
+                                    <Grid container spacing={1}>
+                                        {customCollections.map((collectionId) => {
+                                            const checked = selectedCollectionSet.has(collectionId);
+
+                                            return (
+                                                <Grid item xs={12} sm={6} md={4} key={collectionId}>
+                                                    <Card
+                                                        variant="outlined"
+                                                        sx={{
+                                                            borderRadius: 3,
+                                                            borderColor: checked
+                                                                ? "primary.main"
+                                                                : "divider",
+                                                            bgcolor: "background.default",
+                                                        }}
+                                                    >
+                                                        <CardContent sx={{ py: 1.5 }}>
+                                                            <Stack
+                                                                direction="row"
+                                                                spacing={1}
+                                                                alignItems="flex-start"
+                                                                justifyContent="space-between"
+                                                            >
+                                                                <FormControlLabel
+                                                                    control={
+                                                                        <Checkbox
+                                                                            checked={checked}
+                                                                            onChange={() =>
+                                                                                toggleCollection(collectionId)
+                                                                            }
+                                                                        />
+                                                                    }
+                                                                    label={
+                                                                        <Box>
+                                                                            <Typography
+                                                                                variant="body2"
+                                                                                sx={{ fontWeight: 900 }}
+                                                                            >
+                                                                                Custom collection
+                                                                            </Typography>
+                                                                            <Typography
+                                                                                variant="caption"
+                                                                                color="text.secondary"
+                                                                                sx={{ wordBreak: "break-word" }}
+                                                                            >
+                                                                                collection:{collectionId}
+                                                                            </Typography>
+                                                                        </Box>
+                                                                    }
+                                                                />
+
+                                                                <Tooltip title="Remove custom collection">
+                                                                    <IconButton
+                                                                        type="button"
+                                                                        size="small"
+                                                                        onClick={() =>
+                                                                            removeCustomCollection(collectionId)
+                                                                        }
+                                                                    >
+                                                                        <DeleteOutlineRoundedIcon fontSize="small" />
+                                                                    </IconButton>
+                                                                </Tooltip>
+                                                            </Stack>
+                                                        </CardContent>
+                                                    </Card>
+                                                </Grid>
+                                            );
+                                        })}
+                                    </Grid>
+                                )}
                             </Box>
 
                             <Divider />
@@ -3345,17 +3299,22 @@ export default function ArchiveAudioBrowser() {
                 {copiedUrl && <Alert severity="info">Copied direct audio link.</Alert>}
 
                 {!!activeResults.length && (
-                    <Stack
-                        direction="row"
-                        spacing={1}
-                        flexWrap="wrap"
-                        alignItems="center"
-                    >
+                    <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
                         <Chip label={`${matchingResults.length} matching item(s)`} color="primary" />
-                        <Chip label={`${offQueryResults.length} hidden off-query item(s)`} color={offQueryResults.length ? "warning" : "default"} />
+                        <Chip
+                            label={`${offQueryResults.length} hidden off-query item(s)`}
+                            color={offQueryResults.length ? "warning" : "default"}
+                        />
                         <Chip label={`${totalPlayableFiles} playable file(s) loaded`} />
+                        <Chip label={`Collections: ${selectedCollections.length}`} />
                         <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
-                        <Chip label={nextCursor ? `Next page: ${nextLoadStart}-${nextLoadEnd}` : "Next page: none"} />
+                        <Chip
+                            label={
+                                nextCursor
+                                    ? `Next page: ${nextLoadStart}-${nextLoadEnd}`
+                                    : "Next page: none"
+                            }
+                        />
                         <Button
                             type="button"
                             size="small"
@@ -3393,15 +3352,20 @@ export default function ArchiveAudioBrowser() {
                         onClick={showMoreResults}
                         sx={{ alignSelf: "center" }}
                     >
-                        Show {Math.min(
-                        ARCHIVE_VISIBLE_RESULT_BATCH_SIZE,
-                        matchingResults.length - visibleMatchingResults.length
-                    )} more matching results
+                        Show{" "}
+                        {Math.min(
+                            ARCHIVE_VISIBLE_RESULT_BATCH_SIZE,
+                            matchingResults.length - visibleMatchingResults.length
+                        )}{" "}
+                        more matching results
                     </Button>
                 )}
 
                 {!!offQueryResults.length && (
-                    <Card variant="outlined" sx={{ borderRadius: 4, borderColor: "warning.main" }}>
+                    <Card
+                        variant="outlined"
+                        sx={{ borderRadius: 4, borderColor: "warning.main" }}
+                    >
                         <CardContent>
                             <Stack spacing={1.5}>
                                 <Stack
@@ -3416,7 +3380,8 @@ export default function ArchiveAudioBrowser() {
                                         </Typography>
 
                                         <Typography variant="body2" color="text.secondary">
-                                            Hidden by default so artist searches stay clean. Open this only when you want to inspect broad Archive matches.
+                                            Hidden by default so artist searches stay clean. Open this
+                                            only when you want to inspect broad Archive matches.
                                         </Typography>
                                     </Box>
 
