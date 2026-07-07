@@ -3,6 +3,7 @@ import {
     Box,
     Button,
     Chip,
+    Dialog,
     Divider,
     FormControl,
     InputLabel,
@@ -3889,6 +3890,11 @@ export default function Audio() {
         buildCarPlaySafeModeLabel(readPersistedCarPlaySafeMode())
     );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
+    const [artworkPreview, setArtworkPreview] = useState({
+        open: false,
+        src: "",
+        title: "",
+    });
 
     const isPlayingStateRef = useRef(isPlaying);
     const statusMessageRef = useRef(status);
@@ -4453,6 +4459,36 @@ export default function Audio() {
         statusToneRef.current = "error";
         setStatus(safeMessage);
         setStatusTone((current) => (current === "error" ? current : "error"));
+    }
+
+    function openArtworkPreview(src, title = "Audio artwork") {
+        const safeSrc = String(src || "").trim();
+
+        if (!safeSrc) {
+            return;
+        }
+
+        setArtworkPreview({
+            open: true,
+            src: safeSrc,
+            title: String(title || "Audio artwork").trim() || "Audio artwork",
+        });
+    }
+
+    function closeArtworkPreview() {
+        setArtworkPreview((current) => ({
+            ...current,
+            open: false,
+        }));
+    }
+
+    function handleArtworkPreviewKeyDown(event, src, title) {
+        if (event.key !== "Enter" && event.key !== " ") {
+            return;
+        }
+
+        event.preventDefault();
+        openArtworkPreview(src, title);
     }
 
     function setCarPlayOutputStatusIfChanged(message) {
@@ -7814,6 +7850,14 @@ export default function Audio() {
                 }`
             );
         } catch (error) {
+            if (isCorsLikeError(error)) {
+                rememberCommunityPostDedupeKey(dedupeKey, payload);
+                setInfo(
+                    `Posted "${payload.title}" to the community feed. The browser could not read the backend response, but the post was submitted and saved locally to prevent duplicate posting.`
+                );
+                return;
+            }
+
             setError(
                 error?.message ||
                 "Could not post this track to the community feed. Make sure /api/community/posts is deployed in your Cloudflare Pages Functions backend."
@@ -9678,6 +9722,79 @@ export default function Audio() {
                 }}
             />
 
+            <Dialog
+                open={artworkPreview.open}
+                onClose={closeArtworkPreview}
+                maxWidth="md"
+                fullWidth
+                PaperProps={{
+                    sx: {
+                        borderRadius: 4,
+                        overflow: "hidden",
+                        background:
+                            "linear-gradient(135deg, rgba(8,13,28,0.98), rgba(16,24,46,0.98))",
+                        border: "1px solid rgba(255,255,255,0.16)",
+                        boxShadow: "0 28px 80px rgba(0,0,0,0.52)",
+                    },
+                }}
+            >
+                <Box sx={{ p: { xs: 1.5, sm: 2 } }}>
+                    <Stack
+                        direction="row"
+                        alignItems="center"
+                        justifyContent="space-between"
+                        spacing={1.5}
+                        sx={{ mb: 1.5 }}
+                    >
+                        <Typography
+                            sx={{
+                                color: "#fff",
+                                fontWeight: 950,
+                                minWidth: 0,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                            }}
+                            title={artworkPreview.title}
+                        >
+                            {artworkPreview.title || "Audio artwork"}
+                        </Typography>
+
+                        <Button
+                            size="small"
+                            variant="outlined"
+                            onClick={closeArtworkPreview}
+                            sx={{
+                                borderRadius: 999,
+                                color: "#fff",
+                                borderColor: "rgba(255,255,255,0.22)",
+                                fontWeight: 900,
+                                flex: "0 0 auto",
+                            }}
+                        >
+                            Close
+                        </Button>
+                    </Stack>
+
+                    {artworkPreview.src && (
+                        <Box
+                            component="img"
+                            src={artworkPreview.src}
+                            alt={artworkPreview.title || "Audio artwork"}
+                            sx={{
+                                width: "100%",
+                                maxHeight: { xs: "70vh", md: "78vh" },
+                                objectFit: "contain",
+                                display: "block",
+                                borderRadius: 3,
+                                background: "rgba(0,0,0,0.28)",
+                                border: "1px solid rgba(255,255,255,0.1)",
+                            }}
+                        />
+                    )}
+                </Box>
+            </Dialog>
+
             <Helmet>
                 <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
                 <link rel="canonical" href="https://audiomasterlab.com/audio" />
@@ -10395,7 +10512,22 @@ export default function Audio() {
                                                 <Box
                                                     component="img"
                                                     src={activePlaylistArtworkSource}
-                                                    alt=""
+                                                    alt={`${activePlaylistItem.title} artwork`}
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    onClick={() =>
+                                                        openArtworkPreview(
+                                                            activePlaylistArtworkSource,
+                                                            activePlaylistItem.title
+                                                        )
+                                                    }
+                                                    onKeyDown={(event) =>
+                                                        handleArtworkPreviewKeyDown(
+                                                            event,
+                                                            activePlaylistArtworkSource,
+                                                            activePlaylistItem.title
+                                                        )
+                                                    }
                                                     sx={{
                                                         width: 46,
                                                         height: 46,
@@ -10404,6 +10536,16 @@ export default function Audio() {
                                                         flex: "0 0 auto",
                                                         border: "1px solid rgba(255,255,255,0.16)",
                                                         background: "rgba(255,255,255,0.08)",
+                                                        cursor: "zoom-in",
+                                                        transition:
+                                                            "transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease",
+                                                        "&:hover, &:focus-visible": {
+                                                            transform: "scale(1.06)",
+                                                            borderColor: "rgba(103,232,249,0.72)",
+                                                            boxShadow:
+                                                                "0 12px 30px rgba(103,232,249,0.18)",
+                                                            outline: "none",
+                                                        },
                                                     }}
                                                 />
                                             ) : (
@@ -10487,7 +10629,22 @@ export default function Audio() {
                                                         <Box
                                                             component="img"
                                                             src={itemArtworkSource}
-                                                            alt=""
+                                                            alt={`${item.title} artwork`}
+                                                            role="button"
+                                                            tabIndex={0}
+                                                            onClick={() =>
+                                                                openArtworkPreview(
+                                                                    itemArtworkSource,
+                                                                    item.title
+                                                                )
+                                                            }
+                                                            onKeyDown={(event) =>
+                                                                handleArtworkPreviewKeyDown(
+                                                                    event,
+                                                                    itemArtworkSource,
+                                                                    item.title
+                                                                )
+                                                            }
                                                             sx={{
                                                                 width: 46,
                                                                 height: 46,
@@ -10495,6 +10652,17 @@ export default function Audio() {
                                                                 objectFit: "cover",
                                                                 border: "1px solid rgba(255,255,255,0.12)",
                                                                 background: "rgba(255,255,255,0.08)",
+                                                                cursor: "zoom-in",
+                                                                transition:
+                                                                    "transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease",
+                                                                "&:hover, &:focus-visible": {
+                                                                    transform: "scale(1.06)",
+                                                                    borderColor:
+                                                                        "rgba(103,232,249,0.72)",
+                                                                    boxShadow:
+                                                                        "0 12px 30px rgba(103,232,249,0.18)",
+                                                                    outline: "none",
+                                                                },
                                                             }}
                                                         />
                                                     ) : (
@@ -10688,7 +10856,22 @@ export default function Audio() {
                                                             <Box
                                                                 component="img"
                                                                 src={playerArtworkSource}
-                                                                alt=""
+                                                                alt={`${mediaTitle} artwork`}
+                                                                role="button"
+                                                                tabIndex={0}
+                                                                onClick={() =>
+                                                                    openArtworkPreview(
+                                                                        playerArtworkSource,
+                                                                        mediaTitle
+                                                                    )
+                                                                }
+                                                                onKeyDown={(event) =>
+                                                                    handleArtworkPreviewKeyDown(
+                                                                        event,
+                                                                        playerArtworkSource,
+                                                                        mediaTitle
+                                                                    )
+                                                                }
                                                                 sx={{
                                                                     width: 58,
                                                                     height: 58,
@@ -10698,6 +10881,17 @@ export default function Audio() {
                                                                     border: "1px solid rgba(255,255,255,0.14)",
                                                                     background: "rgba(255,255,255,0.08)",
                                                                     boxShadow: "0 12px 28px rgba(0,0,0,0.22)",
+                                                                    cursor: "zoom-in",
+                                                                    transition:
+                                                                        "transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease",
+                                                                    "&:hover, &:focus-visible": {
+                                                                        transform: "scale(1.05)",
+                                                                        borderColor:
+                                                                            "rgba(103,232,249,0.72)",
+                                                                        boxShadow:
+                                                                            "0 16px 36px rgba(103,232,249,0.2)",
+                                                                        outline: "none",
+                                                                    },
                                                                 }}
                                                             />
                                                         ) : (
