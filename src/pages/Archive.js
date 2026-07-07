@@ -267,6 +267,8 @@ const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
 const AUDIO_PLAYLIST_STORAGE_KEY = "audiomasterlab.audio.playlist.v4";
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const ARCHIVE_PROXY_STORAGE_KEY = "audiomasterlab.archive.useProxy.v1";
+const ARCHIVE_BROWSER_STORAGE_KEY = "audiomasterlab.archive.browser.session.v2";
+const ARCHIVE_BROWSER_MAX_SAVED_RESULTS = 120;
 
 function makeArchivePlaylistId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -317,6 +319,130 @@ function writeArchiveProxySetting(value) {
             ARCHIVE_PROXY_STORAGE_KEY,
             value ? "true" : "false"
         );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getDefaultArchiveBrowserSession() {
+    const useArchiveProxy = readArchiveProxySetting();
+
+    return {
+        query: "old radio",
+        selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
+        allowZipInternalPaths: false,
+        useArchiveProxy,
+        results: [],
+        nextCursor: "",
+        status: "",
+        error: "",
+        loading: false,
+        lastSearchSignature: "",
+        lastSubmittedSearch: {
+            query: "",
+            selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
+            allowZipInternalPaths: false,
+            useArchiveProxy,
+            cursor: "",
+            signature: "",
+        },
+        activeSearch: null,
+        savedAt: "",
+    };
+}
+
+function sanitizeSavedArchiveBrowserSession(value) {
+    const fallback = getDefaultArchiveBrowserSession();
+    const parsed = value && typeof value === "object" ? value : {};
+    const selectedCollections = Array.isArray(parsed.selectedCollections)
+        ? parsed.selectedCollections.filter(Boolean)
+        : fallback.selectedCollections;
+    const lastSubmittedSearch =
+        parsed.lastSubmittedSearch && typeof parsed.lastSubmittedSearch === "object"
+            ? parsed.lastSubmittedSearch
+            : fallback.lastSubmittedSearch;
+
+    return {
+        ...fallback,
+        query: String(parsed.query || fallback.query),
+        selectedCollections: selectedCollections.length
+            ? selectedCollections
+            : fallback.selectedCollections,
+        allowZipInternalPaths: Boolean(parsed.allowZipInternalPaths),
+        useArchiveProxy: Boolean(parsed.useArchiveProxy),
+        results: dedupeArchiveResults(
+            Array.isArray(parsed.results) ? parsed.results : []
+        ).slice(0, ARCHIVE_BROWSER_MAX_SAVED_RESULTS),
+        nextCursor: String(parsed.nextCursor || ""),
+        status: String(parsed.status || ""),
+        error: String(parsed.error || ""),
+        loading: Boolean(parsed.loading),
+        lastSearchSignature: String(parsed.lastSearchSignature || ""),
+        lastSubmittedSearch: {
+            query: String(lastSubmittedSearch.query || ""),
+            selectedCollections: Array.isArray(lastSubmittedSearch.selectedCollections)
+                ? lastSubmittedSearch.selectedCollections.filter(Boolean)
+                : fallback.selectedCollections,
+            allowZipInternalPaths: Boolean(lastSubmittedSearch.allowZipInternalPaths),
+            useArchiveProxy: Boolean(lastSubmittedSearch.useArchiveProxy),
+            cursor: String(lastSubmittedSearch.cursor || ""),
+            signature: String(lastSubmittedSearch.signature || ""),
+        },
+        activeSearch:
+            parsed.activeSearch && typeof parsed.activeSearch === "object"
+                ? {
+                    isLoadMore: Boolean(parsed.activeSearch.isLoadMore),
+                    keepExistingResults: Boolean(
+                        parsed.activeSearch.keepExistingResults
+                    ),
+                    safeQuery: String(parsed.activeSearch.safeQuery || ""),
+                    routeLabel: String(parsed.activeSearch.routeLabel || ""),
+                    startedAt: String(parsed.activeSearch.startedAt || ""),
+                }
+                : null,
+        savedAt: String(parsed.savedAt || ""),
+    };
+}
+
+function readArchiveBrowserSession() {
+    if (typeof window === "undefined" || !window.localStorage) {
+        return getDefaultArchiveBrowserSession();
+    }
+
+    try {
+        const raw = window.localStorage.getItem(ARCHIVE_BROWSER_STORAGE_KEY);
+
+        return sanitizeSavedArchiveBrowserSession(raw ? JSON.parse(raw) : {});
+    } catch {
+        return getDefaultArchiveBrowserSession();
+    }
+}
+
+function writeArchiveBrowserSession(session) {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        const safeSession = sanitizeSavedArchiveBrowserSession({
+            ...session,
+            savedAt: new Date().toISOString(),
+        });
+
+        window.localStorage.setItem(
+            ARCHIVE_BROWSER_STORAGE_KEY,
+            JSON.stringify(safeSession)
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function clearArchiveBrowserSession() {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+
+    try {
+        window.localStorage.removeItem(ARCHIVE_BROWSER_STORAGE_KEY);
         return true;
     } catch {
         return false;
@@ -1270,6 +1396,7 @@ async function loadDirectArchiveAudioLinks({
                                                allowZipInternalPaths,
                                                signal,
                                                useArchiveProxy = false,
+                                               onResult = null,
                                            }) {
     const targets = extractArchiveTargets(query);
 
@@ -1338,6 +1465,15 @@ async function loadDirectArchiveAudioLinks({
             });
             if (result) {
                 results.push(result);
+
+                if (typeof onResult === "function") {
+                    onResult(result, {
+                        accepted: results.length,
+                        inspected: results.length,
+                        totalCandidates: grouped.size,
+                        cursorReset: false,
+                    });
+                }
             }
         } catch (err) {
             if (isAbortError(err)) {
@@ -1361,6 +1497,7 @@ async function searchSafeAudio({
                                    allowZipInternalPaths,
                                    signal,
                                    useArchiveProxy = false,
+                                   onResult = null,
                                }) {
     const safeQuery = getSterileArchiveQuery(query);
     const queryTokens = getArchiveQueryTokens(safeQuery);
@@ -1464,7 +1601,7 @@ async function searchSafeAudio({
                 continue;
             }
 
-            results.push({
+            const nextResult = {
                 identifier: item.identifier,
                 title: metadata.title || item.title || item.identifier,
                 creator: metadata.creator || item.creator || "",
@@ -1485,7 +1622,18 @@ async function searchSafeAudio({
                     useArchiveProxy
                 ),
                 files: playableFiles,
-            });
+            };
+
+            results.push(nextResult);
+
+            if (typeof onResult === "function") {
+                onResult(nextResult, {
+                    accepted: results.length,
+                    inspected: seenIdentifiers.size,
+                    totalCandidates: items.length,
+                    cursorReset,
+                });
+            }
 
             // Do not stop at 50. The Archive scrape page already caps the
             // request batch, and every returned item may contain multiple files.
@@ -1610,38 +1758,66 @@ function mergeArchiveResults(current = [], incoming = []) {
 }
 
 export default function ArchiveAudioBrowser() {
-    const [query, setQuery] = useState("old radio");
-    const [results, setResults] = useState([]);
-    const [nextCursor, setNextCursor] = useState("");
-    const [status, setStatus] = useState("");
-    const [error, setError] = useState("");
+    const restoredSessionRef = useRef(null);
+
+    if (restoredSessionRef.current === null) {
+        restoredSessionRef.current = readArchiveBrowserSession();
+    }
+
+    const restoredSession = restoredSessionRef.current;
+
+    const [query, setQuery] = useState(restoredSession.query || "old radio");
+    const [results, setResults] = useState(restoredSession.results || []);
+    const [nextCursor, setNextCursor] = useState(restoredSession.nextCursor || "");
+    const [status, setStatus] = useState(
+        restoredSession.loading
+            ? "Restored a search that was fetching before refresh. Continuing from saved results..."
+            : restoredSession.status || ""
+    );
+    const [error, setError] = useState(restoredSession.error || "");
     const [loading, setLoading] = useState(false);
     const [selectedCollections, setSelectedCollections] = useState(
-        DEFAULT_SELECTED_COLLECTIONS
+        restoredSession.selectedCollections || DEFAULT_SELECTED_COLLECTIONS
     );
-    const [allowZipInternalPaths, setAllowZipInternalPaths] = useState(false);
-    const [useArchiveProxy, setUseArchiveProxy] = useState(readArchiveProxySetting);
+    const [allowZipInternalPaths, setAllowZipInternalPaths] = useState(
+        Boolean(restoredSession.allowZipInternalPaths)
+    );
+    const [useArchiveProxy, setUseArchiveProxy] = useState(
+        Boolean(restoredSession.useArchiveProxy)
+    );
     const [copiedUrl, setCopiedUrl] = useState("");
+    const [activeSearch, setActiveSearch] = useState(null);
 
     const searchRunRef = useRef(0);
     const abortControllerRef = useRef(null);
     const latestSearchInputRef = useRef({
-        query: "old radio",
-        selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
-        allowZipInternalPaths: false,
-        useArchiveProxy: readArchiveProxySetting(),
+        query: restoredSession.query || "old radio",
+        selectedCollections:
+            restoredSession.selectedCollections || DEFAULT_SELECTED_COLLECTIONS,
+        allowZipInternalPaths: Boolean(restoredSession.allowZipInternalPaths),
+        useArchiveProxy: Boolean(restoredSession.useArchiveProxy),
     });
+    const browserSessionRef = useRef(restoredSession);
+    const shouldResumeRestoredSearchRef = useRef(Boolean(restoredSession.loading));
 
     const lastSubmittedSearchRef = useRef({
-        query: "",
-        selectedCollections: DEFAULT_SELECTED_COLLECTIONS,
-        allowZipInternalPaths: false,
-        useArchiveProxy: readArchiveProxySetting(),
-        cursor: "",
-        signature: "",
+        ...(restoredSession.lastSubmittedSearch || {}),
+        query: restoredSession.lastSubmittedSearch?.query || "",
+        selectedCollections:
+            restoredSession.lastSubmittedSearch?.selectedCollections ||
+            restoredSession.selectedCollections ||
+            DEFAULT_SELECTED_COLLECTIONS,
+        allowZipInternalPaths: Boolean(
+            restoredSession.lastSubmittedSearch?.allowZipInternalPaths
+        ),
+        useArchiveProxy: Boolean(restoredSession.lastSubmittedSearch?.useArchiveProxy),
+        cursor: restoredSession.lastSubmittedSearch?.cursor || "",
+        signature: restoredSession.lastSubmittedSearch?.signature || "",
     });
 
-    const [lastSearchSignature, setLastSearchSignature] = useState("");
+    const [lastSearchSignature, setLastSearchSignature] = useState(
+        restoredSession.lastSearchSignature || ""
+    );
 
     const currentSearchSignature = useMemo(() => {
         return buildSearchSignature(
@@ -1678,10 +1854,73 @@ export default function ArchiveAudioBrowser() {
     }, [query, selectedCollections, allowZipInternalPaths, useArchiveProxy]);
 
     useEffect(() => {
+        const snapshot = {
+            query,
+            selectedCollections: [...selectedCollections],
+            allowZipInternalPaths,
+            useArchiveProxy,
+            results,
+            nextCursor,
+            status,
+            error,
+            loading,
+            lastSearchSignature,
+            lastSubmittedSearch: lastSubmittedSearchRef.current,
+            activeSearch,
+        };
+
+        browserSessionRef.current = snapshot;
+        writeArchiveBrowserSession(snapshot);
+    }, [
+        query,
+        selectedCollections,
+        allowZipInternalPaths,
+        useArchiveProxy,
+        results,
+        nextCursor,
+        status,
+        error,
+        loading,
+        lastSearchSignature,
+        activeSearch,
+    ]);
+
+    useEffect(() => {
         return () => {
             abortControllerRef.current?.abort();
         };
     }, []);
+
+    useEffect(() => {
+        if (!shouldResumeRestoredSearchRef.current) {
+            return;
+        }
+
+        shouldResumeRestoredSearchRef.current = false;
+
+        const restoredActiveSearch = restoredSessionRef.current?.activeSearch || {};
+        const shouldLoadMore = Boolean(restoredActiveSearch.isLoadMore);
+
+        window.setTimeout(() => {
+            runSearch(shouldLoadMore, { keepExistingResults: true });
+        }, 0);
+    }, []);
+
+    function saveBrowserSnapshot(overrides = {}) {
+        const latestInput = latestSearchInputRef.current;
+        const snapshot = {
+            ...browserSessionRef.current,
+            query: latestInput.query,
+            selectedCollections: [...(latestInput.selectedCollections || [])],
+            allowZipInternalPaths: Boolean(latestInput.allowZipInternalPaths),
+            useArchiveProxy: Boolean(latestInput.useArchiveProxy),
+            lastSubmittedSearch: lastSubmittedSearchRef.current,
+            ...overrides,
+        };
+
+        browserSessionRef.current = snapshot;
+        writeArchiveBrowserSession(snapshot);
+    }
 
     function stopActiveSearchAndClearResults(nextStatus = "") {
         abortControllerRef.current?.abort();
@@ -1703,6 +1942,8 @@ export default function ArchiveAudioBrowser() {
         setNextCursor("");
         setLastSearchSignature("");
         setCopiedUrl("");
+        setActiveSearch(null);
+        clearArchiveBrowserSession();
 
         setStatus(nextStatus || "");
     }
@@ -1714,6 +1955,7 @@ export default function ArchiveAudioBrowser() {
         setLoading(false);
         setNextCursor("");
         setCopiedUrl("");
+        setActiveSearch(null);
         setStatus(nextStatus || "");
     }
 
@@ -1928,8 +2170,9 @@ export default function ArchiveAudioBrowser() {
         setStatus("Saved this Archive audio link for the Audio page without leaving or refreshing this page.");
     }
 
-    async function runSearch(loadMore = false) {
+    async function runSearch(loadMore = false, options = {}) {
         const isLoadMore = Boolean(loadMore);
+        const keepExistingResults = Boolean(options.keepExistingResults);
         const submittedSearch = lastSubmittedSearchRef.current;
         const visibleSignature = buildSearchSignature(
             query,
@@ -1996,13 +2239,31 @@ export default function ArchiveAudioBrowser() {
 
         const controller = new AbortController();
         abortControllerRef.current = controller;
+        const activeSearchSnapshot = {
+            isLoadMore,
+            keepExistingResults,
+            safeQuery,
+            routeLabel: archiveRouteLabel,
+            startedAt: new Date().toISOString(),
+        };
+
+        lastSubmittedSearchRef.current = {
+            query: queryForRequest,
+            selectedCollections: collectionsForRequest,
+            allowZipInternalPaths: allowZipForRequest,
+            useArchiveProxy: proxyForRequest,
+            cursor: cursorForRequest,
+            signature: requestSignature,
+        };
 
         try {
             setLoading(true);
+            setActiveSearch(activeSearchSnapshot);
+            setLastSearchSignature(requestSignature);
             setError("");
             setCopiedUrl("");
 
-            if (!isLoadMore) {
+            if (!isLoadMore && !keepExistingResults) {
                 setResults([]);
                 setNextCursor("");
             }
@@ -2013,6 +2274,42 @@ export default function ArchiveAudioBrowser() {
                     : `Searching Archive audio for "${safeQuery}"${archiveRouteLabel}...`
             );
 
+            const handleIncrementalResult = (result, progress = {}) => {
+                if (controller.signal.aborted || searchId !== searchRunRef.current) {
+                    return;
+                }
+
+                const stampedResult = stampArchiveResults(
+                    [result],
+                    requestSignature
+                );
+
+                if (!stampedResult.length) {
+                    return;
+                }
+
+                const progressStatus = `Loaded ${progress.accepted || 1} Archive item(s) for "${safeQuery}"${archiveRouteLabel}; inspected ${progress.inspected || 0} of ${progress.totalCandidates || 0} candidates.`;
+
+                setResults((current) => {
+                    const nextResults = mergeArchiveResults(current, stampedResult);
+
+                    saveBrowserSnapshot({
+                        results: nextResults,
+                        nextCursor,
+                        status: progressStatus,
+                        error: "",
+                        loading: true,
+                        lastSearchSignature: requestSignature,
+                        lastSubmittedSearch: lastSubmittedSearchRef.current,
+                        activeSearch: activeSearchSnapshot,
+                    });
+
+                    return nextResults;
+                });
+
+                setStatus(progressStatus);
+            };
+
             const directData = !isLoadMore
                 ? await loadDirectArchiveAudioLinks({
                     query: queryForRequest,
@@ -2020,6 +2317,7 @@ export default function ArchiveAudioBrowser() {
                     allowZipInternalPaths: allowZipForRequest,
                     signal: controller.signal,
                     useArchiveProxy: proxyForRequest,
+                    onResult: handleIncrementalResult,
                 })
                 : null;
 
@@ -2033,6 +2331,7 @@ export default function ArchiveAudioBrowser() {
                         allowZipInternalPaths: allowZipForRequest,
                         signal: controller.signal,
                         useArchiveProxy: proxyForRequest,
+                        onResult: handleIncrementalResult,
                     });
 
             // Ignore stale results from an older search.
@@ -2073,7 +2372,11 @@ export default function ArchiveAudioBrowser() {
             setNextCursor(nextCursorValue);
 
             setResults((current) => {
-                if (isLoadMore && !data.directLinkMode) {
+                if (data.directLinkMode && !isLoadMore && !keepExistingResults) {
+                    return incomingResults;
+                }
+
+                if (isLoadMore || keepExistingResults || !data.directLinkMode) {
                     return mergeArchiveResults(current, incomingResults);
                 }
 
@@ -2116,13 +2419,14 @@ export default function ArchiveAudioBrowser() {
             setError(err?.message || "Archive search failed.");
             setStatus("");
 
-            if (!isLoadMore) {
+            if (!isLoadMore && !keepExistingResults) {
                 setResults([]);
                 setNextCursor("");
             }
         } finally {
             if (searchId === searchRunRef.current) {
                 setLoading(false);
+                setActiveSearch(null);
 
                 if (abortControllerRef.current === controller) {
                     abortControllerRef.current = null;

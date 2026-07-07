@@ -68,6 +68,9 @@ const DEFAULT_SETTINGS = {
     speed: 1,
     pitchSemitones: 0,
 
+    distortionAmount: 0,
+    bitcrusherWarmth: 0,
+    bitcrusherVariance: 0.12,
     compressorThreshold: -18,
     compressorRatio: 3,
     outputGain: 0,
@@ -99,10 +102,77 @@ const HUMAN_SAFE_LIMITS = {
     speed: { min: 0.8, max: 1.25 },
     pitchSemitones: { min: -7, max: 7 },
 
+    distortionAmount: { min: 0, max: 1 },
+    bitcrusherWarmth: { min: 0, max: 0.55 },
+    bitcrusherVariance: { min: 0, max: 0.75 },
     compressorThreshold: { min: -48, max: -2 },
     compressorRatio: { min: 1, max: 8 },
     outputGain: { min: -18, max: 6 },
 };
+
+const VISUALIZER_3D_STORAGE_KEY = "audiomasterlab.audio.visualizer3d.v1";
+
+const DEFAULT_VISUALIZER_3D_SETTINGS = {
+    enabled: false,
+    model: "radial-bars",
+};
+
+const VISUALIZER_3D_MODE_OPTIONS = [
+    {
+        value: "radial-bars",
+        label: "Radial bars",
+    },
+    {
+        value: "sphere-dots",
+        label: "Sphere dots",
+    },
+    {
+        value: "terrain-grid",
+        label: "Terrain grid",
+    },
+];
+
+function readPersistedVisualizer3DSettings() {
+    if (typeof window === "undefined" || !window.localStorage) {
+        return DEFAULT_VISUALIZER_3D_SETTINGS;
+    }
+
+    try {
+        const raw = window.localStorage.getItem(VISUALIZER_3D_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : {};
+
+        return {
+            ...DEFAULT_VISUALIZER_3D_SETTINGS,
+            ...(parsed || {}),
+            model: VISUALIZER_3D_MODE_OPTIONS.some(
+                (option) => option.value === parsed?.model
+            )
+                ? parsed.model
+                : DEFAULT_VISUALIZER_3D_SETTINGS.model,
+            enabled: Boolean(parsed?.enabled),
+        };
+    } catch {
+        return DEFAULT_VISUALIZER_3D_SETTINGS;
+    }
+}
+
+function persistVisualizer3DSettings(settings) {
+    if (typeof window === "undefined" || !window.localStorage) {
+        return;
+    }
+
+    try {
+        window.localStorage.setItem(
+            VISUALIZER_3D_STORAGE_KEY,
+            JSON.stringify({
+                ...DEFAULT_VISUALIZER_3D_SETTINGS,
+                ...(settings || {}),
+            })
+        );
+    } catch {
+        // Ignore storage failures.
+    }
+}
 
 const MIXER_PRESETS = [
     {
@@ -132,6 +202,9 @@ const MIXER_PRESETS = [
             delayMix: 0.08,
             delayTime: 0.33,
             delayFeedback: 0.18,
+            distortionAmount: 0.08,
+            bitcrusherWarmth: 0.04,
+            bitcrusherVariance: 0.16,
             compressorThreshold: -20,
             compressorRatio: 3,
             outputGain: -2,
@@ -157,6 +230,9 @@ const MIXER_PRESETS = [
             delayMix: 0.11,
             delayTime: 0.42,
             delayFeedback: 0.24,
+            distortionAmount: 0.12,
+            bitcrusherWarmth: 0.08,
+            bitcrusherVariance: 0.2,
             compressorThreshold: -22,
             compressorRatio: 3.5,
             outputGain: -2.5,
@@ -182,6 +258,9 @@ const MIXER_PRESETS = [
             delayMix: 0.16,
             delayTime: 0.5,
             delayFeedback: 0.32,
+            distortionAmount: 0.1,
+            bitcrusherWarmth: 0.1,
+            bitcrusherVariance: 0.22,
             compressorThreshold: -24,
             compressorRatio: 3.2,
             outputGain: -3,
@@ -203,9 +282,58 @@ const MIXER_PRESETS = [
             highGain: 1.5,
             highPass: 28,
             lowPass: 19000,
+            distortionAmount: 0.14,
+            bitcrusherWarmth: 0.08,
+            bitcrusherVariance: 0.16,
             compressorThreshold: -18,
             compressorRatio: 3.5,
             outputGain: -1,
+        },
+    },
+    {
+        key: "warm-bit-color",
+        label: "Warm slight bit color",
+        shortLabel: "Warm bit",
+        description:
+            "Adds a soft WaveShaper edge, gentle compression, and a warm bitcrusher color that stays subtle instead of harsh.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.22,
+            demudAmount: 0.18,
+            lowGain: 1,
+            midGain: -0.5,
+            highGain: 1,
+            highPass: 28,
+            lowPass: 18500,
+            distortionAmount: 0.16,
+            bitcrusherWarmth: 0.22,
+            bitcrusherVariance: 0.28,
+            compressorThreshold: -24,
+            compressorRatio: 3,
+            outputGain: -2,
+        },
+    },
+    {
+        key: "soft-distortion-glue",
+        label: "Soft distortion glue",
+        shortLabel: "Soft drive",
+        description:
+            "More obvious soft distortion with compressor control, but still gain-staged for safe browser playback.",
+        settings: {
+            ...DEFAULT_SETTINGS,
+            clarityAmount: 0.18,
+            demudAmount: 0.16,
+            lowGain: 0.75,
+            midGain: -0.25,
+            highGain: 0.75,
+            highPass: 32,
+            lowPass: 17600,
+            distortionAmount: 0.34,
+            bitcrusherWarmth: 0.1,
+            bitcrusherVariance: 0.18,
+            compressorThreshold: -26,
+            compressorRatio: 3.8,
+            outputGain: -3,
         },
     },
     {
@@ -244,6 +372,9 @@ const MIXER_PRESETS = [
             highGain: 0.5,
             highPass: 35,
             lowPass: 18000,
+            distortionAmount: 0.1,
+            bitcrusherWarmth: 0.06,
+            bitcrusherVariance: 0.14,
             compressorThreshold: -20,
             compressorRatio: 4.2,
             outputGain: -2,
@@ -288,6 +419,9 @@ const MIXER_PRESETS = [
             lowPass: 19000,
             reverbMix: 0.08,
             reverbSeconds: 1.4,
+            distortionAmount: 0.18,
+            bitcrusherWarmth: 0.1,
+            bitcrusherVariance: 0.18,
             compressorThreshold: -18,
             compressorRatio: 3,
             outputGain: -1.5,
@@ -1622,6 +1756,12 @@ function normalizeSettings(value) {
         speed: limitSettingValue("speed", merged.speed),
         pitchSemitones: limitSettingValue("pitchSemitones", merged.pitchSemitones),
 
+        distortionAmount: limitSettingValue("distortionAmount", merged.distortionAmount),
+        bitcrusherWarmth: limitSettingValue("bitcrusherWarmth", merged.bitcrusherWarmth),
+        bitcrusherVariance: limitSettingValue(
+            "bitcrusherVariance",
+            merged.bitcrusherVariance
+        ),
         compressorThreshold: limitSettingValue(
             "compressorThreshold",
             merged.compressorThreshold
@@ -1633,6 +1773,60 @@ function normalizeSettings(value) {
 
 function dbToGain(db) {
     return Math.pow(10, db / 20);
+}
+
+function createSoftDistortionCurve(amount = 0) {
+    const drive = clamp(numberOrDefault(amount, 0), 0, 1);
+    const sampleCount = 2048;
+    const curve = new Float32Array(sampleCount);
+    const k = 1 + drive * 48;
+
+    for (let index = 0; index < sampleCount; index += 1) {
+        const x = (index * 2) / sampleCount - 1;
+        const shaped = ((1 + k) * x) / (1 + k * Math.abs(x));
+        const warmSaturation = Math.tanh(x * (1.1 + drive * 2.7));
+
+        curve[index] = shaped * (0.66 + drive * 0.2) + warmSaturation * (0.34 - drive * 0.1);
+    }
+
+    return curve;
+}
+
+function createWarmBitcrusherCurve(warmth = 0, variance = 0.12) {
+    const warmAmount = clamp(numberOrDefault(warmth, 0), 0, 0.55);
+    const varianceAmount = clamp(numberOrDefault(variance, 0.12), 0, 0.75);
+    const sampleCount = 2048;
+    const curve = new Float32Array(sampleCount);
+
+    if (warmAmount <= 0.001) {
+        for (let index = 0; index < sampleCount; index += 1) {
+            curve[index] = (index * 2) / sampleCount - 1;
+        }
+
+        return curve;
+    }
+
+    const bitDepth = clamp(16 - warmAmount * 5 - varianceAmount * 1.5, 10, 16);
+    const quantizeStep = 2 / Math.pow(2, bitDepth);
+    const wet = clamp(warmAmount * 0.62, 0, 0.36);
+
+    for (let index = 0; index < sampleCount; index += 1) {
+        const x = (index * 2) / sampleCount - 1;
+        const movingStep = quantizeStep * (1 + Math.sin(index * 0.041) * varianceAmount * 0.18);
+        const quantized = Math.round(x / movingStep) * movingStep;
+        const rounded = Math.tanh(quantized * (1.08 + warmAmount * 0.7));
+
+        curve[index] = x * (1 - wet) + rounded * wet;
+    }
+
+    return curve;
+}
+
+function applyWaveShaperCurve(node, curve) {
+    if (!node) return;
+
+    node.curve = curve;
+    node.oversample = "2x";
 }
 
 function formatTime(seconds) {
@@ -1810,6 +2004,9 @@ function getCarPlaySafeSettings(rawSettings) {
         delayFeedback: Math.min(settings.delayFeedback, 0.28),
         highPass: Math.max(settings.highPass, 28),
         lowPass: Math.min(settings.lowPass, 18000),
+        distortionAmount: Math.min(settings.distortionAmount, 0.18),
+        bitcrusherWarmth: Math.min(settings.bitcrusherWarmth, 0.18),
+        bitcrusherVariance: Math.min(settings.bitcrusherVariance, 0.28),
         compressorThreshold: Math.min(settings.compressorThreshold, -18),
         compressorRatio: Math.max(settings.compressorRatio, 2.8),
         outputGain: Math.min(settings.outputGain, -1),
@@ -2855,6 +3052,15 @@ function applySettingsToNodes(nodes, rawSettings, currentTime) {
     setAudioParam(nodes.lowPass.frequency, settings.lowPass, currentTime, smoothingSeconds);
     setAudioParam(nodes.lowPass.Q, 0.7, currentTime, smoothingSeconds);
 
+    applyWaveShaperCurve(
+        nodes.distortionNode,
+        createSoftDistortionCurve(settings.distortionAmount)
+    );
+    applyWaveShaperCurve(
+        nodes.bitcrusherNode,
+        createWarmBitcrusherCurve(settings.bitcrusherWarmth, settings.bitcrusherVariance)
+    );
+
     setAudioParam(nodes.compressor.threshold, settings.compressorThreshold, currentTime, smoothingSeconds);
     setAudioParam(nodes.compressor.knee, 14, currentTime, smoothingSeconds);
     setAudioParam(nodes.compressor.ratio, settings.compressorRatio, currentTime, smoothingSeconds);
@@ -2929,6 +3135,8 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
     const lowPass = context.createBiquadFilter();
     lowPass.type = "lowpass";
 
+    const distortionNode = context.createWaveShaper();
+    const bitcrusherNode = context.createWaveShaper();
     const compressor = context.createDynamicsCompressor();
 
     const dryGain = context.createGain();
@@ -2967,6 +3175,8 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
         highShelf,
         lowPass,
 
+        distortionNode,
+        bitcrusherNode,
         compressor,
 
         dryGain,
@@ -3002,6 +3212,8 @@ function createProcessingGraph(context, destination, rawSettings, options = {}) 
         .connect(midPeak)
         .connect(highShelf)
         .connect(lowPass)
+        .connect(distortionNode)
+        .connect(bitcrusherNode)
         .connect(compressor);
 
     compressor.connect(dryGain);
@@ -3445,9 +3657,11 @@ export default function Audio() {
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
+    const visualizer3dCanvasRef = useRef(null);
     const visualizerFrameRef = useRef(null);
     const waveformDataRef = useRef(null);
     const frequencyDataRef = useRef(null);
+    const visualizer3dSettingsRef = useRef(DEFAULT_VISUALIZER_3D_SETTINGS);
 
     const timerRef = useRef(null);
 
@@ -3530,6 +3744,9 @@ export default function Audio() {
     const [directLink, setDirectLink] = useState(() => readPersistedDirectLink());
     const [playlistLink, setPlaylistLink] = useState(() => readPersistedPlaylistLinkDraft());
     const [settings, setSettings] = useState(() => readPersistedSettings());
+    const [visualizer3dSettings, setVisualizer3dSettings] = useState(() =>
+        readPersistedVisualizer3DSettings()
+    );
     const [status, setStatus] = useState(
         "Upload MP3, WAV, OGG, WebM, M4A, MP4, MOV, or choose a file from iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, or another Files provider."
     );
@@ -3568,6 +3785,10 @@ export default function Audio() {
     const carPlayOutputStatusValueRef = useRef(carPlayOutputStatus);
 
     const settingsView = normalizeSettings(settings);
+    const selectedVisualizer3DMode =
+        VISUALIZER_3D_MODE_OPTIONS.find(
+            (option) => option.value === visualizer3dSettings.model
+        ) || VISUALIZER_3D_MODE_OPTIONS[0];
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
     // Keep the visual Play/Pause toggle tied to real playback only. The pause
     // settling flag still disables controls while iOS quiets the route, but it
@@ -3594,6 +3815,7 @@ export default function Audio() {
 
     mediaTitleRef.current = mediaTitle;
     mediaDurationRef.current = Number.isFinite(duration) ? duration : 0;
+    visualizer3dSettingsRef.current = visualizer3dSettings;
 
     // Do not let a stale React render overwrite the newest lock-screen scrub
     // position. Media Session seekto actions can arrive while the page is
@@ -6197,6 +6419,19 @@ export default function Audio() {
     function clearVisualizerCanvases() {
         clearCanvas(waveformCanvasRef.current);
         clearCanvas(frequencyCanvasRef.current);
+        clearCanvas(visualizer3dCanvasRef.current);
+    }
+
+    function getVisualizerFrequencyValue(dataArray, ratio) {
+        if (!dataArray?.length) return 0;
+
+        const safeRatio = clamp(numberOrDefault(ratio, 0), 0, 1);
+        const index = Math.min(
+            dataArray.length - 1,
+            Math.max(0, Math.floor(safeRatio * (dataArray.length - 1)))
+        );
+
+        return (dataArray[index] || 0) / 255;
     }
 
     function drawWaveform(analyser) {
@@ -6330,6 +6565,148 @@ export default function Audio() {
         drawCanvasLabel(context, "Processed frequency spectrum", width, height);
     }
 
+    function draw3DVisualizer(analyser) {
+        const visualSettings = visualizer3dSettingsRef.current;
+
+        if (!visualSettings?.enabled) return;
+
+        const prepared = prepareCanvas(visualizer3dCanvasRef.current);
+
+        if (!prepared) return;
+
+        const { context, width, height } = prepared;
+        const bufferLength = analyser.frequencyBinCount;
+
+        if (!frequencyDataRef.current || frequencyDataRef.current.length !== bufferLength) {
+            frequencyDataRef.current = new Uint8Array(bufferLength);
+        }
+
+        const dataArray = frequencyDataRef.current;
+        const now = performance.now() * 0.001;
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const selectedModel =
+            VISUALIZER_3D_MODE_OPTIONS.find(
+                (option) => option.value === visualSettings.model
+            ) || VISUALIZER_3D_MODE_OPTIONS[0];
+
+        analyser.getByteFrequencyData(dataArray);
+
+        const bass = getVisualizerFrequencyValue(dataArray, 0.04);
+        const mids = getVisualizerFrequencyValue(dataArray, 0.22);
+
+        context.clearRect(0, 0, width, height);
+
+        const background = context.createRadialGradient(
+            centerX,
+            height * 0.24,
+            20,
+            centerX,
+            centerY,
+            Math.max(width, height) * 0.72
+        );
+
+        background.addColorStop(0, "rgba(103,232,249,0.2)");
+        background.addColorStop(0.42, "rgba(15,23,42,0.98)");
+        background.addColorStop(1, "rgba(7,10,19,1)");
+        context.fillStyle = background;
+        context.fillRect(0, 0, width, height);
+
+        if (visualSettings.model === "sphere-dots") {
+            const count = 96;
+            const radius = Math.min(width, height) * (0.24 + bass * 0.08);
+
+            for (let index = 0; index < count; index += 1) {
+                const ratio = index / Math.max(1, count - 1);
+                const y = 1 - ratio * 2;
+                const ringRadius = Math.sqrt(Math.max(0, 1 - y * y));
+                const angle = index * Math.PI * (3 - Math.sqrt(5)) + now * 0.55;
+                const value = getVisualizerFrequencyValue(dataArray, ratio);
+                const depth = Math.sin(angle + now * 0.8) * 0.5 + 0.5;
+                const projectedRadius = radius * (0.62 + depth * 0.5 + value * 0.22);
+                const x = centerX + Math.cos(angle) * ringRadius * projectedRadius;
+                const dotY = centerY + y * radius * 0.78 + Math.sin(now + index) * value * 18;
+                const size = 2.5 + value * 12 + depth * 3;
+
+                context.beginPath();
+                context.fillStyle =
+                    index % 2 === 0
+                        ? `rgba(103,232,249,${0.38 + value * 0.55})`
+                        : `rgba(167,139,250,${0.34 + value * 0.55})`;
+                context.shadowColor = "rgba(103,232,249,0.35)";
+                context.shadowBlur = 10 + value * 16;
+                context.arc(x, dotY, size, 0, Math.PI * 2);
+                context.fill();
+            }
+        } else if (visualSettings.model === "terrain-grid") {
+            const rows = 18;
+            const cols = 46;
+            const horizon = height * 0.28;
+            const ground = height * 0.88;
+
+            context.lineWidth = 1.2;
+
+            for (let row = 0; row < rows; row += 1) {
+                const depth = row / Math.max(1, rows - 1);
+                const y = horizon + depth * depth * (ground - horizon);
+                const perspective = 0.24 + depth * 0.9;
+
+                context.beginPath();
+                for (let col = 0; col < cols; col += 1) {
+                    const ratio = col / Math.max(1, cols - 1);
+                    const value = getVisualizerFrequencyValue(dataArray, ratio);
+                    const x = centerX + (ratio - 0.5) * width * perspective;
+                    const lift = value * (78 * (1 - depth * 0.35));
+                    const wave = Math.sin(now * 2 + row * 0.7 + col * 0.24) * 6 * mids;
+                    const pointY = y - lift + wave;
+
+                    if (col === 0) context.moveTo(x, pointY);
+                    else context.lineTo(x, pointY);
+                }
+
+                context.strokeStyle =
+                    row % 2 === 0 ? "rgba(103,232,249,0.5)" : "rgba(167,139,250,0.42)";
+                context.stroke();
+            }
+        } else {
+            const count = 84;
+            const baseRadius = Math.min(width, height) * (0.22 + bass * 0.08);
+
+            for (let index = 0; index < count; index += 1) {
+                const ratio = index / count;
+                const angle = ratio * Math.PI * 2 + now * 0.35;
+                const value = getVisualizerFrequencyValue(dataArray, ratio);
+                const barLength = 18 + value * Math.min(width, height) * 0.28;
+                const depth = Math.sin(angle + now) * 0.5 + 0.5;
+                const radius = baseRadius * (0.72 + depth * 0.52);
+                const startX = centerX + Math.cos(angle) * radius;
+                const startY = centerY + Math.sin(angle) * radius * 0.52;
+                const endX = centerX + Math.cos(angle) * (radius + barLength);
+                const endY = centerY + Math.sin(angle) * (radius + barLength) * 0.52;
+
+                context.beginPath();
+                context.lineWidth = 2 + value * 7 + depth * 2;
+                context.strokeStyle =
+                    index % 2 === 0
+                        ? `rgba(103,232,249,${0.35 + value * 0.55})`
+                        : `rgba(167,139,250,${0.3 + value * 0.55})`;
+                context.shadowColor = "rgba(103,232,249,0.34)";
+                context.shadowBlur = 8 + value * 18;
+                context.moveTo(startX, startY);
+                context.lineTo(endX, endY);
+                context.stroke();
+            }
+        }
+
+        context.shadowBlur = 0;
+        drawCanvasLabel(
+            context,
+            `3D ${selectedModel.label} visualizer`,
+            width,
+            height
+        );
+    }
+
     function drawVisualizers() {
         const analyser = analyserRef.current;
 
@@ -6340,6 +6717,7 @@ export default function Audio() {
 
         drawWaveform(analyser);
         drawFrequencyBars(analyser);
+        draw3DVisualizer(analyser);
 
         visualizerFrameRef.current = window.requestAnimationFrame(drawVisualizers);
     }
@@ -8501,8 +8879,8 @@ export default function Audio() {
                             carPlaySafeModeRef.current
                                 ? "CarPlay / USB safe mode is active. "
                                 : ""
-                        }Playing through the hidden iPhone media element output path. Pause hard-squelches the hidden stream volume and keep-alive carrier; lock-screen Stop resets WebAudio but keeps the hidden route attached, and lock-screen Play turns the single route back up after starting the audible source.`
-                        : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
+                        }Playing through the hidden iPhone media element output path with lock-screen scrubbing armed. Pause hard-squelches the hidden stream volume and keep-alive carrier; lock-screen Stop resets WebAudio but keeps the hidden route attached, and lock-screen Play turns the single route back up after starting the audible source.`
+                        : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, WaveShaper distortion, warm bitcrusher, panning, delay, and convolution reverb.`
                 );
             }
 
@@ -8829,6 +9207,34 @@ export default function Audio() {
             }
 
             return nextSettings;
+        });
+    }
+
+    function updateVisualizer3DSetting(key, value) {
+        setVisualizer3dSettings((previous) => {
+            const next = {
+                ...DEFAULT_VISUALIZER_3D_SETTINGS,
+                ...previous,
+                [key]: key === "enabled" ? Boolean(value) : value,
+            };
+
+            if (
+                key === "model" &&
+                !VISUALIZER_3D_MODE_OPTIONS.some((option) => option.value === next.model)
+            ) {
+                next.model = DEFAULT_VISUALIZER_3D_SETTINGS.model;
+            }
+
+            visualizer3dSettingsRef.current = next;
+            persistVisualizer3DSettings(next);
+
+            if (!next.enabled) {
+                clearCanvas(visualizer3dCanvasRef.current);
+            } else if (playingRef.current) {
+                startVisualizer();
+            }
+
+            return next;
         });
     }
 
@@ -9213,8 +9619,8 @@ export default function Audio() {
                                     }}
                                 >
                                     This reads from the final processed AnalyserNode after
-                                    ClarityChain, Demudder, De-Esser, EQ, delay, reverb, panning,
-                                    compression, and gain.
+                                    ClarityChain, Demudder, De-Esser, EQ, WaveShaper distortion,
+                                    warm bitcrusher, delay, reverb, panning, compression, and gain.
                                 </Typography>
                             </Box>
 
@@ -9227,6 +9633,77 @@ export default function Audio() {
                                     justifyContent: { xs: "flex-start", md: "flex-end" },
                                 }}
                             >
+                                <Button
+                                    type="button"
+                                    variant={visualizer3dSettings.enabled ? "contained" : "outlined"}
+                                    onClick={() =>
+                                        updateVisualizer3DSetting(
+                                            "enabled",
+                                            !visualizer3dSettings.enabled
+                                        )
+                                    }
+                                    sx={{
+                                        borderRadius: 999,
+                                        px: 1.6,
+                                        py: 0.7,
+                                        color: visualizer3dSettings.enabled ? "#06111e" : "#fff",
+                                        borderColor: "rgba(103,232,249,0.28)",
+                                        background: visualizer3dSettings.enabled
+                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                            : "rgba(255,255,255,0.04)",
+                                        fontSize: 12,
+                                        fontWeight: 950,
+                                    }}
+                                >
+                                    {visualizer3dSettings.enabled ? "3D on" : "3D off"}
+                                </Button>
+
+                                {visualizer3dSettings.enabled && (
+                                    <FormControl
+                                        size="small"
+                                        sx={{
+                                            minWidth: 170,
+                                            "& .MuiInputLabel-root": {
+                                                color: "rgba(255,255,255,0.66)",
+                                            },
+                                            "& .MuiOutlinedInput-root": {
+                                                color: "#fff",
+                                                borderRadius: 999,
+                                                background: "rgba(7,10,19,0.72)",
+                                                fontSize: 12,
+                                                fontWeight: 850,
+                                                "& fieldset": {
+                                                    borderColor: "rgba(103,232,249,0.24)",
+                                                },
+                                            },
+                                            "& .MuiSvgIcon-root": {
+                                                color: "#67e8f9",
+                                            },
+                                        }}
+                                    >
+                                        <InputLabel id="visualizer-3d-model-label">
+                                            Model
+                                        </InputLabel>
+                                        <Select
+                                            labelId="visualizer-3d-model-label"
+                                            value={visualizer3dSettings.model}
+                                            label="Model"
+                                            onChange={(event) =>
+                                                updateVisualizer3DSetting(
+                                                    "model",
+                                                    event.target.value
+                                                )
+                                            }
+                                        >
+                                            {VISUALIZER_3D_MODE_OPTIONS.map((mode) => (
+                                                <MenuItem key={mode.value} value={mode.value}>
+                                                    {mode.label}
+                                                </MenuItem>
+                                            ))}
+                                        </Select>
+                                    </FormControl>
+                                )}
+
                                 <Box
                                     sx={{
                                         display: "inline-flex",
@@ -9326,6 +9803,22 @@ export default function Audio() {
                                 }}
                             />
                         </Box>
+
+                        {visualizer3dSettings.enabled && (
+                            <Box
+                                component="canvas"
+                                ref={visualizer3dCanvasRef}
+                                sx={{
+                                    width: "100%",
+                                    height: { xs: 240, md: 340 },
+                                    display: "block",
+                                    borderRadius: 4,
+                                    border: "1px solid rgba(103,232,249,0.14)",
+                                    background:
+                                        "radial-gradient(circle at 50% 18%, rgba(103,232,249,0.12), transparent 38%), rgba(7,10,19,0.98)",
+                                }}
+                            />
+                        )}
                     </Stack>
                 </GlassCard>
 
@@ -10813,6 +11306,41 @@ export default function Audio() {
                                     unit=" st"
                                     disabled={isRendering || isLoading}
                                     onChange={(value) => updateSetting("pitchSemitones", value)}
+                                />
+
+                                <ControlSlider
+                                    label="WaveShaper distortion"
+                                    value={settingsView.distortionAmount}
+                                    min={HUMAN_SAFE_LIMITS.distortionAmount.min}
+                                    max={HUMAN_SAFE_LIMITS.distortionAmount.max}
+                                    step={0.01}
+                                    unit=""
+                                    disabled={isRendering || isLoading}
+                                    onChange={(value) => updateSetting("distortionAmount", value)}
+                                />
+
+                                <ControlSlider
+                                    label="Warm bitcrusher"
+                                    value={settingsView.bitcrusherWarmth}
+                                    min={HUMAN_SAFE_LIMITS.bitcrusherWarmth.min}
+                                    max={HUMAN_SAFE_LIMITS.bitcrusherWarmth.max}
+                                    step={0.01}
+                                    unit=""
+                                    disabled={isRendering || isLoading}
+                                    onChange={(value) => updateSetting("bitcrusherWarmth", value)}
+                                />
+
+                                <ControlSlider
+                                    label="Bitcrusher variance"
+                                    value={settingsView.bitcrusherVariance}
+                                    min={HUMAN_SAFE_LIMITS.bitcrusherVariance.min}
+                                    max={HUMAN_SAFE_LIMITS.bitcrusherVariance.max}
+                                    step={0.01}
+                                    unit=""
+                                    disabled={isRendering || isLoading}
+                                    onChange={(value) =>
+                                        updateSetting("bitcrusherVariance", value)
+                                    }
                                 />
 
                                 <ControlSlider
