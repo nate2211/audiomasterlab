@@ -397,7 +397,7 @@ const COMMUNITY_LISTENING_SESSION_STORAGE_KEY =
     "audiomasterlab.community.listening.session.v1";
 const COMMUNITY_LISTENING_USER_NAME_STORAGE_KEY =
     "audiomasterlab.community.userName.v1";
-const COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS = 15000;
+const COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS = 45000;
 
 function isArchiveMediaHost(hostname = "") {
     const host = String(hostname || "").toLowerCase();
