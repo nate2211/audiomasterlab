@@ -497,6 +497,7 @@ const STORAGE_KEYS = {
     lastMedia: "audiomasterlab.audio.lastMedia.v4",
     lastSession: "audiomasterlab.audio.lastSession.v4",
     carPlaySafeMode: "audiomasterlab.audio.carPlaySafeMode.v4",
+    communityPostDedupe: "audiomasterlab.community.postDedupe.v1",
 };
 
 const COOKIE_NAMES = {
@@ -532,6 +533,8 @@ const COMMUNITY_LISTENING_SESSION_STORAGE_KEY =
 const COMMUNITY_LISTENING_USER_NAME_STORAGE_KEY =
     "audiomasterlab.community.userName.v1";
 const COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS = 45000;
+const COMMUNITY_POST_DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000;
+const COMMUNITY_POST_DEDUPE_MAX_RECORDS = 80;
 
 function isArchiveMediaHost(hostname = "") {
     const host = String(hostname || "").toLowerCase();
@@ -742,6 +745,110 @@ function writeStorageJson(key, value) {
     } catch {
         return false;
     }
+}
+
+function normalizeCommunityPostDedupeText(value) {
+    return String(value || "")
+        .trim()
+        .replace(/\s+/g, " ")
+        .toLowerCase();
+}
+
+function stableCommunityPostHash(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+
+    for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+
+    return (hash >>> 0).toString(36);
+}
+
+function buildCommunityPostDedupeKey(payload) {
+    const canonicalAudioUrl = getCanonicalArchiveMediaUrl(
+        payload?.originalUrl ||
+        payload?.audioUrl ||
+        payload?.audio_url ||
+        payload?.directArchiveUrl ||
+        payload?.proxiedArchiveUrl ||
+        ""
+    );
+    const normalizedParts = [
+        normalizeCommunityPostDedupeText(payload?.userName || payload?.user_name),
+        normalizeCommunityPostDedupeText(payload?.title || payload?.track_title),
+        normalizeCommunityPostDedupeText(payload?.artist),
+        normalizeCommunityPostDedupeText(canonicalAudioUrl || payload?.audioUrl || payload?.audio_url),
+    ];
+
+    return `aml-post-${stableCommunityPostHash(normalizedParts.join("|"))}`;
+}
+
+function pruneCommunityPostDedupeMap(map, now = Date.now()) {
+    const entries = Object.entries(map || {})
+        .map(([key, record]) => {
+            const postedAt = Number(
+                typeof record === "number" ? record : record?.postedAt
+            );
+
+            if (!key || !Number.isFinite(postedAt)) {
+                return null;
+            }
+
+            if (now - postedAt > COMMUNITY_POST_DEDUPE_WINDOW_MS) {
+                return null;
+            }
+
+            return [
+                key,
+                {
+                    ...(typeof record === "object" && record ? record : {}),
+                    postedAt,
+                },
+            ];
+        })
+        .filter(Boolean)
+        .sort((a, b) => Number(b[1]?.postedAt || 0) - Number(a[1]?.postedAt || 0))
+        .slice(0, COMMUNITY_POST_DEDUPE_MAX_RECORDS);
+
+    return Object.fromEntries(entries);
+}
+
+function readCommunityPostDedupeMap() {
+    return pruneCommunityPostDedupeMap(
+        readStorageJson(STORAGE_KEYS.communityPostDedupe, {})
+    );
+}
+
+function hasRecentCommunityPostDedupeKey(dedupeKey) {
+    if (!dedupeKey) {
+        return false;
+    }
+
+    return Boolean(readCommunityPostDedupeMap()[dedupeKey]);
+}
+
+function rememberCommunityPostDedupeKey(dedupeKey, payload = {}) {
+    if (!dedupeKey) {
+        return false;
+    }
+
+    const now = Date.now();
+    const nextMap = pruneCommunityPostDedupeMap(
+        {
+            ...readCommunityPostDedupeMap(),
+            [dedupeKey]: {
+                postedAt: now,
+                title: payload?.title || payload?.track_title || "",
+                audioUrl: payload?.audioUrl || payload?.audio_url || "",
+                userName: payload?.userName || payload?.user_name || "",
+            },
+        },
+        now
+    );
+
+    return writeStorageJson(STORAGE_KEYS.communityPostDedupe, nextMap);
 }
 
 function encodeCookie(value) {
@@ -3672,6 +3779,7 @@ export default function Audio() {
     const playingRef = useRef(false);
     const scrubbingRef = useRef(false);
     const wasPlayingBeforeScrubRef = useRef(false);
+    const scrubResumeRequestedRef = useRef(false);
     const mutedRef = useRef(false);
     const latestSettingsRef = useRef(DEFAULT_SETTINGS);
     const repeatEnabledRef = useRef(false);
@@ -3687,6 +3795,9 @@ export default function Audio() {
     );
     const communityListeningHeartbeatTimerRef = useRef(null);
     const lastCommunityListeningBeatAtRef = useRef(0);
+    const isPostingCommunityPostRef = useRef(false);
+    const lastCommunityPostDedupeKeyRef = useRef("");
+    const lastCommunityPostAttemptAtRef = useRef(0);
 
     // Media Session / lock-screen refs keep hardware, CarPlay, Bluetooth,
     // and lock-screen controls wired to the latest React state without stale
@@ -5886,18 +5997,24 @@ export default function Audio() {
             durationValue
         );
         const wasPlaying = Boolean(playingRef.current);
+        const shouldResumeAfterSeek = Boolean(
+            wasPlaying ||
+            wasPlayingBeforeScrubRef.current ||
+            scrubResumeRequestedRef.current
+        );
         const isFastSeek = Boolean(details.fastSeek);
         let outputAlreadyRestarted = false;
 
         lastMediaSessionSeekAtRef.current = Date.now();
         pendingMediaSessionSeekRef.current = nextSeekTime;
         scrubbingRef.current = true;
+        scrubResumeRequestedRef.current = shouldResumeAfterSeek;
         setIsScrubbing(true);
         syncPlaybackPosition(nextSeekTime, {
             fromMediaSession: true,
             forceMediaSession: true,
         });
-        updateMediaSessionState(wasPlaying ? "playing" : "paused", {
+        updateMediaSessionState(shouldResumeAfterSeek ? "playing" : "paused", {
             forcePosition: true,
         });
 
@@ -5907,10 +6024,10 @@ export default function Audio() {
             clearMediaSessionFastSeekCommitTimer();
 
             if (!alreadyFastSeeking) {
-                wasPlayingBeforeScrubRef.current = wasPlaying;
+                wasPlayingBeforeScrubRef.current = shouldResumeAfterSeek;
             }
 
-            if (wasPlaying && activeSourceRef.current) {
+            if (shouldResumeAfterSeek && activeSourceRef.current) {
                 manualStopRef.current = true;
                 stopActiveSource();
                 stopPositionTimer();
@@ -5942,7 +6059,7 @@ export default function Audio() {
 
         clearMediaSessionFastSeekCommitTimer();
 
-        if (isIOSAudioDevice() && wasPlaying) {
+        if (isIOSAudioDevice() && shouldResumeAfterSeek) {
             const { context, nodes } = ensureLiveGraph();
             releaseOutputAfterGlitchlessSourceStart(context, nodes, {
                 rampSeconds: 0.05,
@@ -5951,18 +6068,19 @@ export default function Audio() {
         }
 
         try {
-            await seekTo(nextSeekTime, wasPlaying, {
+            await seekTo(nextSeekTime, shouldResumeAfterSeek, {
                 fromMediaSession: true,
                 preserveUnlockedOutput: isIOSAudioDevice(),
                 outputAlreadyRestarted,
-                forceIPhoneOutputPostStart: isIOSAudioDevice() && wasPlaying,
-                keepPlayingUiDuringSeek: wasPlaying,
+                forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResumeAfterSeek,
+                keepPlayingUiDuringSeek: shouldResumeAfterSeek,
                 quietStatus: true,
             });
         } finally {
             scrubbingRef.current = false;
             setIsScrubbing(false);
             wasPlayingBeforeScrubRef.current = false;
+            scrubResumeRequestedRef.current = false;
             pendingMediaSessionSeekRef.current = null;
         }
 
@@ -5970,7 +6088,7 @@ export default function Audio() {
             fromMediaSession: true,
             forceMediaSession: true,
         });
-        updateMediaSessionState(wasPlaying ? "playing" : "paused", {
+        updateMediaSessionState(shouldResumeAfterSeek ? "playing" : "paused", {
             forcePosition: true,
         });
         return true;
@@ -6952,6 +7070,7 @@ export default function Audio() {
 
         scrubbingRef.current = false;
         wasPlayingBeforeScrubRef.current = false;
+        scrubResumeRequestedRef.current = false;
 
         setIsScrubbing(false);
         mediaDurationRef.current = 0;
@@ -7034,6 +7153,7 @@ export default function Audio() {
 
         scrubbingRef.current = false;
         wasPlayingBeforeScrubRef.current = false;
+        scrubResumeRequestedRef.current = false;
 
         setIsScrubbing(false);
         setBufferReady(false);
@@ -7445,7 +7565,7 @@ export default function Audio() {
             getPlaylistItemArtworkSource(activeItem)
         );
 
-        return {
+        const basePayload = {
             userName: readPersistedCommunityListeningUserName(),
             title: title || "Community audio post",
             artist: "",
@@ -7461,6 +7581,15 @@ export default function Audio() {
             playlistItemId: activeItem?.id || "",
             postedFrom: "audio-page",
             createdAt: new Date().toISOString(),
+        };
+        const dedupeKey = buildCommunityPostDedupeKey(basePayload);
+
+        return {
+            ...basePayload,
+            dedupeKey,
+            idempotencyKey: dedupeKey,
+            dedupe_key: dedupeKey,
+            idempotency_key: dedupeKey,
         };
     }
 
@@ -7595,18 +7724,53 @@ export default function Audio() {
     }
 
     async function postCurrentMediaToCommunityFeed() {
-        if (isPostingCommunityPost || isRendering || isLoading) {
+        if (
+            isPostingCommunityPostRef.current ||
+            isPostingCommunityPost ||
+            isRendering ||
+            isLoading
+        ) {
             return;
         }
 
+        isPostingCommunityPostRef.current = true;
+
         let payload;
+        let dedupeKey = "";
 
         try {
             payload = buildCurrentCommunityPostPayload();
+            dedupeKey = payload.dedupeKey || buildCommunityPostDedupeKey(payload);
+            payload = {
+                ...payload,
+                dedupeKey,
+                idempotencyKey: dedupeKey,
+                dedupe_key: dedupeKey,
+                idempotency_key: dedupeKey,
+            };
         } catch (error) {
+            isPostingCommunityPostRef.current = false;
             setError(error?.message || "Could not prepare this community post.");
             return;
         }
+
+        const now = Date.now();
+        const isSameImmediateAttempt = Boolean(
+            dedupeKey &&
+            lastCommunityPostDedupeKeyRef.current === dedupeKey &&
+            now - (lastCommunityPostAttemptAtRef.current || 0) < 3500
+        );
+
+        if (isSameImmediateAttempt || hasRecentCommunityPostDedupeKey(dedupeKey)) {
+            isPostingCommunityPostRef.current = false;
+            setInfo(
+                `Skipped duplicate community post for "${payload.title}". This exact track was already added from this browser recently.`
+            );
+            return;
+        }
+
+        lastCommunityPostDedupeKeyRef.current = dedupeKey;
+        lastCommunityPostAttemptAtRef.current = now;
 
         try {
             setIsPostingCommunityPost(true);
@@ -7617,10 +7781,21 @@ export default function Audio() {
                 headers: {
                     "Content-Type": "application/json",
                     Accept: "application/json",
+                    "Idempotency-Key": dedupeKey,
+                    "X-AudioMasterLab-Dedupe-Key": dedupeKey,
                 },
                 body: JSON.stringify(payload),
+                cache: "no-store",
             });
             const result = await response.json().catch(() => null);
+
+            if (response.status === 409 || result?.duplicate || result?.deduped) {
+                rememberCommunityPostDedupeKey(dedupeKey, payload);
+                setInfo(
+                    `Skipped duplicate community post for "${payload.title}" because the feed already has this exact track.`
+                );
+                return;
+            }
 
             if (!response.ok || result?.ok === false) {
                 throw new Error(
@@ -7630,6 +7805,7 @@ export default function Audio() {
                 );
             }
 
+            rememberCommunityPostDedupeKey(dedupeKey, payload);
             setInfo(
                 `Posted "${payload.title}" to the community feed${
                     payload.usesArchiveProxy
@@ -7643,6 +7819,7 @@ export default function Audio() {
                 "Could not post this track to the community feed. Make sure /api/community/posts is deployed in your Cloudflare Pages Functions backend."
             );
         } finally {
+            isPostingCommunityPostRef.current = false;
             setIsPostingCommunityPost(false);
         }
     }
@@ -9061,9 +9238,10 @@ export default function Audio() {
         if (scrubbingRef.current) return;
 
         const currentOffset = getCurrentOffset();
-        const shouldKeepPlayingUi = Boolean(playingRef.current);
+        const wasPlayingAtStart = Boolean(playingRef.current || activeSourceRef.current);
 
-        wasPlayingBeforeScrubRef.current = playingRef.current;
+        wasPlayingBeforeScrubRef.current = wasPlayingAtStart;
+        scrubResumeRequestedRef.current = wasPlayingAtStart;
         scrubbingRef.current = true;
 
         manualStopRef.current = true;
@@ -9079,7 +9257,11 @@ export default function Audio() {
 
         setIsScrubbing(true);
 
-        if (shouldKeepPlayingUi) {
+        if (wasPlayingAtStart) {
+            // Keep the UI and Media Session in the playing state while the source
+            // is temporarily stopped. handleScrubCommit() will always restart from
+            // the committed offset when this ref is true, even if React state
+            // updates or duplicate mouse/touch commit events arrive out of order.
             playingRef.current = true;
             isPlayingStateRef.current = true;
             setIsPlaying((current) => (current ? current : true));
@@ -9096,6 +9278,10 @@ export default function Audio() {
 
         if (!buffer) return;
 
+        if (!scrubbingRef.current) {
+            handleScrubStart();
+        }
+
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
 
@@ -9104,6 +9290,10 @@ export default function Audio() {
         syncPlaybackPosition(nextOffset, {
             forceMediaSession: true,
         });
+
+        if (scrubResumeRequestedRef.current) {
+            updateMediaSessionState("playing", { forcePosition: true });
+        }
     }
 
     async function handleScrubCommit(_, nextValue) {
@@ -9111,10 +9301,20 @@ export default function Audio() {
 
         if (!buffer) return;
 
-        const shouldResume = wasPlayingBeforeScrubRef.current;
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        const shouldResume = Boolean(
+            scrubResumeRequestedRef.current ||
+            wasPlayingBeforeScrubRef.current ||
+            playingRef.current ||
+            activeSourceRef.current
+        );
         let outputAlreadyRestarted = false;
+
+        // Preserve the resume decision until seekTo() has completed. This avoids
+        // the common mobile bug where releasing the scrubber fires a second commit
+        // after the first one already cleared wasPlayingBeforeScrubRef.
+        scrubResumeRequestedRef.current = shouldResume;
 
         if (isIOSAudioDevice() && shouldResume) {
             try {
@@ -9128,17 +9328,26 @@ export default function Audio() {
             }
         }
 
-        scrubbingRef.current = false;
-        wasPlayingBeforeScrubRef.current = false;
+        try {
+            await seekTo(nextOffset, shouldResume, {
+                preserveUnlockedOutput: isIOSAudioDevice(),
+                outputAlreadyRestarted,
+                forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
+                keepPlayingUiDuringSeek: shouldResume,
+                quietStatus: true,
+            });
+        } finally {
+            scrubbingRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            scrubResumeRequestedRef.current = false;
+            setIsScrubbing(false);
+        }
 
-        setIsScrubbing(false);
-
-        await seekTo(nextOffset, shouldResume, {
-            preserveUnlockedOutput: isIOSAudioDevice(),
-            outputAlreadyRestarted,
-            forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
-            keepPlayingUiDuringSeek: shouldResume,
-            quietStatus: true,
+        syncPlaybackPosition(nextOffset, {
+            forceMediaSession: true,
+        });
+        updateMediaSessionState(shouldResume ? "playing" : "paused", {
+            forcePosition: true,
         });
     }
 
