@@ -9,6 +9,7 @@ import {
     CardContent,
     Checkbox,
     Chip,
+    Collapse,
     CircularProgress,
     Divider,
     FormControlLabel,
@@ -269,6 +270,9 @@ const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/arc
 const ARCHIVE_PROXY_STORAGE_KEY = "audiomasterlab.archive.useProxy.v1";
 const ARCHIVE_BROWSER_STORAGE_KEY = "audiomasterlab.archive.browser.session.v2";
 const ARCHIVE_BROWSER_MAX_SAVED_RESULTS = 120;
+const ARCHIVE_VISIBLE_RESULT_BATCH_SIZE = 12;
+const ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM = 4;
+const ARCHIVE_FILE_BATCH_SIZE = 12;
 
 function makeArchivePlaylistId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -527,7 +531,7 @@ function getSterileArchiveQuery(value) {
 
 function escapeArchivePhrase(value) {
     return String(value || "")
-        .replace(/[\\"]/g, " ")
+        .replace(/[\"]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -1242,43 +1246,108 @@ function tokenAppearsInText(text, token) {
     );
 }
 
-function archiveItemMatchesActiveQuery({
-                                           query,
-                                           queryTokens,
-                                           item,
-                                           metadata,
-                                           files,
-                                       }) {
+function compactArchiveMatchText(value) {
+    return String(value || "")
+        .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9]+/g, "");
+}
+
+function archiveTokensAppearInText(text, tokens = []) {
+    const normalizedText = String(text || "");
+    const compactText = compactArchiveMatchText(normalizedText);
+
+    return tokens.reduce((count, token) => {
+        const safeToken = String(token || "").trim();
+        const compactToken = compactArchiveMatchText(safeToken);
+
+        if (!safeToken) return count;
+
+        return (
+            tokenAppearsInText(normalizedText, safeToken) ||
+            (compactToken && compactText.includes(compactToken))
+        )
+            ? count + 1
+            : count;
+    }, 0);
+}
+
+function archivePhraseAppearsInText(text, tokens = []) {
+    const compactPhrase = tokens.map(compactArchiveMatchText).join("");
+
+    if (!compactPhrase || compactPhrase.length < 4) {
+        return false;
+    }
+
+    return compactArchiveMatchText(text).includes(compactPhrase);
+}
+
+function getArchiveQueryRelevance({
+                                      query,
+                                      queryTokens,
+                                      item,
+                                      metadata,
+                                      files,
+                                  }) {
     const tokens = Array.isArray(queryTokens) && queryTokens.length
         ? queryTokens
         : getArchiveQueryTokens(query);
 
     if (!tokens.length) {
-        return true;
+        return {
+            matches: true,
+            highSignalMatchedCount: 0,
+            fullMatchedCount: 0,
+            missingTokens: [],
+        };
     }
 
     const highSignalHaystack = getArchiveHighSignalSearchText(item, metadata, files);
     const fullHaystack = getArchiveCandidateSearchText(item, metadata, files);
+    const highSignalMatchedCount = archiveTokensAppearInText(
+        highSignalHaystack,
+        tokens
+    );
+    const fullMatchedCount = archiveTokensAppearInText(fullHaystack, tokens);
+    const highSignalPhraseMatch = archivePhraseAppearsInText(
+        highSignalHaystack,
+        tokens
+    );
+    const fullPhraseMatch = archivePhraseAppearsInText(fullHaystack, tokens);
+    const missingTokens = tokens.filter(
+        (token) => !tokenAppearsInText(fullHaystack, token)
+    );
 
-    const highSignalMatchedCount = tokens.reduce((count, token) => {
-        return tokenAppearsInText(highSignalHaystack, token) ? count + 1 : count;
-    }, 0);
-
-    const fullMatchedCount = tokens.reduce((count, token) => {
-        return tokenAppearsInText(fullHaystack, token) ? count + 1 : count;
-    }, 0);
+    let matches;
 
     if (tokens.length === 1) {
         // A single-word query like "yeat" should match the current query in
         // title/creator/subject/identifier/file name, not only a stale broad
         // description from an older or unrelated Archive item.
-        return highSignalMatchedCount === 1;
+        matches = highSignalMatchedCount === 1 || highSignalPhraseMatch;
+    } else {
+        // Multi-word artist searches should stay tight. "lil uzi vert" should
+        // not let broad radio or unrelated collection metadata into the main
+        // list unless the artist/name tokens appear in high-signal fields.
+        matches =
+            highSignalMatchedCount === tokens.length ||
+            highSignalPhraseMatch ||
+            (fullMatchedCount === tokens.length &&
+                fullPhraseMatch &&
+                highSignalMatchedCount >= Math.min(2, tokens.length));
     }
 
-    // For multi-word searches, require all current tokens somewhere, with at
-    // least one high-signal hit. This keeps searches clean without rejecting
-    // every item that has imperfect user-supplied metadata.
-    return fullMatchedCount === tokens.length && highSignalMatchedCount >= 1;
+    return {
+        matches,
+        highSignalMatchedCount,
+        fullMatchedCount,
+        missingTokens,
+    };
+}
+
+function archiveItemMatchesActiveQuery(args) {
+    return getArchiveQueryRelevance(args).matches;
 }
 
 function isAbortError(error) {
@@ -1378,6 +1447,13 @@ async function buildArchiveResultFromMetadata({
         license: getLicense(metadata),
         rightsVerified: rightsSafer,
         directUrlResult: Boolean(allowDirectUrlResult),
+        queryMatched: true,
+        queryRelevance: {
+            matches: true,
+            highSignalMatchedCount: 0,
+            fullMatchedCount: 0,
+            missingTokens: [],
+        },
         downloads: "",
         detailsUrl: buildDetailsUrl(identifier),
         images: getArchiveItemImages(
@@ -1576,15 +1652,13 @@ async function searchSafeAudio({
             const metadata = metadataData.metadata || {};
             const files = Array.isArray(metadataData.files) ? metadataData.files : [];
 
-            if (!archiveItemMatchesActiveQuery({
+            const queryRelevance = getArchiveQueryRelevance({
                 query: safeQuery,
                 queryTokens,
                 item,
                 metadata,
                 files,
-            })) {
-                continue;
-            }
+            });
 
             if (!looksRightsSafer(item, metadata, selectedCollections)) {
                 continue;
@@ -1613,6 +1687,8 @@ async function searchSafeAudio({
                 license: getLicense(metadata),
                 rightsVerified: true,
                 directUrlResult: false,
+                queryMatched: queryRelevance.matches,
+                queryRelevance,
                 downloads: item.downloads || "",
                 detailsUrl: buildDetailsUrl(item.identifier),
                 images: getArchiveItemImages(
@@ -1742,6 +1818,7 @@ function stampArchiveResults(items = [], searchSignature = "") {
     return dedupeArchiveResults(items).map((item) => ({
         ...item,
         searchSignature,
+        queryMatched: item.queryMatched !== false,
         images: dedupeArchiveImages(item.images).map((image) => ({
             ...image,
             searchSignature,
@@ -1756,6 +1833,362 @@ function stampArchiveResults(items = [], searchSignature = "") {
 function mergeArchiveResults(current = [], incoming = []) {
     return dedupeArchiveResults([...current, ...incoming]);
 }
+
+const ArchiveFileRow = React.memo(function ArchiveFileRow({
+                                                              file,
+                                                              onCopyText,
+                                                              onSendToAudioPage,
+                                                              onAddToPlaylist,
+                                                          }) {
+    return (
+        <Box
+            sx={{
+                p: 1.5,
+                border: "1px solid",
+                borderColor: file.zipInternal ? "warning.main" : "divider",
+                borderRadius: 3,
+                bgcolor: "background.default",
+            }}
+        >
+            <Stack spacing={1}>
+                <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    spacing={1}
+                    justifyContent="space-between"
+                    alignItems={{ xs: "flex-start", sm: "center" }}
+                >
+                    <Stack
+                        direction="row"
+                        spacing={1}
+                        alignItems="center"
+                        sx={{ minWidth: 0 }}
+                    >
+                        <AudiotrackRoundedIcon fontSize="small" />
+
+                        <Box sx={{ minWidth: 0 }}>
+                            <Typography
+                                variant="body2"
+                                sx={{
+                                    fontWeight: 900,
+                                    wordBreak: "break-word",
+                                }}
+                            >
+                                {file.name}
+                            </Typography>
+
+                            <Typography variant="caption" color="text.secondary">
+                                {formatFileLabel(file)}
+                                {file.zipInternal ? " - ZIP-internal path" : ""}
+                                {file.proxied ? " - proxied" : ""}
+                            </Typography>
+                        </Box>
+                    </Stack>
+                </Stack>
+
+                <audio
+                    controls
+                    preload="none"
+                    src={file.url}
+                    style={{
+                        width: "100%",
+                        display: "block",
+                    }}
+                />
+
+                <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                    <Button
+                        href={file.serveUrl || file.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        size="small"
+                        variant="outlined"
+                        endIcon={<OpenInNewRoundedIcon />}
+                    >
+                        Open serve link
+                    </Button>
+
+                    <Button
+                        href={file.downloadUrl || file.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        size="small"
+                        variant="outlined"
+                        endIcon={<OpenInNewRoundedIcon />}
+                    >
+                        Open download link
+                    </Button>
+
+                    <Button
+                        type="button"
+                        size="small"
+                        variant="text"
+                        startIcon={<ContentCopyRoundedIcon />}
+                        onClick={() => onCopyText(file.serveUrl || file.url)}
+                    >
+                        Copy serve link
+                    </Button>
+
+                    <Button
+                        type="button"
+                        size="small"
+                        variant="text"
+                        startIcon={<ContentCopyRoundedIcon />}
+                        onClick={() => onCopyText(file.downloadUrl || file.url)}
+                    >
+                        Copy download link
+                    </Button>
+
+                    <Button
+                        type="button"
+                        size="small"
+                        variant="contained"
+                        onClick={() => onSendToAudioPage(file)}
+                        startIcon={<AudiotrackRoundedIcon />}
+                    >
+                        Save for Audio Page
+                    </Button>
+
+                    <Button
+                        type="button"
+                        size="small"
+                        variant="outlined"
+                        onClick={() => onAddToPlaylist(file)}
+                        startIcon={<PlaylistAddRoundedIcon />}
+                    >
+                        Add song to playlist
+                    </Button>
+                </Stack>
+            </Stack>
+        </Box>
+    );
+});
+
+const ArchiveResultCard = React.memo(function ArchiveResultCard({
+                                                                    item,
+                                                                    visibleFileLimit,
+                                                                    offQuery = false,
+                                                                    onShowMoreFiles,
+                                                                    onShowAllFiles,
+                                                                    onCollapseFiles,
+                                                                    onAddFilesToPlaylist,
+                                                                    onCopyText,
+                                                                    onSendToAudioPage,
+                                                                    onAddFileToPlaylist,
+                                                                }) {
+    const files = Array.isArray(item.files) ? item.files : [];
+    const visibleFiles = files.slice(0, visibleFileLimit);
+    const hiddenFileCount = Math.max(files.length - visibleFiles.length, 0);
+
+    return (
+        <Card
+            variant="outlined"
+            sx={{
+                borderRadius: 4,
+                overflow: "hidden",
+                borderColor: offQuery ? "warning.main" : "divider",
+                opacity: offQuery ? 0.9 : 1,
+            }}
+        >
+            <CardContent>
+                <Stack spacing={1.5}>
+                    <Stack
+                        direction={{ xs: "column", md: "row" }}
+                        spacing={1}
+                        justifyContent="space-between"
+                        alignItems={{ xs: "flex-start", md: "center" }}
+                    >
+                        <Box>
+                            <Typography variant="h6" sx={{ fontWeight: 950 }}>
+                                {item.title}
+                            </Typography>
+
+                            <Typography variant="body2" color="text.secondary">
+                                {item.creator || "Unknown creator"}
+                                {item.date ? ` - ${item.date}` : ""}
+                                {item.downloads ? ` - ${item.downloads} downloads` : ""}
+                            </Typography>
+
+                            <Typography variant="caption" color="text.secondary">
+                                Loaded {files.length} playable file(s) from this Archive item.
+                                {hiddenFileCount
+                                    ? ` Showing ${visibleFiles.length} right now for smoother rendering.`
+                                    : ""}
+                            </Typography>
+
+                            {offQuery && (
+                                <Typography
+                                    variant="caption"
+                                    color="warning.main"
+                                    sx={{ display: "block", mt: 0.5 }}
+                                >
+                                    This item did not strongly match the current query in title,
+                                    creator, identifier, subject, or file names.
+                                </Typography>
+                            )}
+                        </Box>
+
+                        <Stack
+                            direction={{ xs: "column", sm: "row" }}
+                            spacing={1}
+                            alignItems={{ xs: "stretch", sm: "center" }}
+                        >
+                            <Button
+                                type="button"
+                                size="small"
+                                variant="outlined"
+                                startIcon={<PlaylistAddRoundedIcon />}
+                                disabled={!files.length}
+                                onClick={() =>
+                                    onAddFilesToPlaylist(
+                                        files,
+                                        `file(s) from "${item.title || item.identifier}"`
+                                    )
+                                }
+                            >
+                                Add all item files
+                            </Button>
+
+                            <Button
+                                href={item.detailsUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                endIcon={<OpenInNewRoundedIcon />}
+                            >
+                                Archive page
+                            </Button>
+                        </Stack>
+                    </Stack>
+
+                    {!!item.images?.[0] && (
+                        <Card
+                            variant="outlined"
+                            sx={{
+                                borderRadius: 3,
+                                bgcolor: "background.default",
+                                overflow: "hidden",
+                            }}
+                        >
+                            <Box
+                                component="img"
+                                src={item.images[0].imageUrl || item.images[0].url}
+                                alt={item.images[0].alt || `${item.title} Archive thumbnail`}
+                                loading="lazy"
+                                decoding="async"
+                                referrerPolicy="no-referrer"
+                                onError={(event) => {
+                                    event.currentTarget.style.display = "none";
+                                }}
+                                sx={{
+                                    width: "100%",
+                                    height: { xs: 180, sm: 240 },
+                                    objectFit: "contain",
+                                    objectPosition: "center",
+                                    display: "block",
+                                    bgcolor: "background.paper",
+                                }}
+                            />
+
+                            <CardContent sx={{ p: 1.5, "&:last-child": { pb: 1.5 } }}>
+                                <Stack
+                                    direction={{ xs: "column", sm: "row" }}
+                                    spacing={1}
+                                    justifyContent="space-between"
+                                    alignItems={{ xs: "flex-start", sm: "center" }}
+                                >
+                                    <Typography variant="body2" sx={{ fontWeight: 900 }}>
+                                        Archive thumbnail
+                                    </Typography>
+
+                                    <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                        sx={{ wordBreak: "break-word" }}
+                                    >
+                                        {item.images[0].name || "Archive item thumbnail"}
+                                        {item.images[0].proxied ? " - proxied" : ""}
+                                    </Typography>
+                                </Stack>
+                            </CardContent>
+                        </Card>
+                    )}
+
+                    {item.description && (
+                        <Typography variant="body2" color="text.secondary">
+                            {item.description}
+                        </Typography>
+                    )}
+
+                    <Typography
+                        variant="caption"
+                        color={item.rightsVerified === false ? "warning.main" : "text.secondary"}
+                    >
+                        License / rights:{" "}
+                        {item.license ||
+                            (item.directUrlResult
+                                ? "Direct URL result - rights were not verified by AudioMaster Lab. Only use audio you own or have permission to use."
+                                : "Not listed - verify before reuse.")}
+                    </Typography>
+
+                    <Stack direction="row" spacing={1} flexWrap="wrap">
+                        {(Array.isArray(item.collection) ? item.collection : [])
+                            .slice(0, 8)
+                            .map((collection) => (
+                                <Chip key={collection} label={collection} size="small" />
+                            ))}
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.5}>
+                        {visibleFiles.map((file) => (
+                            <ArchiveFileRow
+                                key={file.url || file.serveUrl || file.downloadUrl || file.name}
+                                file={file}
+                                onCopyText={onCopyText}
+                                onSendToAudioPage={onSendToAudioPage}
+                                onAddToPlaylist={onAddFileToPlaylist}
+                            />
+                        ))}
+
+                        {hiddenFileCount > 0 && (
+                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                                <Button
+                                    type="button"
+                                    size="small"
+                                    variant="outlined"
+                                    onClick={() => onShowMoreFiles(item.identifier)}
+                                >
+                                    Show {Math.min(ARCHIVE_FILE_BATCH_SIZE, hiddenFileCount)} more files
+                                </Button>
+
+                                <Button
+                                    type="button"
+                                    size="small"
+                                    variant="text"
+                                    onClick={() => onShowAllFiles(item.identifier)}
+                                >
+                                    Show all {files.length} files
+                                </Button>
+                            </Stack>
+                        )}
+
+                        {visibleFiles.length > ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM && (
+                            <Button
+                                type="button"
+                                size="small"
+                                variant="text"
+                                onClick={() => onCollapseFiles(item.identifier)}
+                                sx={{ alignSelf: "flex-start" }}
+                            >
+                                Collapse file list
+                            </Button>
+                        )}
+                    </Stack>
+                </Stack>
+            </CardContent>
+        </Card>
+    );
+});
 
 export default function ArchiveAudioBrowser() {
     const restoredSessionRef = useRef(null);
@@ -1787,9 +2220,15 @@ export default function ArchiveAudioBrowser() {
     );
     const [copiedUrl, setCopiedUrl] = useState("");
     const [activeSearch, setActiveSearch] = useState(null);
+    const [visibleResultLimit, setVisibleResultLimit] = useState(
+        ARCHIVE_VISIBLE_RESULT_BATCH_SIZE
+    );
+    const [expandedFileLimits, setExpandedFileLimits] = useState({});
+    const [showOffQueryResults, setShowOffQueryResults] = useState(false);
 
     const searchRunRef = useRef(0);
     const abortControllerRef = useRef(null);
+    const sessionSaveTimerRef = useRef(null);
     const latestSearchInputRef = useRef({
         query: restoredSession.query || "old radio",
         selectedCollections:
@@ -1834,11 +2273,31 @@ export default function ArchiveAudioBrowser() {
         );
     }, [currentSearchSignature, lastSearchSignature]);
 
+    const activeResults = useMemo(() => {
+        if (!lastSearchSignature) {
+            return results;
+        }
+
+        return results.filter((item) => item.searchSignature === lastSearchSignature);
+    }, [results, lastSearchSignature]);
+
+    const matchingResults = useMemo(() => {
+        return activeResults.filter((item) => item.queryMatched !== false);
+    }, [activeResults]);
+
+    const offQueryResults = useMemo(() => {
+        return activeResults.filter((item) => item.queryMatched === false);
+    }, [activeResults]);
+
+    const visibleMatchingResults = useMemo(() => {
+        return matchingResults.slice(0, visibleResultLimit);
+    }, [matchingResults, visibleResultLimit]);
+
     const totalPlayableFiles = useMemo(() => {
-        return results.reduce((total, item) => {
+        return activeResults.reduce((total, item) => {
             return total + (Array.isArray(item.files) ? item.files.length : 0);
         }, 0);
-    }, [results]);
+    }, [activeResults]);
 
     const selectedCollectionSet = useMemo(() => {
         return new Set(selectedCollections);
@@ -1870,7 +2329,7 @@ export default function ArchiveAudioBrowser() {
         };
 
         browserSessionRef.current = snapshot;
-        writeArchiveBrowserSession(snapshot);
+        scheduleBrowserSessionWrite(snapshot);
     }, [
         query,
         selectedCollections,
@@ -1888,6 +2347,10 @@ export default function ArchiveAudioBrowser() {
     useEffect(() => {
         return () => {
             abortControllerRef.current?.abort();
+
+            if (sessionSaveTimerRef.current) {
+                window.clearTimeout(sessionSaveTimerRef.current);
+            }
         };
     }, []);
 
@@ -1906,6 +2369,22 @@ export default function ArchiveAudioBrowser() {
         }, 0);
     }, []);
 
+    function scheduleBrowserSessionWrite(snapshot, delay = 300) {
+        if (typeof window === "undefined") {
+            writeArchiveBrowserSession(snapshot);
+            return;
+        }
+
+        if (sessionSaveTimerRef.current) {
+            window.clearTimeout(sessionSaveTimerRef.current);
+        }
+
+        sessionSaveTimerRef.current = window.setTimeout(() => {
+            sessionSaveTimerRef.current = null;
+            writeArchiveBrowserSession(snapshot);
+        }, delay);
+    }
+
     function saveBrowserSnapshot(overrides = {}) {
         const latestInput = latestSearchInputRef.current;
         const snapshot = {
@@ -1919,7 +2398,7 @@ export default function ArchiveAudioBrowser() {
         };
 
         browserSessionRef.current = snapshot;
-        writeArchiveBrowserSession(snapshot);
+        scheduleBrowserSessionWrite(snapshot);
     }
 
     function stopActiveSearchAndClearResults(nextStatus = "") {
@@ -1943,6 +2422,7 @@ export default function ArchiveAudioBrowser() {
         setLastSearchSignature("");
         setCopiedUrl("");
         setActiveSearch(null);
+        resetRenderWindows();
         clearArchiveBrowserSession();
 
         setStatus(nextStatus || "");
@@ -1957,6 +2437,49 @@ export default function ArchiveAudioBrowser() {
         setCopiedUrl("");
         setActiveSearch(null);
         setStatus(nextStatus || "");
+    }
+
+    function resetRenderWindows() {
+        setVisibleResultLimit(ARCHIVE_VISIBLE_RESULT_BATCH_SIZE);
+        setExpandedFileLimits({});
+        setShowOffQueryResults(false);
+    }
+
+    function getVisibleFileLimit(item) {
+        return (
+            expandedFileLimits[item.identifier] ||
+            ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM
+        );
+    }
+
+    function showMoreFilesForItem(identifier) {
+        setExpandedFileLimits((current) => ({
+            ...current,
+            [identifier]:
+                (current[identifier] || ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM) +
+                ARCHIVE_FILE_BATCH_SIZE,
+        }));
+    }
+
+    function showAllFilesForItem(identifier) {
+        const item = activeResults.find((result) => result.identifier === identifier);
+        const fileCount = Array.isArray(item?.files) ? item.files.length : 0;
+
+        setExpandedFileLimits((current) => ({
+            ...current,
+            [identifier]: Math.max(fileCount, ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM),
+        }));
+    }
+
+    function collapseFilesForItem(identifier) {
+        setExpandedFileLimits((current) => ({
+            ...current,
+            [identifier]: ARCHIVE_INITIAL_VISIBLE_FILES_PER_ITEM,
+        }));
+    }
+
+    function showMoreResults() {
+        setVisibleResultLimit((current) => current + ARCHIVE_VISIBLE_RESULT_BATCH_SIZE);
     }
 
     function handleQueryChange(event) {
@@ -2119,11 +2642,11 @@ export default function ArchiveAudioBrowser() {
     }
 
     function addAllVisibleArchiveFilesToPlaylist() {
-        const files = results.flatMap((item) =>
+        const files = matchingResults.flatMap((item) =>
             Array.isArray(item.files) ? item.files : []
         );
 
-        addArchiveFilesToAudioPlaylist(files, "visible Archive file(s)");
+        addArchiveFilesToAudioPlaylist(files, "matching Archive file(s)");
     }
 
     async function copyText(value) {
@@ -2264,6 +2787,7 @@ export default function ArchiveAudioBrowser() {
             setCopiedUrl("");
 
             if (!isLoadMore && !keepExistingResults) {
+                resetRenderWindows();
                 setResults([]);
                 setNextCursor("");
             }
@@ -2291,7 +2815,15 @@ export default function ArchiveAudioBrowser() {
                 const progressStatus = `Loaded ${progress.accepted || 1} Archive item(s) for "${safeQuery}"${archiveRouteLabel}; inspected ${progress.inspected || 0} of ${progress.totalCandidates || 0} candidates.`;
 
                 setResults((current) => {
-                    const nextResults = mergeArchiveResults(current, stampedResult);
+                    const nextResults =
+                        isLoadMore || keepExistingResults
+                            ? mergeArchiveResults(current, stampedResult)
+                            : mergeArchiveResults(
+                                current.filter(
+                                    (item) => item.searchSignature === requestSignature
+                                ),
+                                stampedResult
+                            );
 
                     saveBrowserSnapshot({
                         results: nextResults,
@@ -2376,7 +2908,7 @@ export default function ArchiveAudioBrowser() {
                     return incomingResults;
                 }
 
-                if (isLoadMore || keepExistingResults || !data.directLinkMode) {
+                if (isLoadMore || keepExistingResults) {
                     return mergeArchiveResults(current, incomingResults);
                 }
 
@@ -2706,15 +3238,16 @@ export default function ArchiveAudioBrowser() {
                 {error && <Alert severity="error">{error}</Alert>}
                 {copiedUrl && <Alert severity="info">Copied direct audio link.</Alert>}
 
-                {!!results.length && (
+                {!!activeResults.length && (
                     <Stack
                         direction="row"
                         spacing={1}
                         flexWrap="wrap"
                         alignItems="center"
                     >
-                        <Chip label={`${results.length} item(s)`} color="primary" />
-                        <Chip label={`${totalPlayableFiles} playable file(s)`} />
+                        <Chip label={`${matchingResults.length} matching item(s)`} color="primary" />
+                        <Chip label={`${offQueryResults.length} hidden off-query item(s)`} color={offQueryResults.length ? "warning" : "default"} />
+                        <Chip label={`${totalPlayableFiles} playable file(s) loaded`} />
                         <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
                         <Chip label={`Next cursor: ${nextCursor ? "available" : "none"}`} />
                         <Button
@@ -2722,297 +3255,102 @@ export default function ArchiveAudioBrowser() {
                             size="small"
                             variant="outlined"
                             startIcon={<PlaylistAddRoundedIcon />}
+                            disabled={!matchingResults.length}
                             onClick={addAllVisibleArchiveFilesToPlaylist}
                         >
-                            Add all visible files to playlist
+                            Add matching files to playlist
                         </Button>
                     </Stack>
                 )}
 
                 <Stack spacing={2}>
-                    {results.map((item) => (
-                        <Card
+                    {visibleMatchingResults.map((item) => (
+                        <ArchiveResultCard
                             key={item.identifier}
-                            variant="outlined"
-                            sx={{
-                                borderRadius: 4,
-                                overflow: "hidden",
-                            }}
-                        >
-                            <CardContent>
-                                <Stack spacing={1.5}>
-                                    <Stack
-                                        direction={{ xs: "column", md: "row" }}
-                                        spacing={1}
-                                        justifyContent="space-between"
-                                        alignItems={{ xs: "flex-start", md: "center" }}
-                                    >
-                                        <Box>
-                                            <Typography variant="h6" sx={{ fontWeight: 950 }}>
-                                                {item.title}
-                                            </Typography>
-
-                                            <Typography variant="body2" color="text.secondary">
-                                                {item.creator || "Unknown creator"}
-                                                {item.date ? ` • ${item.date}` : ""}
-                                                {item.downloads ? ` • ${item.downloads} downloads` : ""}
-                                            </Typography>
-
-                                            <Typography variant="caption" color="text.secondary">
-                                                Loaded {Array.isArray(item.files) ? item.files.length : 0} playable file(s) from this Archive item.
-                                            </Typography>
-                                        </Box>
-
-                                        <Stack
-                                            direction={{ xs: "column", sm: "row" }}
-                                            spacing={1}
-                                            alignItems={{ xs: "stretch", sm: "center" }}
-                                        >
-                                            <Button
-                                                type="button"
-                                                size="small"
-                                                variant="outlined"
-                                                startIcon={<PlaylistAddRoundedIcon />}
-                                                disabled={!Array.isArray(item.files) || !item.files.length}
-                                                onClick={() =>
-                                                    addArchiveFilesToAudioPlaylist(
-                                                        item.files,
-                                                        `file(s) from "${item.title || item.identifier}"`
-                                                    )
-                                                }
-                                            >
-                                                Add all item files
-                                            </Button>
-
-                                            <Button
-                                                href={item.detailsUrl}
-                                                target="_blank"
-                                                rel="noreferrer"
-                                                endIcon={<OpenInNewRoundedIcon />}
-                                            >
-                                                Archive page
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-
-                                    {!!item.images?.[0] && (
-                                        <Card
-                                            variant="outlined"
-                                            sx={{
-                                                borderRadius: 3,
-                                                bgcolor: "background.default",
-                                                overflow: "hidden",
-                                            }}
-                                        >
-                                            <Box
-                                                component="img"
-                                                src={item.images[0].imageUrl || item.images[0].url}
-                                                alt={item.images[0].alt || `${item.title} Archive thumbnail`}
-                                                loading="lazy"
-                                                referrerPolicy="no-referrer"
-                                                onError={(event) => {
-                                                    event.currentTarget.style.display = "none";
-                                                }}
-                                                sx={{
-                                                    width: "100%",
-                                                    height: { xs: 220, sm: 280 },
-                                                    objectFit: "contain",
-                                                    objectPosition: "center",
-                                                    display: "block",
-                                                    bgcolor: "background.paper",
-                                                }}
-                                            />
-
-                                            <CardContent sx={{ p: 1.5, "&:last-child": { pb: 1.5 } }}>
-                                                <Stack
-                                                    direction={{ xs: "column", sm: "row" }}
-                                                    spacing={1}
-                                                    justifyContent="space-between"
-                                                    alignItems={{ xs: "flex-start", sm: "center" }}
-                                                >
-                                                    <Typography variant="body2" sx={{ fontWeight: 900 }}>
-                                                        Archive thumbnail
-                                                    </Typography>
-
-                                                    <Typography
-                                                        variant="caption"
-                                                        color="text.secondary"
-                                                        sx={{ wordBreak: "break-word" }}
-                                                    >
-                                                        {item.images[0].name || "Archive item thumbnail"}
-                                                        {item.images[0].proxied ? " • proxied" : ""}
-                                                    </Typography>
-                                                </Stack>
-                                            </CardContent>
-                                        </Card>
-                                    )}
-
-                                    {item.description && (
-                                        <Typography variant="body2" color="text.secondary">
-                                            {item.description}
-                                        </Typography>
-                                    )}
-
-                                    <Typography
-                                        variant="caption"
-                                        color={item.rightsVerified === false ? "warning.main" : "text.secondary"}
-                                    >
-                                        License / rights:{" "}
-                                        {item.license ||
-                                            (item.directUrlResult
-                                                ? "Direct URL result — rights were not verified by AudioMaster Lab. Only use audio you own or have permission to use."
-                                                : "Not listed — verify before reuse.")}
-                                    </Typography>
-
-                                    <Stack direction="row" spacing={1} flexWrap="wrap">
-                                        {item.collection.slice(0, 8).map((collection) => (
-                                            <Chip key={collection} label={collection} size="small" />
-                                        ))}
-                                    </Stack>
-
-                                    <Divider />
-
-                                    <Stack spacing={1.5}>
-                                        {item.files.map((file) => (
-                                            <Box
-                                                key={file.url}
-                                                sx={{
-                                                    p: 1.5,
-                                                    border: "1px solid",
-                                                    borderColor: file.zipInternal
-                                                        ? "warning.main"
-                                                        : "divider",
-                                                    borderRadius: 3,
-                                                    bgcolor: "background.default",
-                                                }}
-                                            >
-                                                <Stack spacing={1}>
-                                                    <Stack
-                                                        direction={{ xs: "column", sm: "row" }}
-                                                        spacing={1}
-                                                        justifyContent="space-between"
-                                                        alignItems={{ xs: "flex-start", sm: "center" }}
-                                                    >
-                                                        <Stack
-                                                            direction="row"
-                                                            spacing={1}
-                                                            alignItems="center"
-                                                            sx={{ minWidth: 0 }}
-                                                        >
-                                                            <AudiotrackRoundedIcon fontSize="small" />
-
-                                                            <Box sx={{ minWidth: 0 }}>
-                                                                <Typography
-                                                                    variant="body2"
-                                                                    sx={{
-                                                                        fontWeight: 900,
-                                                                        wordBreak: "break-word",
-                                                                    }}
-                                                                >
-                                                                    {file.name}
-                                                                </Typography>
-
-                                                                <Typography
-                                                                    variant="caption"
-                                                                    color="text.secondary"
-                                                                >
-                                                                    {formatFileLabel(file)}
-                                                                    {file.zipInternal
-                                                                        ? " • ZIP-internal path"
-                                                                        : ""}
-                                                                    {file.proxied
-                                                                        ? " • proxied"
-                                                                        : ""}
-                                                                </Typography>
-                                                            </Box>
-                                                        </Stack>
-                                                    </Stack>
-
-                                                    <audio
-                                                        controls
-                                                        preload="none"
-                                                        src={file.url}
-                                                        style={{
-                                                            width: "100%",
-                                                            display: "block",
-                                                        }}
-                                                    />
-
-                                                    <Stack
-                                                        direction={{ xs: "column", sm: "row" }}
-                                                        spacing={1}
-                                                    >
-                                                        <Button
-                                                            href={file.serveUrl || file.url}
-                                                            target="_blank"
-                                                            rel="noreferrer"
-                                                            size="small"
-                                                            variant="outlined"
-                                                            endIcon={<OpenInNewRoundedIcon />}
-                                                        >
-                                                            Open serve link
-                                                        </Button>
-
-                                                        <Button
-                                                            href={file.downloadUrl || file.url}
-                                                            target="_blank"
-                                                            rel="noreferrer"
-                                                            size="small"
-                                                            variant="outlined"
-                                                            endIcon={<OpenInNewRoundedIcon />}
-                                                        >
-                                                            Open download link
-                                                        </Button>
-
-                                                        <Button
-                                                            type="button"
-                                                            size="small"
-                                                            variant="text"
-                                                            startIcon={<ContentCopyRoundedIcon />}
-                                                            onClick={() => copyText(file.serveUrl || file.url)}
-                                                        >
-                                                            Copy serve link
-                                                        </Button>
-
-                                                        <Button
-                                                            type="button"
-                                                            size="small"
-                                                            variant="text"
-                                                            startIcon={<ContentCopyRoundedIcon />}
-                                                            onClick={() => copyText(file.downloadUrl || file.url)}
-                                                        >
-                                                            Copy download link
-                                                        </Button>
-                                                        <Button
-                                                            type="button"
-                                                            size="small"
-                                                            variant="contained"
-                                                            onClick={() => sendArchiveFileToAudioPage(file)}
-                                                            startIcon={<AudiotrackRoundedIcon />}
-                                                        >
-                                                            Save for Audio Page
-                                                        </Button>
-                                                        <Button
-                                                            type="button"
-                                                            size="small"
-                                                            variant="outlined"
-                                                            onClick={() => addArchiveFileToAudioPlaylist(file)}
-                                                            startIcon={<PlaylistAddRoundedIcon />}
-                                                        >
-                                                            Add song to playlist
-                                                        </Button>
-                                                    </Stack>
-                                                </Stack>
-                                            </Box>
-                                        ))}
-                                    </Stack>
-                                </Stack>
-                            </CardContent>
-                        </Card>
+                            item={item}
+                            visibleFileLimit={getVisibleFileLimit(item)}
+                            onShowMoreFiles={showMoreFilesForItem}
+                            onShowAllFiles={showAllFilesForItem}
+                            onCollapseFiles={collapseFilesForItem}
+                            onAddFilesToPlaylist={addArchiveFilesToAudioPlaylist}
+                            onCopyText={copyText}
+                            onSendToAudioPage={sendArchiveFileToAudioPage}
+                            onAddFileToPlaylist={addArchiveFileToAudioPlaylist}
+                        />
                     ))}
                 </Stack>
 
-                {!results.length && !loading && (
+                {matchingResults.length > visibleMatchingResults.length && (
+                    <Button
+                        type="button"
+                        variant="outlined"
+                        onClick={showMoreResults}
+                        sx={{ alignSelf: "center" }}
+                    >
+                        Show {Math.min(
+                        ARCHIVE_VISIBLE_RESULT_BATCH_SIZE,
+                        matchingResults.length - visibleMatchingResults.length
+                    )} more matching results
+                    </Button>
+                )}
+
+                {!!offQueryResults.length && (
+                    <Card variant="outlined" sx={{ borderRadius: 4, borderColor: "warning.main" }}>
+                        <CardContent>
+                            <Stack spacing={1.5}>
+                                <Stack
+                                    direction={{ xs: "column", sm: "row" }}
+                                    spacing={1}
+                                    justifyContent="space-between"
+                                    alignItems={{ xs: "flex-start", sm: "center" }}
+                                >
+                                    <Box>
+                                        <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                                            Results not strongly matching this query
+                                        </Typography>
+
+                                        <Typography variant="body2" color="text.secondary">
+                                            Hidden by default so artist searches stay clean. Open this only when you want to inspect broad Archive matches.
+                                        </Typography>
+                                    </Box>
+
+                                    <Button
+                                        type="button"
+                                        variant={showOffQueryResults ? "contained" : "outlined"}
+                                        color="warning"
+                                        onClick={() => setShowOffQueryResults((value) => !value)}
+                                    >
+                                        {showOffQueryResults
+                                            ? "Hide off-query results"
+                                            : `View ${offQueryResults.length} off-query result(s)`}
+                                    </Button>
+                                </Stack>
+
+                                <Collapse in={showOffQueryResults} timeout="auto" unmountOnExit>
+                                    <Stack spacing={2} sx={{ mt: 1.5 }}>
+                                        {offQueryResults.map((item) => (
+                                            <ArchiveResultCard
+                                                key={item.identifier}
+                                                item={item}
+                                                offQuery
+                                                visibleFileLimit={getVisibleFileLimit(item)}
+                                                onShowMoreFiles={showMoreFilesForItem}
+                                                onShowAllFiles={showAllFilesForItem}
+                                                onCollapseFiles={collapseFilesForItem}
+                                                onAddFilesToPlaylist={addArchiveFilesToAudioPlaylist}
+                                                onCopyText={copyText}
+                                                onSendToAudioPage={sendArchiveFileToAudioPage}
+                                                onAddFileToPlaylist={addArchiveFileToAudioPlaylist}
+                                            />
+                                        ))}
+                                    </Stack>
+                                </Collapse>
+                            </Stack>
+                        </CardContent>
+                    </Card>
+                )}
+
+                {!activeResults.length && !loading && (
                     <Card variant="outlined" sx={{ borderRadius: 4 }}>
                         <CardContent>
                             <Stack spacing={1}>
