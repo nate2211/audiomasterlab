@@ -44,6 +44,18 @@ import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import LinkRoundedIcon from "@mui/icons-material/LinkRounded";
 import ClearAllRoundedIcon from "@mui/icons-material/ClearAllRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import PauseRoundedIcon from "@mui/icons-material/PauseRounded";
+import SkipPreviousRoundedIcon from "@mui/icons-material/SkipPreviousRounded";
+import VolumeUpRoundedIcon from "@mui/icons-material/VolumeUpRounded";
+import SpeedRoundedIcon from "@mui/icons-material/SpeedRounded";
+import PictureInPictureAltRoundedIcon from "@mui/icons-material/PictureInPictureAltRounded";
+import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
+import AccessTimeRoundedIcon from "@mui/icons-material/AccessTimeRounded";
+import CalendarMonthRoundedIcon from "@mui/icons-material/CalendarMonthRounded";
+import DragIndicatorRoundedIcon from "@mui/icons-material/DragIndicatorRounded";
+import KeyboardRoundedIcon from "@mui/icons-material/KeyboardRounded";
+import KeyboardArrowUpRoundedIcon from "@mui/icons-material/KeyboardArrowUpRounded";
+import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
 
 import { Helmet } from "react-helmet-async";
 
@@ -64,6 +76,12 @@ const PLAYLIST_PAGE_SIZE = 50;
 const PLAYLIST_MAX_PAGES = 4;
 const YOUTUBE_LOCAL_SESSION_KEY = "aml_youtube_local_session_v3";
 const MAX_LOCAL_PLAYLIST_ITEMS = 300;
+const YOUTUBE_SEARCH_HISTORY_KEY = "aml_youtube_search_history_v1";
+const MAX_SEARCH_HISTORY_ITEMS = 12;
+const BROWSE_RENDER_BATCH_SIZE = 80;
+const PLAYER_TRANSITION_MS = 260;
+const PLAYER_PROGRESS_POLL_MS = 750;
+const DEFAULT_PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
 
 function getCookieValue(name) {
@@ -557,6 +575,109 @@ function safeWriteLocalStorageJson(key, value) {
     }
 }
 
+function normalizeSearchHistory(values) {
+    const output = [];
+    const seen = new Set();
+
+    (Array.isArray(values) ? values : []).forEach((value) => {
+        const clean = String(value || "").replace(/\s+/g, " ").trim().slice(0, 120);
+        const key = clean.toLowerCase();
+
+        if (!clean || seen.has(key)) return;
+
+        seen.add(key);
+        output.push(clean);
+    });
+
+    return output.slice(0, MAX_SEARCH_HISTORY_ITEMS);
+}
+
+function readSearchHistory() {
+    return normalizeSearchHistory(
+        safeReadLocalStorageJson(YOUTUBE_SEARCH_HISTORY_KEY, [])
+    );
+}
+
+function writeSearchHistory(values) {
+    const cleanHistory = normalizeSearchHistory(values);
+    safeWriteLocalStorageJson(YOUTUBE_SEARCH_HISTORY_KEY, cleanHistory);
+    return cleanHistory;
+}
+
+function addSearchHistoryItem(query, currentHistory = readSearchHistory()) {
+    const clean = String(query || "").replace(/\s+/g, " ").trim();
+
+    if (!clean || /^https?:\/\//i.test(clean)) {
+        return normalizeSearchHistory(currentHistory);
+    }
+
+    return writeSearchHistory([clean, ...currentHistory]);
+}
+
+function parseDurationLabelToSeconds(value) {
+    const clean = String(value || "").trim();
+
+    if (!clean) return 0;
+
+    const parts = clean.split(":").map((part) => Number(part));
+
+    if (parts.some((part) => !Number.isFinite(part))) {
+        return 0;
+    }
+
+    if (parts.length === 3) {
+        return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+
+    if (parts.length === 2) {
+        return parts[0] * 60 + parts[1];
+    }
+
+    return parts[0] || 0;
+}
+
+function videoMatchesDurationFilter(video, filter) {
+    if (!filter || filter === "any") return true;
+
+    const seconds = parseDurationLabelToSeconds(video?.duration);
+
+    if (!seconds) return true;
+    if (filter === "short") return seconds < 4 * 60;
+    if (filter === "medium") return seconds >= 4 * 60 && seconds <= 20 * 60;
+    if (filter === "long") return seconds > 20 * 60;
+
+    return true;
+}
+
+function videoMatchesUploadFilter(video, filter) {
+    if (!filter || filter === "any") return true;
+
+    const publishedAt = Date.parse(video?.publishedAt || "");
+
+    if (!Number.isFinite(publishedAt)) return true;
+
+    const ageDays = (Date.now() - publishedAt) / (24 * 60 * 60 * 1000);
+
+    if (filter === "week") return ageDays <= 7;
+    if (filter === "month") return ageDays <= 31;
+    if (filter === "year") return ageDays <= 366;
+
+    return true;
+}
+
+function formatPlayerTime(seconds) {
+    const cleanSeconds = Math.max(0, Math.floor(Number(seconds || 0)));
+    const hours = Math.floor(cleanSeconds / 3600);
+    const minutes = Math.floor((cleanSeconds % 3600) / 60);
+    const remainingSeconds = cleanSeconds % 60;
+
+    if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
 function normalizeStoredVideo(video) {
     if (!video?.id) return null;
 
@@ -613,6 +734,7 @@ function readYoutubeLocalSession() {
         playlist,
         playbackMode,
         activePlaylistIndex,
+        playbackPositionSeconds: Math.max(0, Number(session?.playbackPositionSeconds || 0)),
         savedAt: Number(session?.savedAt || 0),
     };
 }
@@ -624,6 +746,7 @@ function writeYoutubeLocalSession({
                                       playlist,
                                       playbackMode,
                                       activePlaylistIndex,
+                                      playbackPositionSeconds,
                                   }) {
     const cleanPlaylist = normalizeStoredPlaylist(playlist);
 
@@ -636,6 +759,7 @@ function writeYoutubeLocalSession({
         activePlaylistIndex: Number.isInteger(activePlaylistIndex)
             ? Math.min(Math.max(activePlaylistIndex, -1), cleanPlaylist.length - 1)
             : -1,
+        playbackPositionSeconds: Math.max(0, Number(playbackPositionSeconds || 0)),
         savedAt: Date.now(),
     });
 }
@@ -945,6 +1069,9 @@ export default function YoutubePage() {
     const restoredVideoCueRequestedRef = useRef(false);
     const playerReadyRef = useRef(false);
     const pendingPlayerCommandRef = useRef(null);
+    const playerTransitionTimerRef = useRef(null);
+    const playerProgressTimerRef = useRef(null);
+    const draggedPlaylistIndexRef = useRef(-1);
 
     const videosRef = useRef(
         uniqueVideosById([
@@ -1005,6 +1132,19 @@ export default function YoutubePage() {
     const [keepAwakeEnabled, setKeepAwakeEnabled] = useState(false);
     const [keepAwakeSupported, setKeepAwakeSupported] = useState(false);
     const [playerIframeReady, setPlayerIframeReady] = useState(false);
+    const [playerTransitioning, setPlayerTransitioning] = useState(false);
+    const [playerChromeVisible, setPlayerChromeVisible] = useState(false);
+    const [playerControlsOpen, setPlayerControlsOpen] = useState(false);
+    const [isPlayerPlaying, setIsPlayerPlaying] = useState(false);
+    const [playerCurrentTime, setPlayerCurrentTime] = useState(() => initialLocalSessionRef.current.playbackPositionSeconds || 0);
+    const [playerDuration, setPlayerDuration] = useState(0);
+    const [playerVolume, setPlayerVolume] = useState(80);
+    const [playbackRate, setPlaybackRate] = useState(1);
+    const [availablePlaybackRates, setAvailablePlaybackRates] = useState(DEFAULT_PLAYBACK_RATES);
+    const [browseDurationFilter, setBrowseDurationFilter] = useState("any");
+    const [browseUploadFilter, setBrowseUploadFilter] = useState("any");
+    const [browseRenderLimit, setBrowseRenderLimit] = useState(BROWSE_RENDER_BATCH_SIZE);
+    const [searchHistory, setSearchHistory] = useState(() => readSearchHistory());
 
     const [status, setStatus] = useState(() =>
         initialLocalSessionRef.current.selectedVideo || initialLocalSessionRef.current.playlist.length
@@ -1067,6 +1207,19 @@ export default function YoutubePage() {
         : videos.length
             ? `${videos.length} loaded${totalResults ? ` / ${totalResults} possible` : ""}`
             : "Search results appear here";
+    const filteredBrowseVideos = useMemo(() => {
+        return browseVideos.filter((video) => (
+            videoMatchesDurationFilter(video, browseDurationFilter) &&
+            videoMatchesUploadFilter(video, browseUploadFilter)
+        ));
+    }, [browseVideos, browseDurationFilter, browseUploadFilter]);
+    const visibleBrowseVideos = useMemo(() => (
+        filteredBrowseVideos.slice(0, browseRenderLimit)
+    ), [filteredBrowseVideos, browseRenderLimit]);
+    const hasMoreRenderedBrowseVideos = visibleBrowseVideos.length < filteredBrowseVideos.length;
+    const playerProgressPercent = playerDuration > 0
+        ? Math.min(100, Math.max(0, (playerCurrentTime / playerDuration) * 100))
+        : 0;
 
     const selectedVideoInPlaylist = useMemo(() => {
         if (!selectedVideo?.id) return false;
@@ -1081,8 +1234,9 @@ export default function YoutubePage() {
             playlist,
             playbackMode,
             activePlaylistIndex,
+            playbackPositionSeconds: selectedVideo ? playerCurrentTime : 0,
         });
-    }, [query, activeQuery, selectedVideo, playlist, playbackMode, activePlaylistIndex]);
+    }, [query, activeQuery, selectedVideo, playlist, playbackMode, activePlaylistIndex, playerCurrentTime]);
 
     useEffect(() => {
         videosRef.current = videos;
@@ -1151,13 +1305,84 @@ export default function YoutubePage() {
     }, [activeQuery]);
 
     useEffect(() => {
+        setBrowseRenderLimit(BROWSE_RENDER_BATCH_SIZE);
+    }, [activeQuery, showingRecommendations, browseDurationFilter, browseUploadFilter]);
+
+    useEffect(() => {
+        return () => {
+            if (playerTransitionTimerRef.current) {
+                window.clearTimeout(playerTransitionTimerRef.current);
+            }
+
+            if (playerProgressTimerRef.current) {
+                window.clearInterval(playerProgressTimerRef.current);
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        function handleGlobalKeyboard(event) {
+            const target = event.target;
+            const tagName = String(target?.tagName || "").toLowerCase();
+            const isTyping =
+                tagName === "input" ||
+                tagName === "textarea" ||
+                target?.isContentEditable ||
+                target?.getAttribute?.("role") === "textbox";
+
+            if (isTyping || event.altKey || event.ctrlKey || event.metaKey) return;
+
+            const key = event.key.toLowerCase();
+
+            if (event.code === "Space" || key === "k") {
+                event.preventDefault();
+                togglePlayerPlayback();
+                return;
+            }
+
+            if (key === "j") {
+                event.preventDefault();
+                seekPlayerBy(-5);
+                return;
+            }
+
+            if (key === "l") {
+                event.preventDefault();
+                seekPlayerBy(5);
+                return;
+            }
+
+            if (event.key === "ArrowLeft") {
+                event.preventDefault();
+                playPreviousVideoFromCurrentContext();
+                return;
+            }
+
+            if (event.key === "ArrowRight") {
+                event.preventDefault();
+                playNextVideoFromCurrentContext();
+            }
+        }
+
+        window.addEventListener("keydown", handleGlobalKeyboard);
+
+        return () => {
+            window.removeEventListener("keydown", handleGlobalKeyboard);
+        };
+    }, [playerCurrentTime, playerDuration, playbackMode, selectedVideo, activePlaylistIndex]);
+
+    useEffect(() => {
         function cueRestoredVideo() {
             const restoredVideo = selectedVideoRef.current;
 
             if (!restoredVideo?.id || restoredVideoCueRequestedRef.current) return;
 
             restoredVideoCueRequestedRef.current = true;
-            createOrLoadPlayer(restoredVideo.id, false, 0);
+            createOrLoadPlayer(
+                restoredVideo.id,
+                false,
+                initialLocalSessionRef.current.playbackPositionSeconds || 0
+            );
             setStatus(
                 `Restored ${restoredVideo.title || "your last YouTube video"}. Press play to continue from the saved session.`
             );
@@ -1527,10 +1752,14 @@ export default function YoutubePage() {
         function handlePointerUp() {
             window.removeEventListener("pointermove", handlePointerMove);
             window.removeEventListener("pointerup", handlePointerUp);
+            window.removeEventListener("pointercancel", handlePointerUp);
+            window.removeEventListener("blur", handlePointerUp);
         }
 
         window.addEventListener("pointermove", handlePointerMove);
         window.addEventListener("pointerup", handlePointerUp);
+        window.addEventListener("pointercancel", handlePointerUp);
+        window.addEventListener("blur", handlePointerUp);
     }
 
     function resetPlayerSize() {
@@ -1599,11 +1828,202 @@ export default function YoutubePage() {
             playerRef.current = null;
             playerReadyRef.current = false;
             setPlayerIframeReady(false);
+            setIsPlayerPlaying(false);
         }
 
         if (resetMount && playerContainerRef.current) {
             ensurePlayerMountNode(true);
         }
+    }
+
+    function refreshPlayerSnapshot(player = playerRef.current) {
+        if (!isUsableYoutubePlayer(player)) return;
+
+        try {
+            if (typeof player.getCurrentTime === "function") {
+                setPlayerCurrentTime(Number(player.getCurrentTime() || 0));
+            }
+
+            if (typeof player.getDuration === "function") {
+                setPlayerDuration(Number(player.getDuration() || 0));
+            }
+
+            if (typeof player.getVolume === "function") {
+                setPlayerVolume(Number(player.getVolume() || 0));
+            }
+
+            if (typeof player.getPlaybackRate === "function") {
+                setPlaybackRate(Number(player.getPlaybackRate() || 1));
+            }
+
+            if (typeof player.getAvailablePlaybackRates === "function") {
+                const rates = player.getAvailablePlaybackRates();
+
+                if (Array.isArray(rates) && rates.length) {
+                    setAvailablePlaybackRates(rates);
+                }
+            }
+
+            if (typeof player.getPlayerState === "function" && window.YT?.PlayerState) {
+                setIsPlayerPlaying(player.getPlayerState() === window.YT.PlayerState.PLAYING);
+            }
+        } catch {
+            // Ignore transient YouTube API reads while an iframe swaps videos.
+        }
+    }
+
+    function startPlayerProgressPolling(player = playerRef.current) {
+        if (playerProgressTimerRef.current) {
+            window.clearInterval(playerProgressTimerRef.current);
+        }
+
+        refreshPlayerSnapshot(player);
+        playerProgressTimerRef.current = window.setInterval(() => {
+            refreshPlayerSnapshot(playerRef.current);
+        }, PLAYER_PROGRESS_POLL_MS);
+    }
+
+    function togglePlayerPlayback() {
+        const player = playerRef.current;
+
+        if (!isUsableYoutubePlayer(player)) {
+            if (selectedVideoRef.current?.id) {
+                createOrLoadPlayer(selectedVideoRef.current.id, true, playerCurrentTime);
+            } else {
+                setStatus("Select a YouTube video first, then use keyboard playback controls.");
+            }
+
+            return;
+        }
+
+        try {
+            const state = typeof player.getPlayerState === "function"
+                ? player.getPlayerState()
+                : null;
+
+            if (state === window.YT?.PlayerState?.PLAYING) {
+                player.pauseVideo();
+                setIsPlayerPlaying(false);
+                setStatus("Paused YouTube playback.");
+            } else {
+                player.playVideo();
+                setIsPlayerPlaying(true);
+                setStatus("Playing YouTube video.");
+            }
+        } catch {
+            setStatus("The YouTube player did not accept the play/pause command. Tap the embedded player once and try again.");
+        }
+    }
+
+    function seekPlayerTo(seconds) {
+        const player = playerRef.current;
+
+        if (!isUsableYoutubePlayer(player)) return;
+
+        const nextTime = Math.min(
+            Math.max(0, Number(seconds || 0)),
+            playerDuration || Number.MAX_SAFE_INTEGER
+        );
+
+        try {
+            player.seekTo(nextTime, true);
+            setPlayerCurrentTime(nextTime);
+        } catch {
+            setStatus("The YouTube player could not seek right now.");
+        }
+    }
+
+    function seekPlayerBy(deltaSeconds) {
+        seekPlayerTo((playerCurrentTime || 0) + Number(deltaSeconds || 0));
+    }
+
+    function setYoutubePlayerVolume(nextVolume) {
+        const cleanVolume = Math.min(100, Math.max(0, Number(nextVolume || 0)));
+        const player = playerRef.current;
+
+        setPlayerVolume(cleanVolume);
+
+        if (!isUsableYoutubePlayer(player)) return;
+
+        try {
+            player.setVolume(cleanVolume);
+
+            if (cleanVolume > 0 && typeof player.unMute === "function") {
+                player.unMute();
+            }
+        } catch {
+            setStatus("The YouTube player could not update volume right now.");
+        }
+    }
+
+    function setYoutubePlaybackRate(rate) {
+        const cleanRate = Number(rate || 1);
+        const player = playerRef.current;
+
+        setPlaybackRate(cleanRate);
+
+        if (!isUsableYoutubePlayer(player)) return;
+
+        try {
+            player.setPlaybackRate(cleanRate);
+            setStatus(`Playback speed set to ${cleanRate}x.`);
+        } catch {
+            setStatus("This embedded YouTube video does not support that playback speed.");
+        }
+    }
+
+    async function togglePictureInPicture() {
+        const player = playerRef.current;
+
+        if (document.pictureInPictureElement) {
+            try {
+                await document.exitPictureInPicture();
+                setStatus("Picture-in-picture closed.");
+            } catch {
+                setStatus("Could not close picture-in-picture from this tab.");
+            }
+
+            return;
+        }
+
+        try {
+            const iframe = isUsableYoutubePlayer(player) ? player.getIframe() : null;
+
+            if (iframe && typeof iframe.requestPictureInPicture === "function") {
+                await iframe.requestPictureInPicture();
+                setStatus("Picture-in-picture opened.");
+                return;
+            }
+        } catch {
+            // Fall through to the practical browser limitation message below.
+        }
+
+        setStatus("Browser PiP is not exposed for this YouTube iframe. Use the YouTube player's built-in mini-player/PiP controls when available.");
+    }
+
+    function togglePlayerControls() {
+        setPlayerControlsOpen((current) => {
+            const nextOpen = !current;
+            setStatus(nextOpen ? "Custom player controls opened." : "Custom player controls hidden.");
+            return nextOpen;
+        });
+    }
+
+    function showPlayerChrome() {
+        setPlayerChromeVisible(true);
+    }
+
+    function hidePlayerChrome() {
+        setPlayerChromeVisible(false);
+        setPlayerControlsOpen(false);
+    }
+
+    function handlePlayerShellBlur(event) {
+        if (event.currentTarget.contains(event.relatedTarget)) {
+            return;
+        }
+
+        hidePlayerChrome();
     }
 
     function runYoutubePlayerCommand(player, videoId, shouldPlay = true, startSeconds = 0) {
@@ -1619,6 +2039,18 @@ export default function YoutubePage() {
 
         applyIframePlaybackPermissions(player);
         setPlayerIframeReady(true);
+
+        try {
+            if (typeof player.setVolume === "function") {
+                player.setVolume(playerVolume);
+            }
+
+            if (typeof player.setPlaybackRate === "function") {
+                player.setPlaybackRate(playbackRate);
+            }
+        } catch {
+            // Volume/rate can fail during early iframe setup; polling will recover state.
+        }
 
         if (shouldPlay) {
             player.loadVideoById(commandPayload);
@@ -1718,6 +2150,7 @@ export default function YoutubePage() {
                         playerReadyRef.current = true;
                         setPlayerIframeReady(true);
                         applyIframePlaybackPermissions(event.target);
+                        startPlayerProgressPolling(event.target);
 
                         try {
                             runYoutubePlayerCommand(
@@ -1731,7 +2164,21 @@ export default function YoutubePage() {
                         }
                     },
                     onStateChange: (event) => {
+                        refreshPlayerSnapshot(event.target);
+
+                        if (event.data === window.YT.PlayerState.PLAYING) {
+                            setIsPlayerPlaying(true);
+                        }
+
+                        if (
+                            event.data === window.YT.PlayerState.PAUSED ||
+                            event.data === window.YT.PlayerState.CUED
+                        ) {
+                            setIsPlayerPlaying(false);
+                        }
+
                         if (event.data === window.YT.PlayerState.ENDED) {
+                            setIsPlayerPlaying(false);
                             handleVideoEnded(event.target);
                         }
                     },
@@ -1796,7 +2243,17 @@ export default function YoutubePage() {
             setStatus(`Browsing YouTube: ${video.title}`);
         }
 
-        createOrLoadPlayer(video.id, true, Number(options.startSeconds || 0));
+        if (playerTransitionTimerRef.current) {
+            window.clearTimeout(playerTransitionTimerRef.current);
+        }
+
+        setPlayerTransitioning(true);
+        playerTransitionTimerRef.current = window.setTimeout(() => {
+            createOrLoadPlayer(video.id, true, Number(options.startSeconds || 0));
+            playerTransitionTimerRef.current = window.setTimeout(() => {
+                setPlayerTransitioning(false);
+            }, PLAYER_TRANSITION_MS);
+        }, PLAYER_TRANSITION_MS);
     }
 
     function handleVideoEnded(player) {
@@ -1963,8 +2420,8 @@ export default function YoutubePage() {
         );
     }
 
-    async function handleSearch() {
-        const cleanQuery = query.trim();
+    async function handleSearch(submittedQuery = query) {
+        const cleanQuery = String(submittedQuery || "").trim();
 
         if (!cleanQuery) {
             setActiveQuery("");
@@ -1984,6 +2441,7 @@ export default function YoutubePage() {
             setStatus("Searching YouTube...");
             const result = await fetchYoutubeVideosBySearch(cleanQuery);
             rememberRecommendationQueries(cleanQuery);
+            setSearchHistory((current) => addSearchHistoryItem(cleanQuery, current));
             addInterestSignal(cleanQuery, 3);
             refreshInterestQueries();
 
@@ -2250,6 +2708,7 @@ export default function YoutubePage() {
 
             const result = await fetchAutoPlaylistVideos(cleanQuery, autoPlaylistLimit);
             rememberRecommendationQueries(result.queryParts);
+            setSearchHistory((current) => addSearchHistoryItem(cleanQuery, current));
             result.queryParts.forEach((part) => addInterestSignal(part, 3));
             refreshInterestQueries();
 
@@ -2336,22 +2795,27 @@ export default function YoutubePage() {
         });
     }
 
+    function runHistorySearch(historyQuery) {
+        setQuery(historyQuery);
+        handleSearch(historyQuery);
+    }
+
     function addAllVisibleToPlaylist() {
-        if (!browseVideos.length) {
+        if (!visibleBrowseVideos.length) {
             setStatus("Search, load, or browse recommended videos first.");
             return;
         }
 
         setPlaylist((current) => {
             const existingIds = new Set(current.map((item) => item.id));
-            const nextItems = browseVideos
+            const nextItems = visibleBrowseVideos
                 .filter((video) => video?.id && !existingIds.has(video.id))
                 .map((video) => ({
                     ...video,
                     playlistId: makePlaylistId(),
                 }));
 
-            setStatus(`Added ${nextItems.length} visible video(s) to the playlist.`);
+            setStatus(`Added ${nextItems.length} visible filtered video(s) to the playlist.`);
             return [...current, ...nextItems];
         });
     }
@@ -2375,6 +2839,47 @@ export default function YoutubePage() {
         });
     }
 
+    function movePlaylistItem(fromIndex, toIndex) {
+        if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+
+        setPlaylist((current) => {
+            if (fromIndex >= current.length || toIndex >= current.length) return current;
+
+            const nextList = [...current];
+            const [movedItem] = nextList.splice(fromIndex, 1);
+            nextList.splice(toIndex, 0, movedItem);
+
+            const activeId = selectedVideoRef.current?.playlistId || selectedVideoRef.current?.id;
+            const nextActiveIndex = nextList.findIndex((item) => (
+                item.playlistId === activeId || item.id === selectedVideoRef.current?.id
+            ));
+
+            if (nextActiveIndex >= 0) {
+                setActivePlaylistIndex(nextActiveIndex);
+                activePlaylistIndexRef.current = nextActiveIndex;
+            }
+
+            setStatus(`Moved playlist item to position ${toIndex + 1}.`);
+            return nextList;
+        });
+    }
+
+    function handlePlaylistDragStart(event, index) {
+        draggedPlaylistIndexRef.current = index;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", String(index));
+    }
+
+    function handlePlaylistDrop(event, index) {
+        event.preventDefault();
+
+        const fromIndex = Number(event.dataTransfer.getData("text/plain"));
+        const dragIndex = Number.isFinite(fromIndex) ? fromIndex : draggedPlaylistIndexRef.current;
+
+        movePlaylistItem(dragIndex, index);
+        draggedPlaylistIndexRef.current = -1;
+    }
+
     function clearPlaylist() {
         setPlaylist([]);
         setActivePlaylistIndex(-1);
@@ -2394,6 +2899,20 @@ export default function YoutubePage() {
             mode: "playlist",
             playlistIndex: index,
         });
+    }
+
+    function playPreviousPlaylistVideo() {
+        const list = playlistRef.current;
+
+        if (!list.length) {
+            setStatus("Playlist is empty. Add YouTube videos to playlist first.");
+            return;
+        }
+
+        const currentIndex = activePlaylistIndexRef.current;
+        const previousIndex = currentIndex > 0 ? currentIndex - 1 : list.length - 1;
+
+        playPlaylistItem(previousIndex);
     }
 
     function playNextPlaylistVideo(fromEndedEvent = false) {
@@ -2419,6 +2938,41 @@ export default function YoutubePage() {
         }
 
         playPlaylistItem(nextIndex);
+    }
+
+    function playPreviousBrowseVideoFromCurrentList() {
+        const list = activeQueryRef.current.trim() ? videosRef.current : recommendedVideosRef.current;
+        const currentId = selectedVideoRef.current?.id;
+
+        if (!list.length) {
+            setStatus("No browse videos are loaded yet.");
+            return;
+        }
+
+        const currentIndex = list.findIndex((video) => video.id === currentId);
+        const previousIndex = currentIndex > 0 ? currentIndex - 1 : list.length - 1;
+
+        loadVideo(list[previousIndex], {
+            mode: "browse",
+        });
+    }
+
+    function playNextVideoFromCurrentContext() {
+        if (playbackModeRef.current === "playlist") {
+            playNextPlaylistVideo(false);
+            return;
+        }
+
+        playNextBrowseVideoFromCurrentList();
+    }
+
+    function playPreviousVideoFromCurrentContext() {
+        if (playbackModeRef.current === "playlist") {
+            playPreviousPlaylistVideo();
+            return;
+        }
+
+        playPreviousBrowseVideoFromCurrentList();
     }
 
     function playSelectedAsBrowse() {
@@ -2484,6 +3038,25 @@ export default function YoutubePage() {
         return (
             <Box
                 key={`${source}-${video.playlistId || video.id}`}
+                role="button"
+                tabIndex={0}
+                draggable={source === "playlist"}
+                onDragStart={(event) => {
+                    if (source === "playlist") {
+                        handlePlaylistDragStart(event, index);
+                    }
+                }}
+                onDragOver={(event) => {
+                    if (source === "playlist") {
+                        event.preventDefault();
+                        event.dataTransfer.dropEffect = "move";
+                    }
+                }}
+                onDrop={(event) => {
+                    if (source === "playlist") {
+                        handlePlaylistDrop(event, index);
+                    }
+                }}
                 sx={{
                     display: "grid",
                     gridTemplateColumns: "112px minmax(0, 1fr)",
@@ -2501,19 +3074,53 @@ export default function YoutubePage() {
                         ? playPlaylistItem(index)
                         : loadVideo(video, { mode: "browse" })
                 }
+                onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        source === "playlist"
+                            ? playPlaylistItem(index)
+                            : loadVideo(video, { mode: "browse" });
+                    }
+                }}
             >
-                <Box
-                    component="img"
-                    src={video.thumbnail}
-                    alt=""
-                    sx={{
-                        width: 112,
-                        height: 64,
-                        borderRadius: 2,
-                        objectFit: "cover",
-                        background: "#000",
-                    }}
-                />
+                <Box sx={{ position: "relative", width: 112, height: 64 }}>
+                    <Box
+                        component="img"
+                        src={video.thumbnail}
+                        alt=""
+                        loading="lazy"
+                        decoding="async"
+                        sx={{
+                            width: 112,
+                            height: 64,
+                            borderRadius: 2,
+                            objectFit: "cover",
+                            background: "#000",
+                        }}
+                    />
+
+                    {source === "playlist" && (
+                        <Tooltip title="Drag to reorder playlist">
+                            <Box
+                                sx={{
+                                    position: "absolute",
+                                    left: 5,
+                                    top: 5,
+                                    width: 24,
+                                    height: 24,
+                                    borderRadius: 2,
+                                    display: "grid",
+                                    placeItems: "center",
+                                    color: "#fff",
+                                    background: "rgba(0,0,0,0.58)",
+                                    border: "1px solid rgba(255,255,255,0.18)",
+                                }}
+                            >
+                                <DragIndicatorRoundedIcon fontSize="small" />
+                            </Box>
+                        </Tooltip>
+                    )}
+                </Box>
 
                 <Box sx={{ minWidth: 0 }}>
                     <Typography
@@ -2983,14 +3590,17 @@ export default function YoutubePage() {
 
                                 <Button
                                     variant="outlined"
+                                    startIcon={<SkipPreviousRoundedIcon />}
+                                    onClick={playPreviousVideoFromCurrentContext}
+                                    sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
+                                >
+                                    Previous
+                                </Button>
+
+                                <Button
+                                    variant="outlined"
                                     startIcon={<SkipNextRoundedIcon />}
-                                    onClick={() => {
-                                        if (playbackModeRef.current === "playlist") {
-                                            playNextPlaylistVideo(false);
-                                        } else {
-                                            playNextBrowseVideoFromCurrentList();
-                                        }
-                                    }}
+                                    onClick={playNextVideoFromCurrentContext}
                                     sx={{ borderRadius: 999, color: "#fff", borderColor: "rgba(255,255,255,0.18)", fontWeight: 900 }}
                                 >
                                     Next
@@ -3042,6 +3652,24 @@ export default function YoutubePage() {
                 }}
             >
                 <Container maxWidth="xl">
+                    <Box
+                        aria-live="polite"
+                        aria-atomic="true"
+                        sx={{
+                            position: "absolute",
+                            width: 1,
+                            height: 1,
+                            p: 0,
+                            m: -1,
+                            overflow: "hidden",
+                            clip: "rect(0 0 0 0)",
+                            whiteSpace: "nowrap",
+                            border: 0,
+                        }}
+                    >
+                        {status}
+                    </Box>
+
                     <Stack spacing={3}>
                         <Card
                             elevation={0}
@@ -3081,6 +3709,16 @@ export default function YoutubePage() {
                                                 color: "#fff",
                                                 background: "rgba(167,139,250,0.12)",
                                                 border: "1px solid rgba(167,139,250,0.22)",
+                                                fontWeight: 900,
+                                            }}
+                                        />
+                                        <Chip
+                                            icon={<KeyboardRoundedIcon />}
+                                            label="Space/K play, J/L seek, arrows change video"
+                                            sx={{
+                                                color: "#fff",
+                                                background: "rgba(255,255,255,0.08)",
+                                                border: "1px solid rgba(255,255,255,0.12)",
                                                 fontWeight: 900,
                                             }}
                                         />
@@ -3167,6 +3805,36 @@ export default function YoutubePage() {
                                             Settings
                                         </Button>
                                     </Stack>
+
+                                    {searchHistory.length > 0 && (
+                                        <Stack direction="row" alignItems="center" flexWrap="wrap" gap={0.75}>
+                                            <Chip
+                                                icon={<HistoryRoundedIcon />}
+                                                label="Recent searches"
+                                                sx={{
+                                                    color: "#fff",
+                                                    background: "rgba(255,255,255,0.08)",
+                                                    border: "1px solid rgba(255,255,255,0.1)",
+                                                    fontWeight: 900,
+                                                }}
+                                            />
+
+                                            {searchHistory.slice(0, 8).map((historyQuery) => (
+                                                <Chip
+                                                    key={historyQuery}
+                                                    label={historyQuery}
+                                                    onClick={() => runHistorySearch(historyQuery)}
+                                                    sx={{
+                                                        color: "#fff",
+                                                        background: "rgba(103,232,249,0.1)",
+                                                        border: "1px solid rgba(103,232,249,0.18)",
+                                                        fontWeight: 850,
+                                                        maxWidth: 220,
+                                                    }}
+                                                />
+                                            ))}
+                                        </Stack>
+                                    )}
                                 </Stack>
                             </CardContent>
                         </Card>
@@ -3194,12 +3862,18 @@ export default function YoutubePage() {
                                     `Player: ${playerBoxSize.width || "auto"}px × ${Math.round(playerHeight)}px • ${playerWideLayout ? "wide/theater layout" : "split layout"}`,
                                     <Card
                                         elevation={0}
+                                        onMouseEnter={showPlayerChrome}
+                                        onMouseLeave={hidePlayerChrome}
+                                        onPointerDown={showPlayerChrome}
+                                        onFocus={showPlayerChrome}
+                                        onBlur={handlePlayerShellBlur}
                                         sx={{
                                             borderRadius: 5,
                                             background: "rgba(0,0,0,0.24)",
                                             border: "1px solid rgba(255,255,255,0.1)",
                                             overflow: "hidden",
                                             position: "relative",
+                                            pb: "18px",
                                         }}
                                     >
                                         <Box
@@ -3229,6 +3903,8 @@ export default function YoutubePage() {
                                                     height: "100%",
                                                     zIndex: 2,
                                                     background: "transparent",
+                                                    opacity: playerTransitioning ? 0.18 : 1,
+                                                    transition: `opacity ${PLAYER_TRANSITION_MS}ms ease`,
                                                     "& iframe": {
                                                         width: "100% !important",
                                                         height: "100% !important",
@@ -3271,8 +3947,148 @@ export default function YoutubePage() {
                                                         border: 0,
                                                         zIndex: 1,
                                                         background: "#000",
+                                                        opacity: playerTransitioning ? 0.18 : 1,
+                                                        transition: `opacity ${PLAYER_TRANSITION_MS}ms ease`,
                                                     }}
                                                 />
+                                            )}
+
+                                            {selectedVideo?.id && (
+                                                <Box
+                                                    sx={{
+                                                        position: "absolute",
+                                                        left: 12,
+                                                        right: { xs: 12, sm: 66 },
+                                                        bottom: 58,
+                                                        zIndex: 5,
+                                                        borderRadius: 3,
+                                                        p: { xs: 1, md: 1.15 },
+                                                        background: "linear-gradient(180deg, rgba(2,6,23,0.82), rgba(2,6,23,0.64))",
+                                                        border: "1px solid rgba(255,255,255,0.14)",
+                                                        boxShadow: "0 16px 40px rgba(0,0,0,0.36)",
+                                                        backdropFilter: "blur(12px)",
+                                                        opacity: playerControlsOpen ? 1 : 0,
+                                                        pointerEvents: playerControlsOpen ? "auto" : "none",
+                                                        transform: playerControlsOpen ? "translateY(0)" : "translateY(calc(100% + 90px))",
+                                                        transition: "opacity 220ms ease, transform 260ms ease",
+                                                    }}
+                                                >
+                                                    <Stack spacing={0.8}>
+                                                        <Stack direction="row" alignItems="center" spacing={1}>
+                                                            <Tooltip title={isPlayerPlaying ? "Pause (Space or K)" : "Play (Space or K)"}>
+                                                                <IconButton
+                                                                    aria-label={isPlayerPlaying ? "Pause YouTube video" : "Play YouTube video"}
+                                                                    size="small"
+                                                                    onClick={togglePlayerPlayback}
+                                                                    sx={{ color: "#fff", border: "1px solid rgba(255,255,255,0.16)" }}
+                                                                >
+                                                                    {isPlayerPlaying ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />}
+                                                                </IconButton>
+                                                            </Tooltip>
+
+                                                            <Tooltip title="Previous video (Left arrow)">
+                                                                <IconButton
+                                                                    aria-label="Previous video"
+                                                                    size="small"
+                                                                    onClick={playPreviousVideoFromCurrentContext}
+                                                                    sx={{ color: "#fff", border: "1px solid rgba(255,255,255,0.16)" }}
+                                                                >
+                                                                    <SkipPreviousRoundedIcon />
+                                                                </IconButton>
+                                                            </Tooltip>
+
+                                                            <Tooltip title="Next video (Right arrow)">
+                                                                <IconButton
+                                                                    aria-label="Next video"
+                                                                    size="small"
+                                                                    onClick={playNextVideoFromCurrentContext}
+                                                                    sx={{ color: "#fff", border: "1px solid rgba(255,255,255,0.16)" }}
+                                                                >
+                                                                    <SkipNextRoundedIcon />
+                                                                </IconButton>
+                                                            </Tooltip>
+
+                                                            <Typography variant="caption" sx={{ color: "rgba(255,255,255,0.78)", minWidth: 92, fontWeight: 850 }}>
+                                                                {formatPlayerTime(playerCurrentTime)} / {formatPlayerTime(playerDuration)}
+                                                            </Typography>
+
+                                                            <Slider
+                                                                size="small"
+                                                                aria-label="YouTube playback position"
+                                                                value={playerProgressPercent}
+                                                                min={0}
+                                                                max={100}
+                                                                step={0.1}
+                                                                onChange={(_, nextValue) => {
+                                                                    const percent = Array.isArray(nextValue) ? nextValue[0] : nextValue;
+                                                                    const nextTime = playerDuration ? (percent / 100) * playerDuration : 0;
+                                                                    setPlayerCurrentTime(nextTime);
+                                                                }}
+                                                                onChangeCommitted={(_, nextValue) => {
+                                                                    const percent = Array.isArray(nextValue) ? nextValue[0] : nextValue;
+                                                                    seekPlayerTo(playerDuration ? (percent / 100) * playerDuration : 0);
+                                                                }}
+                                                                sx={{ color: "#67e8f9", flex: 1, minWidth: 90 }}
+                                                            />
+
+                                                            <Tooltip title="Picture-in-picture">
+                                                                <IconButton
+                                                                    aria-label="Toggle picture in picture"
+                                                                    size="small"
+                                                                    onClick={togglePictureInPicture}
+                                                                    sx={{ color: "#fff", border: "1px solid rgba(255,255,255,0.16)" }}
+                                                                >
+                                                                    <PictureInPictureAltRoundedIcon />
+                                                                </IconButton>
+                                                            </Tooltip>
+                                                        </Stack>
+
+                                                        <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
+                                                            <Stack direction="row" alignItems="center" spacing={0.75} sx={{ minWidth: { xs: "100%", sm: 190 }, flex: { xs: "1 1 100%", sm: "0 0 190px" } }}>
+                                                                <VolumeUpRoundedIcon fontSize="small" sx={{ color: "rgba(255,255,255,0.76)" }} />
+                                                                <Slider
+                                                                    size="small"
+                                                                    aria-label="YouTube volume"
+                                                                    value={playerVolume}
+                                                                    min={0}
+                                                                    max={100}
+                                                                    step={1}
+                                                                    onChange={(_, nextValue) => {
+                                                                        const value = Array.isArray(nextValue) ? nextValue[0] : nextValue;
+                                                                        setYoutubePlayerVolume(value);
+                                                                    }}
+                                                                    sx={{ color: "#a78bfa" }}
+                                                                />
+                                                            </Stack>
+
+                                                            <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap">
+                                                                <SpeedRoundedIcon fontSize="small" sx={{ color: "rgba(255,255,255,0.76)" }} />
+                                                                {availablePlaybackRates.map((rate) => (
+                                                                    <Button
+                                                                        key={rate}
+                                                                        size="small"
+                                                                        variant={Number(playbackRate) === Number(rate) ? "contained" : "outlined"}
+                                                                        onClick={() => setYoutubePlaybackRate(rate)}
+                                                                        sx={{
+                                                                            minWidth: 44,
+                                                                            px: 1,
+                                                                            py: 0.2,
+                                                                            borderRadius: 999,
+                                                                            color: Number(playbackRate) === Number(rate) ? "#06111e" : "#fff",
+                                                                            borderColor: "rgba(255,255,255,0.18)",
+                                                                            background: Number(playbackRate) === Number(rate)
+                                                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                                                : "transparent",
+                                                                            fontWeight: 950,
+                                                                        }}
+                                                                    >
+                                                                        {rate}x
+                                                                    </Button>
+                                                                ))}
+                                                            </Stack>
+                                                        </Stack>
+                                                    </Stack>
+                                                </Box>
                                             )}
 
                                             <Tooltip title="Drag to resize the video window">
@@ -3295,12 +4111,52 @@ export default function YoutubePage() {
                                                         zIndex: 4,
                                                         userSelect: "none",
                                                         touchAction: "none",
+                                                        opacity: playerChromeVisible ? 1 : 0,
+                                                        pointerEvents: playerChromeVisible ? "auto" : "none",
+                                                        transition: "opacity 180ms ease",
                                                     }}
                                                 >
                                                     <OpenWithRoundedIcon />
                                                 </Box>
                                             </Tooltip>
                                         </Box>
+
+                                        {selectedVideo?.id && (
+                                            <Tooltip title={playerControlsOpen ? "Hide custom controls" : "Show custom controls"}>
+                                                <IconButton
+                                                    onClick={togglePlayerControls}
+                                                    aria-expanded={playerControlsOpen}
+                                                    aria-label={playerControlsOpen ? "Hide custom player controls" : "Show custom player controls"}
+                                                    sx={{
+                                                        position: "absolute",
+                                                        left: "50%",
+                                                        bottom: -18,
+                                                        transform: "translateX(-50%)",
+                                                        zIndex: 7,
+                                                        width: 74,
+                                                        height: 38,
+                                                        borderRadius: "999px 999px 0 0",
+                                                        color: "#06111e",
+                                                        background: "linear-gradient(135deg, rgba(103,232,249,0.98), rgba(167,139,250,0.98))",
+                                                        boxShadow: "0 -10px 28px rgba(0,0,0,0.42)",
+                                                        border: "1px solid rgba(255,255,255,0.26)",
+                                                        borderBottom: 0,
+                                                        opacity: playerChromeVisible || playerControlsOpen ? 1 : 0,
+                                                        pointerEvents: playerChromeVisible || playerControlsOpen ? "auto" : "none",
+                                                        transition: "opacity 180ms ease, background 160ms ease",
+                                                        "& svg": {
+                                                            fontSize: 24,
+                                                            transform: playerControlsOpen ? "translateY(-4px)" : "translateY(-5px)",
+                                                        },
+                                                        "&:hover": {
+                                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                        },
+                                                    }}
+                                                >
+                                                    {playerControlsOpen ? <KeyboardArrowDownRoundedIcon /> : <KeyboardArrowUpRoundedIcon />}
+                                                </IconButton>
+                                            </Tooltip>
+                                        )}
                                     </Card>
                                 )}
 
@@ -3545,7 +4401,7 @@ export default function YoutubePage() {
                                                     variant="outlined"
                                                     startIcon={<PlaylistAddRoundedIcon />}
                                                     onClick={addAllVisibleToPlaylist}
-                                                    disabled={!browseVideos.length}
+                                                    disabled={!visibleBrowseVideos.length}
                                                     sx={{
                                                         borderRadius: 999,
                                                         color: "#fff",
@@ -3560,7 +4416,68 @@ export default function YoutubePage() {
 
                                         <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
 
-                                        {!browseVideos.length ? (
+                                        <Stack direction="row" alignItems="center" flexWrap="wrap" gap={0.75}>
+                                            <Chip
+                                                icon={<AccessTimeRoundedIcon />}
+                                                label="Duration"
+                                                sx={{ color: "#fff", background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.1)", fontWeight: 900 }}
+                                            />
+                                            {[
+                                                ["any", "Any"],
+                                                ["short", "Short"],
+                                                ["medium", "Medium"],
+                                                ["long", "Long"],
+                                            ].map(([value, label]) => (
+                                                <Chip
+                                                    key={value}
+                                                    label={label}
+                                                    onClick={() => setBrowseDurationFilter(value)}
+                                                    sx={{
+                                                        color: browseDurationFilter === value ? "#06111e" : "#fff",
+                                                        background: browseDurationFilter === value
+                                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                            : "rgba(255,255,255,0.06)",
+                                                        border: "1px solid rgba(255,255,255,0.12)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                />
+                                            ))}
+
+                                            <Chip
+                                                icon={<CalendarMonthRoundedIcon />}
+                                                label="Upload"
+                                                sx={{ color: "#fff", background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.1)", fontWeight: 900, ml: { xs: 0, md: 1 } }}
+                                            />
+                                            {[
+                                                ["any", "Any"],
+                                                ["week", "Week"],
+                                                ["month", "Month"],
+                                                ["year", "Year"],
+                                            ].map(([value, label]) => (
+                                                <Chip
+                                                    key={value}
+                                                    label={label}
+                                                    onClick={() => setBrowseUploadFilter(value)}
+                                                    sx={{
+                                                        color: browseUploadFilter === value ? "#06111e" : "#fff",
+                                                        background: browseUploadFilter === value
+                                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                            : "rgba(255,255,255,0.06)",
+                                                        border: "1px solid rgba(255,255,255,0.12)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                />
+                                            ))}
+
+                                            {filteredBrowseVideos.length !== browseVideos.length && (
+                                                <Chip
+                                                    label={`${filteredBrowseVideos.length} match filters`}
+                                                    sx={{ color: "#67e8f9", background: "rgba(103,232,249,0.1)", border: "1px solid rgba(103,232,249,0.18)", fontWeight: 900 }}
+                                                />
+                                            )}
+                                        </Stack>
+
+                                        {!filteredBrowseVideos.length ? (
                                             <Box
                                                 sx={{
                                                     minHeight: 140,
@@ -3579,14 +4496,31 @@ export default function YoutubePage() {
                                                         {showingRecommendations
                                                             ? savedQueryRecommendationsReady
                                                                 ? "Loading videos from saved cookie queries, or press Refresh saved feed."
-                                                                : "Loading recommended videos from YouTube, or press Refresh recommended."
+                                                                : browseVideos.length
+                                                                    ? "No loaded videos match those filters. Clear filters or load more results."
+                                                                    : "Loading recommended videos from YouTube, or press Refresh recommended."
                                                             : "Search YouTube or load a direct YouTube link."}
                                                     </Typography>
                                                 </Stack>
                                             </Box>
                                         ) : (
                                             <Stack spacing={1.2}>
-                                                {browseVideos.map((video) => renderVideoCard(video, "browse"))}
+                                                {visibleBrowseVideos.map((video) => renderVideoCard(video, "browse"))}
+
+                                                {hasMoreRenderedBrowseVideos && (
+                                                    <Button
+                                                        variant="outlined"
+                                                        onClick={() => setBrowseRenderLimit((current) => current + BROWSE_RENDER_BATCH_SIZE)}
+                                                        sx={{
+                                                            borderRadius: 999,
+                                                            color: "#fff",
+                                                            borderColor: "rgba(255,255,255,0.18)",
+                                                            fontWeight: 900,
+                                                        }}
+                                                    >
+                                                        Render {Math.min(BROWSE_RENDER_BATCH_SIZE, filteredBrowseVideos.length - visibleBrowseVideos.length)} more filtered videos
+                                                    </Button>
+                                                )}
 
                                                 <Box
                                                     ref={loadMoreSentinelRef}

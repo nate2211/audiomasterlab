@@ -25,7 +25,6 @@ import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
 import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
-import { useNavigate } from "react-router-dom";
 import {Helmet} from "react-helmet-async";
 const AUDIO_EXTENSIONS = [
     ".mp3",
@@ -1624,8 +1623,6 @@ export default function ArchiveAudioBrowser() {
     const [useArchiveProxy, setUseArchiveProxy] = useState(readArchiveProxySetting);
     const [copiedUrl, setCopiedUrl] = useState("");
 
-    const navigate = useNavigate();
-
     const searchRunRef = useRef(0);
     const abortControllerRef = useRef(null);
     const latestSearchInputRef = useRef({
@@ -1710,14 +1707,24 @@ export default function ArchiveAudioBrowser() {
         setStatus(nextStatus || "");
     }
 
+    function stopActiveSearchAndKeepResults(nextStatus = "") {
+        abortControllerRef.current?.abort();
+        searchRunRef.current += 1;
+
+        setLoading(false);
+        setNextCursor("");
+        setCopiedUrl("");
+        setStatus(nextStatus || "");
+    }
+
     function handleQueryChange(event) {
         const nextQuery = event.target.value;
 
         setQuery(nextQuery);
         setError("");
-        stopActiveSearchAndClearResults(
+        stopActiveSearchAndKeepResults(
             nextQuery.trim()
-                ? "New query typed. Press Search Archive Audio to refresh results."
+                ? "New query typed. Press Search Archive Audio when ready."
                 : ""
         );
     }
@@ -1728,22 +1735,22 @@ export default function ArchiveAudioBrowser() {
             : [...selectedCollections, collectionId];
 
         setSelectedCollections(nextSelected);
-        stopActiveSearchAndClearResults(
-            "Collection filters changed. Press Search Archive Audio to refresh results."
+        stopActiveSearchAndKeepResults(
+            "Collection filters changed. Press Search Archive Audio when ready."
         );
     }
 
     function resetCollections() {
         setSelectedCollections(DEFAULT_SELECTED_COLLECTIONS);
-        stopActiveSearchAndClearResults(
-            "Collection filters reset. Press Search Archive Audio to refresh results."
+        stopActiveSearchAndKeepResults(
+            "Collection filters reset. Press Search Archive Audio when ready."
         );
     }
 
     function handleAllowZipInternalPathsChange(event) {
         setAllowZipInternalPaths(event.target.checked);
-        stopActiveSearchAndClearResults(
-            "ZIP-internal path setting changed. Press Search Archive Audio to refresh results."
+        stopActiveSearchAndKeepResults(
+            "ZIP-internal path setting changed. Press Search Archive Audio when ready."
         );
     }
 
@@ -1752,10 +1759,10 @@ export default function ArchiveAudioBrowser() {
 
         setUseArchiveProxy(enabled);
         writeArchiveProxySetting(enabled);
-        stopActiveSearchAndClearResults(
+        stopActiveSearchAndKeepResults(
             enabled
-                ? "Archive proxy enabled. Press Search Archive Audio to refresh search, metadata, and audio links through the proxy."
-                : "Archive proxy disabled. Press Search Archive Audio to refresh direct Archive.org results."
+                ? "Archive proxy enabled. Press Search Archive Audio when ready."
+                : "Archive proxy disabled. Press Search Archive Audio when ready."
         );
     }
 
@@ -1916,7 +1923,9 @@ export default function ArchiveAudioBrowser() {
             // Query param still works even if localStorage is blocked.
         }
 
-        navigate(`/audio?url=${encodeURIComponent(selectedUrl)}`);
+
+        setError("");
+        setStatus("Saved this Archive audio link for the Audio page without leaving or refreshing this page.");
     }
 
     async function runSearch(loadMore = false) {
@@ -2099,7 +2108,7 @@ export default function ArchiveAudioBrowser() {
                 setNextCursor("");
                 setError("");
                 setStatus(
-                    "Archive rejected the saved cursor, so Load More was reset. Your current results are still valid; press Search Archive Audio to refresh."
+                    "Archive rejected the saved cursor, so Load More was reset. Your current results are still valid; press Search Archive Audio to run a fresh first page."
                 );
                 return;
             }
@@ -2136,8 +2145,32 @@ export default function ArchiveAudioBrowser() {
         };
     }
 
+    function preventPageRefresh(event) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+    }
+
+    function handleSearchSubmit(event) {
+        preventPageRefresh(event);
+        runSearch(false);
+    }
+
+    function handleSearchButtonClick(event) {
+        preventPageRefresh(event);
+        runSearch(false);
+    }
+
+    function handleLoadMoreButtonClick(event) {
+        preventPageRefresh(event);
+        runSearch(true);
+    }
+
     return (
-        <Box sx={{ p: { xs: 2, md: 4 }, maxWidth: 1240, mx: "auto" }}>
+        <Box
+            component="main"
+            sx={{ p: { xs: 2, md: 4 }, maxWidth: 1240, mx: "auto" }}
+            onSubmit={preventPageRefresh}
+        >
             <Helmet>
                 <title>Archive Audio Browser | AudioMaster Lab</title>
                 <meta
@@ -2187,7 +2220,11 @@ export default function ArchiveAudioBrowser() {
                         borderRadius: 4,
                     }}
                 >
-                    <CardContent>
+                    <CardContent
+                        component="form"
+                        noValidate
+                        onSubmit={handleSearchSubmit}
+                    >
                         <Stack spacing={2.5}>
                             <TextField
                                 label="Search safe Archive audio"
@@ -2195,17 +2232,22 @@ export default function ArchiveAudioBrowser() {
                                 onChange={handleQueryChange}
                                 onKeyDown={(event) => {
                                     if (event.key === "Enter") {
-                                        event.preventDefault();
+                                        preventPageRefresh(event);
                                         runSearch(false);
                                     }
                                 }}
                                 placeholder="old radio, public domain jazz, speeches, librivox, live concert..."
                                 fullWidth
                                 helperText="Avoid leaked, unreleased, bootleg, full album, discography, or commercial artist discovery searches."
+                                inputProps={{
+                                    enterKeyHint: "search",
+                                    autoComplete: "off",
+                                }}
                             />
 
                             <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
                                 <Button
+                                    type="button"
                                     variant="contained"
                                     size="large"
                                     startIcon={
@@ -2215,22 +2257,24 @@ export default function ArchiveAudioBrowser() {
                                             <SearchRoundedIcon />
                                         )
                                     }
-                                    disabled={false}
-                                    onClick={() => runSearch(false)}
+                                    disabled={loading}
+                                    onClick={handleSearchButtonClick}
                                 >
                                     Search Archive Audio
                                 </Button>
 
                                 <Button
+                                    type="button"
                                     variant="outlined"
                                     size="large"
                                     disabled={loading || !nextCursor || hasUnsubmittedSearchChanges}
-                                    onClick={() => runSearch(true)}
+                                    onClick={handleLoadMoreButtonClick}
                                 >
                                     Load More
                                 </Button>
 
                                 <Button
+                                    type="button"
                                     variant="text"
                                     size="large"
                                     startIcon={<RestartAltRoundedIcon />}
@@ -2255,7 +2299,7 @@ export default function ArchiveAudioBrowser() {
                                         Safe collection filters
                                     </Typography>
 
-                                    <Button size="small" onClick={resetCollections}>
+                                    <Button type="button" size="small" onClick={resetCollections}>
                                         Reset collections
                                     </Button>
                                 </Stack>
@@ -2370,6 +2414,7 @@ export default function ArchiveAudioBrowser() {
                         <Chip label={`Proxy: ${useArchiveProxy ? "on" : "off"}`} />
                         <Chip label={`Next cursor: ${nextCursor ? "available" : "none"}`} />
                         <Button
+                            type="button"
                             size="small"
                             variant="outlined"
                             startIcon={<PlaylistAddRoundedIcon />}
@@ -2420,6 +2465,7 @@ export default function ArchiveAudioBrowser() {
                                             alignItems={{ xs: "stretch", sm: "center" }}
                                         >
                                             <Button
+                                                type="button"
                                                 size="small"
                                                 variant="outlined"
                                                 startIcon={<PlaylistAddRoundedIcon />}
@@ -2615,6 +2661,7 @@ export default function ArchiveAudioBrowser() {
                                                         </Button>
 
                                                         <Button
+                                                            type="button"
                                                             size="small"
                                                             variant="text"
                                                             startIcon={<ContentCopyRoundedIcon />}
@@ -2624,6 +2671,7 @@ export default function ArchiveAudioBrowser() {
                                                         </Button>
 
                                                         <Button
+                                                            type="button"
                                                             size="small"
                                                             variant="text"
                                                             startIcon={<ContentCopyRoundedIcon />}
@@ -2632,14 +2680,16 @@ export default function ArchiveAudioBrowser() {
                                                             Copy download link
                                                         </Button>
                                                         <Button
+                                                            type="button"
                                                             size="small"
                                                             variant="contained"
                                                             onClick={() => sendArchiveFileToAudioPage(file)}
                                                             startIcon={<AudiotrackRoundedIcon />}
                                                         >
-                                                            Load in Audio Page
+                                                            Save for Audio Page
                                                         </Button>
                                                         <Button
+                                                            type="button"
                                                             size="small"
                                                             variant="outlined"
                                                             onClick={() => addArchiveFileToAudioPlaylist(file)}
@@ -2682,8 +2732,8 @@ export default function ArchiveAudioBrowser() {
                                             onClick={() => {
                                                 setQuery(suggestion);
                                                 setError("");
-                                                stopActiveSearchAndClearResults(
-                                                    "Suggestion selected. Press Search Archive Audio to refresh results."
+                                                stopActiveSearchAndKeepResults(
+                                                    "Suggestion selected. Press Search Archive Audio when ready."
                                                 );
                                             }}
                                             clickable

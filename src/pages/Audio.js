@@ -3482,6 +3482,7 @@ export default function Audio() {
     const mediaPositionRef = useRef(0);
     const lastMediaSessionSeekAtRef = useRef(0);
     const pendingMediaSessionSeekRef = useRef(null);
+    const mediaSessionFastSeekCommitTimerRef = useRef(null);
     const lastMediaSessionPositionPushAtRef = useRef(0);
     const lastMediaSessionPositionSnapshotRef = useRef({
         duration: 0,
@@ -3540,7 +3541,6 @@ export default function Audio() {
     const [isPostingCommunityPost, setIsPostingCommunityPost] = useState(false);
     const [playlistPreloadSummary, setPlaylistPreloadSummary] = useState("");
     const [isPlaying, setIsPlaying] = useState(false);
-    const [isPauseUiSettling, setIsPauseUiSettling] = useState(false);
     const [isScrubbing, setIsScrubbing] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
     const [bufferReady, setBufferReady] = useState(false);
@@ -3788,6 +3788,7 @@ export default function Audio() {
             clearCarPlayRecoveryTimer();
             clearPauseReleaseTimer();
             clearPauseUiQuietTimer();
+            clearMediaSessionFastSeekCommitTimer();
             clearMediaSession();
             stopCommunityListeningHeartbeat(true);
 
@@ -4140,7 +4141,6 @@ export default function Audio() {
         }
 
         isPauseUiSettlingRef.current = safeValue;
-        setIsPauseUiSettling(safeValue);
     }
 
     function clearPauseUiQuietTimer() {
@@ -4940,6 +4940,73 @@ export default function Audio() {
         return safeBaseVolume;
     }
 
+    function getSafeAudibleBaseVolume(nodes = liveNodesRef.current) {
+        const safeSettings = normalizeSettings(latestSettingsRef.current);
+
+        return Math.max(
+            0.01,
+            nodes?.carPlaySafeMode
+                ? Math.min(safeSettings.baseVolume, 1)
+                : safeSettings.baseVolume
+        );
+    }
+
+    function prepareOutputForGlitchlessSourceStart(context = audioContextRef.current, nodes = liveNodesRef.current) {
+        const now = context?.currentTime || 0;
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(monitorMuteGainRef.current.gain, 0, now, 0);
+            }
+        } catch {
+            // Start pre-silence is best-effort only.
+        }
+
+        try {
+            if (nodes?.baseVolumeGain?.gain) {
+                setAudioParam(nodes.baseVolumeGain.gain, 0, now, 0);
+            }
+        } catch {
+            // Start pre-silence is best-effort only.
+        }
+    }
+
+    function releaseOutputAfterGlitchlessSourceStart(context = audioContextRef.current, nodes = liveNodesRef.current, options = {}) {
+        if (!context || !nodes) {
+            return;
+        }
+
+        const now = context.currentTime || 0;
+        const rampSeconds = Math.max(0.025, Number(options.rampSeconds) || 0.07);
+        const safeBaseVolume = getSafeAudibleBaseVolume(nodes);
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(
+                    monitorMuteGainRef.current.gain,
+                    mutedRef.current ? 0 : 1,
+                    now,
+                    rampSeconds
+                );
+            }
+        } catch {
+            // Start ramp is best-effort only.
+        }
+
+        try {
+            if (nodes.baseVolumeGain?.gain) {
+                setAudioParam(
+                    nodes.baseVolumeGain.gain,
+                    safeBaseVolume,
+                    now,
+                    rampSeconds
+                );
+            }
+        } catch {
+            // Start ramp is best-effort only.
+        }
+    }
+
     function attachOutputElementToCurrentStream(element = outputAudioRef.current, forcedStream = null) {
         if (!element || !isIOSAudioDevice()) {
             return false;
@@ -5124,7 +5191,11 @@ export default function Audio() {
                 // Safe to ignore unsupported element mutations.
             }
 
-            forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
+            releaseOutputAfterGlitchlessSourceStart(context, liveNodesRef.current, {
+                rampSeconds: options.fromMediaSession || options.forceIPhoneOutputPostStart
+                    ? 0.09
+                    : 0.06,
+            });
 
             if (
                 element.paused ||
@@ -5593,6 +5664,7 @@ export default function Audio() {
             durationValue
         );
         const wasPlaying = Boolean(playingRef.current);
+        const isFastSeek = Boolean(details.fastSeek);
         let outputAlreadyRestarted = false;
 
         lastMediaSessionSeekAtRef.current = Date.now();
@@ -5607,9 +5679,52 @@ export default function Audio() {
             forcePosition: true,
         });
 
+        if (isFastSeek) {
+            const alreadyFastSeeking = Boolean(mediaSessionFastSeekCommitTimerRef.current);
+
+            clearMediaSessionFastSeekCommitTimer();
+
+            if (!alreadyFastSeeking) {
+                wasPlayingBeforeScrubRef.current = wasPlaying;
+            }
+
+            if (wasPlaying && activeSourceRef.current) {
+                manualStopRef.current = true;
+                stopActiveSource();
+                stopPositionTimer();
+                stopVisualizer();
+
+                if (isIOSAudioDevice()) {
+                    keepIPhoneOutputElementAliveForLockScreen(
+                        "Lock-screen fast scrub is preserving the iPhone output route"
+                    ).catch(() => {
+                        iPhoneLockScreenOutputArmedRef.current = false;
+                    });
+                }
+            }
+
+            startedOffsetRef.current = nextSeekTime;
+            startedAtContextTimeRef.current = 0;
+            mediaSessionFastSeekCommitTimerRef.current = window.setTimeout(() => {
+                mediaSessionFastSeekCommitTimerRef.current = null;
+                if (pendingMediaSessionSeekRef.current !== null && scrubbingRef.current) {
+                    seekToFromMediaSession({
+                        seekTime: pendingMediaSessionSeekRef.current,
+                        fastSeek: false,
+                    }).catch(() => {});
+                }
+            }, 420);
+
+            return true;
+        }
+
+        clearMediaSessionFastSeekCommitTimer();
+
         if (isIOSAudioDevice() && wasPlaying) {
             const { context, nodes } = ensureLiveGraph();
-            forceRestoreAudibleWebAudioOutput(context, nodes);
+            releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                rampSeconds: 0.05,
+            });
             outputAlreadyRestarted = isIPhoneOutputRouteArmed();
         }
 
@@ -5620,10 +5735,12 @@ export default function Audio() {
                 outputAlreadyRestarted,
                 forceIPhoneOutputPostStart: isIOSAudioDevice() && wasPlaying,
                 keepPlayingUiDuringSeek: wasPlaying,
+                quietStatus: true,
             });
         } finally {
             scrubbingRef.current = false;
             setIsScrubbing(false);
+            wasPlayingBeforeScrubRef.current = false;
             pendingMediaSessionSeekRef.current = null;
         }
 
@@ -6275,6 +6392,13 @@ export default function Audio() {
         }
     }
 
+    function clearMediaSessionFastSeekCommitTimer() {
+        if (mediaSessionFastSeekCommitTimerRef.current) {
+            window.clearTimeout(mediaSessionFastSeekCommitTimerRef.current);
+            mediaSessionFastSeekCommitTimerRef.current = null;
+        }
+    }
+
     function getCurrentOffset() {
         const context = audioContextRef.current;
         const buffer = audioBufferRef.current;
@@ -6283,8 +6407,12 @@ export default function Audio() {
             return 0;
         }
 
-        if (!context || !playingRef.current) {
-            return clamp(startedOffsetRef.current, 0, buffer.duration);
+        if (!context || !playingRef.current || !activeSourceRef.current) {
+            const stableOffset = Number.isFinite(mediaPositionRef.current)
+                ? mediaPositionRef.current
+                : startedOffsetRef.current;
+
+            return clamp(stableOffset, 0, buffer.duration);
         }
 
         const elapsedContextSeconds =
@@ -8295,6 +8423,8 @@ export default function Audio() {
                 latestSettingsRef.current
             );
 
+            prepareOutputForGlitchlessSourceStart(context, nodes);
+
             source.onended = () => {
                 const runEndedHandler = () => {
                     handlePlaybackEnded().catch((error) => {
@@ -8318,7 +8448,11 @@ export default function Audio() {
             };
 
             source.start(0, safeOffset);
-            forceRestoreAudibleWebAudioOutput(context, nodes);
+            releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                rampSeconds: options.fromMediaSession || options.forceIPhoneOutputPostStart
+                    ? 0.09
+                    : 0.06,
+            });
 
             if (isIOSAudioDevice()) {
                 const outputConfirmed = await confirmIPhoneOutputAfterSourceStart(context, {
@@ -8360,15 +8494,17 @@ export default function Audio() {
                 );
             }
 
-            setInfo(
-                isIOSAudioDevice()
-                    ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}${
-                        carPlaySafeModeRef.current
-                            ? "CarPlay / USB safe mode is active. "
-                            : ""
-                    }Playing through the hidden iPhone media element output path. Pause hard-squelches the hidden stream volume and keep-alive carrier; lock-screen Stop resets WebAudio but keeps the hidden route attached, and lock-screen Play turns the single route back up after starting the audible source.`
-                    : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
-            );
+            if (!options.quietStatus) {
+                setInfo(
+                    isIOSAudioDevice()
+                        ? `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}${
+                            carPlaySafeModeRef.current
+                                ? "CarPlay / USB safe mode is active. "
+                                : ""
+                        }Playing through the hidden iPhone media element output path. Pause hard-squelches the hidden stream volume and keep-alive carrier; lock-screen Stop resets WebAudio but keeps the hidden route attached, and lock-screen Play turns the single route back up after starting the audible source.`
+                        : `${repeatEnabledRef.current ? "Repeat is on. " : "Repeat is off. Auto-next is armed. "}Playing through full WebAudio graph with visualizer, panning, delay, and convolution reverb.`
+                );
+            }
 
             return true;
         } catch (error) {
@@ -8402,9 +8538,17 @@ export default function Audio() {
 
         const nextOffset = getCurrentOffset();
 
-        if (isIPhone && context && context.state !== "closed") {
-            await fadeMonitorForPause(context, options.fromMediaSession ? 0.14 : 0.12);
-            holdIPhonePauseSilence(`${options.reason || "Pause"} fade completed`);
+        if (context && context.state !== "closed") {
+            await fadeMonitorForPause(
+                context,
+                isIPhone
+                    ? options.fromMediaSession ? 0.14 : 0.12
+                    : 0.08
+            );
+
+            if (isIPhone) {
+                holdIPhonePauseSilence(`${options.reason || "Pause"} fade completed`);
+            }
         }
 
         manualStopRef.current = true;
@@ -8513,19 +8657,20 @@ export default function Audio() {
                 preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                 outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                 forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
+                quietStatus: Boolean(options.quietStatus),
             });
             syncPlaybackPosition(nextOffset, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 forceMediaSession: true,
             });
             updateMediaSessionState("playing", { forcePosition: true });
-            if (!options.fromMediaSession) {
+            if (!options.fromMediaSession && !options.quietStatus) {
                 setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
             }
         } else {
             setPlayingState(false);
             updateMediaSessionState("paused", { forcePosition: true });
-            if (!options.fromMediaSession) {
+            if (!options.fromMediaSession && !options.quietStatus) {
                 setInfo(`Scrubbed to ${formatTime(nextOffset)}.`);
             }
         }
@@ -8535,8 +8680,10 @@ export default function Audio() {
 
     function handleScrubStart() {
         if (!hasMedia || isRendering || isLoading) return;
+        if (scrubbingRef.current) return;
 
         const currentOffset = getCurrentOffset();
+        const shouldKeepPlayingUi = Boolean(playingRef.current);
 
         wasPlayingBeforeScrubRef.current = playingRef.current;
         scrubbingRef.current = true;
@@ -8552,8 +8699,17 @@ export default function Audio() {
             forceMediaSession: true,
         });
 
-        setPlayingState(false);
         setIsScrubbing(true);
+
+        if (shouldKeepPlayingUi) {
+            playingRef.current = true;
+            isPlayingStateRef.current = true;
+            setIsPlaying((current) => (current ? current : true));
+            updateMediaSessionState("playing", { forcePosition: true });
+            return;
+        }
+
+        setPlayingState(false);
         updateMediaSessionState("paused", { forcePosition: true });
     }
 
@@ -8580,6 +8736,19 @@ export default function Audio() {
         const shouldResume = wasPlayingBeforeScrubRef.current;
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        let outputAlreadyRestarted = false;
+
+        if (isIOSAudioDevice() && shouldResume) {
+            try {
+                const { context, nodes } = ensureLiveGraph();
+                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                    rampSeconds: 0.05,
+                });
+                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
+            } catch {
+                outputAlreadyRestarted = false;
+            }
+        }
 
         scrubbingRef.current = false;
         wasPlayingBeforeScrubRef.current = false;
@@ -8588,8 +8757,10 @@ export default function Audio() {
 
         await seekTo(nextOffset, shouldResume, {
             preserveUnlockedOutput: isIOSAudioDevice(),
+            outputAlreadyRestarted,
             forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
             keepPlayingUiDuringSeek: shouldResume,
+            quietStatus: true,
         });
     }
 
@@ -9209,7 +9380,7 @@ export default function Audio() {
                                         )
                                     }
                                     onClick={handlePlaylistPrimaryPlay}
-                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist || isPauseUiSettling}
+                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
                                     sx={{
                                         borderRadius: 5,
                                         py: { xs: 1.9, md: 2.35 },
@@ -10098,7 +10269,7 @@ export default function Audio() {
                                             showPauseForMainControls ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
                                         }
                                         onClick={handlePlayPause}
-                                        disabled={!hasMedia || isRendering || isLoading || isPauseUiSettling}
+                                        disabled={!hasMedia || isRendering || isLoading}
                                         sx={{
                                             borderRadius: 4,
                                             py: 1.35,
