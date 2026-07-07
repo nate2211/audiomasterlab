@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
     Box,
     Button,
@@ -24,6 +24,7 @@ import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
 import SkipNextRoundedIcon from "@mui/icons-material/SkipNextRounded";
 import SkipPreviousRoundedIcon from "@mui/icons-material/SkipPreviousRounded";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
+import DragIndicatorRoundedIcon from "@mui/icons-material/DragIndicatorRounded";
 import VolumeOffRoundedIcon from "@mui/icons-material/VolumeOffRounded";
 import VolumeUpRoundedIcon from "@mui/icons-material/VolumeUpRounded";
 import VolumeDownRoundedIcon from "@mui/icons-material/VolumeDownRounded";
@@ -3785,6 +3786,17 @@ export default function Audio() {
     const latestSettingsRef = useRef(DEFAULT_SETTINGS);
     const repeatEnabledRef = useRef(false);
     const playlistRef = useRef([]);
+    const playlistDraggedItemIdRef = useRef("");
+    const playlistDragOverItemIdRef = useRef("");
+    const playlistDragDidReorderRef = useRef(false);
+    const playlistItemNodeRefs = useRef(new Map());
+    const playlistAnimationRectsRef = useRef(null);
+    const playlistPointerDragRef = useRef({
+        pointerId: null,
+        itemId: "",
+        startY: 0,
+        currentY: 0,
+    });
     const activePlaylistIndexRef = useRef(-1);
     const playlistLoadTokenRef = useRef(0);
     const playlistAdvanceTokenRef = useRef(0);
@@ -3871,6 +3883,11 @@ export default function Audio() {
     const [playlistPreloadSummary, setPlaylistPreloadSummary] = useState("");
     const [isPlaying, setIsPlaying] = useState(false);
     const [isScrubbing, setIsScrubbing] = useState(false);
+    const [playlistDragState, setPlaylistDragState] = useState({
+        draggingId: "",
+        overId: "",
+        dragOffsetY: 0,
+    });
     const [isMuted, setIsMuted] = useState(false);
     const [bufferReady, setBufferReady] = useState(false);
     const [position, setPosition] = useState(0);
@@ -3967,6 +3984,7 @@ export default function Audio() {
         playlist.length,
         activePlaylistIndex
     );
+    const playlistReorderDisabled = isRendering || isLoading || isPreloadingPlaylist;
     const selectedPreset = getMixerPreset(activePresetKey);
     const selectedPresetDescription =
         activePresetKey === "custom"
@@ -4064,6 +4082,53 @@ export default function Audio() {
                 playlistPreloadCacheRef.current.delete(cacheKey);
             }
         }
+    }, [playlist]);
+
+    useLayoutEffect(() => {
+        const previousRects = playlistAnimationRectsRef.current;
+
+        if (!previousRects) {
+            return;
+        }
+
+        playlistAnimationRectsRef.current = null;
+
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        window.requestAnimationFrame(() => {
+            playlistItemNodeRefs.current.forEach((node, itemId) => {
+                const previousRect = previousRects.get(itemId);
+
+                if (!node || !previousRect || typeof node.animate !== "function") {
+                    return;
+                }
+
+                const nextRect = node.getBoundingClientRect();
+                const deltaX = previousRect.left - nextRect.left;
+                const deltaY = previousRect.top - nextRect.top;
+
+                if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) {
+                    return;
+                }
+
+                node.animate(
+                    [
+                        {
+                            transform: `translate(${deltaX}px, ${deltaY}px)`,
+                        },
+                        {
+                            transform: "translate(0, 0)",
+                        },
+                    ],
+                    {
+                        duration: 320,
+                        easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+                    }
+                );
+            });
+        });
     }, [playlist]);
 
     useEffect(() => {
@@ -8573,6 +8638,393 @@ export default function Audio() {
         }
     }
 
+    function setPlaylistItemNode(itemId, node) {
+        const key = String(itemId || "");
+
+        if (!key) {
+            return;
+        }
+
+        if (node) {
+            playlistItemNodeRefs.current.set(key, node);
+        } else {
+            playlistItemNodeRefs.current.delete(key);
+        }
+    }
+
+    function capturePlaylistItemRects() {
+        const rects = new Map();
+
+        playlistItemNodeRefs.current.forEach((node, itemId) => {
+            if (node) {
+                rects.set(itemId, node.getBoundingClientRect());
+            }
+        });
+
+        return rects;
+    }
+
+    function getPlaylistTargetIdFromPointer(clientY, draggedId) {
+        const sourceId = String(draggedId || "");
+        const candidates = [];
+
+        playlistItemNodeRefs.current.forEach((node, itemId) => {
+            const key = String(itemId || "");
+
+            if (!node || !key || key === sourceId) {
+                return;
+            }
+
+            const rect = node.getBoundingClientRect();
+
+            candidates.push({
+                id: key,
+                top: rect.top,
+                bottom: rect.bottom,
+                center: rect.top + rect.height / 2,
+            });
+        });
+
+        if (!candidates.length) {
+            return "";
+        }
+
+        const containing = candidates.find(
+            (candidate) => clientY >= candidate.top && clientY <= candidate.bottom
+        );
+
+        if (containing) {
+            return containing.id;
+        }
+
+        return candidates
+            .map((candidate) => ({
+                ...candidate,
+                distance: Math.abs(candidate.center - clientY),
+            }))
+            .sort((a, b) => a.distance - b.distance)[0]?.id || "";
+    }
+
+    function shouldIgnorePlaylistPointerStart(target) {
+        return Boolean(
+            target?.closest?.(
+                "button, a, input, textarea, select, [data-playlist-no-drag='true']"
+            )
+        );
+    }
+
+    function resetPlaylistDragState(options = {}) {
+        const draggedId = playlistDraggedItemIdRef.current;
+        const shouldAnnounce = Boolean(options.announce);
+
+        if (shouldAnnounce && draggedId) {
+            const finalIndex = playlistRef.current.findIndex(
+                (item) => item.id === draggedId
+            );
+            const finalItem = playlistRef.current[finalIndex];
+
+            if (finalIndex >= 0 && finalItem) {
+                setInfo(
+                    `Playlist reordered. "${finalItem.title || "playlist item"}" is now position ${
+                        finalIndex + 1
+                    } of ${playlistRef.current.length}.`
+                );
+            }
+        }
+
+        playlistDraggedItemIdRef.current = "";
+        playlistDragOverItemIdRef.current = "";
+        playlistDragDidReorderRef.current = false;
+        playlistPointerDragRef.current = {
+            pointerId: null,
+            itemId: "",
+            startY: 0,
+            currentY: 0,
+        };
+        setPlaylistDragState({
+            draggingId: "",
+            overId: "",
+            dragOffsetY: 0,
+        });
+    }
+
+    function reorderPlaylistItemById(draggedId, targetId, options = {}) {
+        const sourceId = String(draggedId || "");
+        const destinationId = String(targetId || "");
+        const finalizeOnNoop = Boolean(options.finalizeOnNoop);
+
+        if (
+            !sourceId ||
+            !destinationId ||
+            sourceId === destinationId ||
+            playlistReorderDisabled
+        ) {
+            if (finalizeOnNoop) {
+                resetPlaylistDragState({
+                    announce: playlistDragDidReorderRef.current,
+                });
+            }
+            return false;
+        }
+
+        const previousRects = capturePlaylistItemRects();
+        let didReorder = false;
+
+        setPlaylist((current) => {
+            const fromIndex = current.findIndex((item) => item.id === sourceId);
+            const toIndex = current.findIndex((item) => item.id === destinationId);
+
+            if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) {
+                return current;
+            }
+
+            const activeItemId =
+                activePlaylistIndexRef.current >= 0
+                    ? current[activePlaylistIndexRef.current]?.id
+                    : "";
+            const nextPlaylist = [...current];
+            const [movedItem] = nextPlaylist.splice(fromIndex, 1);
+
+            nextPlaylist.splice(toIndex, 0, movedItem);
+
+            if (activeItemId) {
+                const nextActiveIndex = nextPlaylist.findIndex(
+                    (item) => item.id === activeItemId
+                );
+                setActivePlaylistIndex(nextActiveIndex);
+                activePlaylistIndexRef.current = nextActiveIndex;
+            }
+
+            playlistAnimationRectsRef.current = previousRects;
+            playlistDragDidReorderRef.current = true;
+            didReorder = true;
+
+            return nextPlaylist;
+        });
+
+        setPlaylistDragState((current) => ({
+            ...current,
+            draggingId: sourceId,
+            overId: destinationId,
+        }));
+
+        if (
+            options.announceAfterMove &&
+            didReorder &&
+            typeof window !== "undefined"
+        ) {
+            window.requestAnimationFrame(() => {
+                resetPlaylistDragState({ announce: true });
+            });
+        }
+
+        return didReorder;
+    }
+
+    function handlePlaylistDragStart(event, item) {
+        if (playlistReorderDisabled || !item?.id) {
+            event.preventDefault();
+            return;
+        }
+
+        const itemId = String(item.id);
+        playlistDraggedItemIdRef.current = itemId;
+        playlistDragOverItemIdRef.current = "";
+        playlistDragDidReorderRef.current = false;
+
+        try {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", itemId);
+        } catch {
+            // Some mobile/webview drag implementations do not expose dataTransfer.
+        }
+
+        setPlaylistDragState({
+            draggingId: itemId,
+            overId: "",
+        });
+    }
+
+    function handlePlaylistDragOver(event, item) {
+        if (playlistReorderDisabled || !item?.id) {
+            return;
+        }
+
+        const draggedId = playlistDraggedItemIdRef.current;
+        const overId = String(item.id);
+
+        if (!draggedId || draggedId === overId) {
+            return;
+        }
+
+        event.preventDefault();
+        playlistDragOverItemIdRef.current = overId;
+
+        try {
+            event.dataTransfer.dropEffect = "move";
+        } catch {
+            // Optional browser hint only.
+        }
+
+        reorderPlaylistItemById(draggedId, overId);
+    }
+
+    function handlePlaylistDragLeave(event, item) {
+        if (!item?.id) {
+            return;
+        }
+
+        if (event.currentTarget?.contains?.(event.relatedTarget)) {
+            return;
+        }
+
+        const itemId = String(item.id);
+
+        setPlaylistDragState((current) =>
+            current.overId === itemId
+                ? {
+                    ...current,
+                    overId: "",
+                }
+                : current
+        );
+
+        if (playlistDragOverItemIdRef.current === itemId) {
+            playlistDragOverItemIdRef.current = "";
+        }
+    }
+
+    function handlePlaylistDrop(event, item) {
+        event.preventDefault();
+
+        const draggedId =
+            playlistDraggedItemIdRef.current ||
+            (() => {
+                try {
+                    return event.dataTransfer.getData("text/plain");
+                } catch {
+                    return "";
+                }
+            })();
+
+        if (playlistDragDidReorderRef.current) {
+            resetPlaylistDragState({ announce: true });
+            return;
+        }
+
+        reorderPlaylistItemById(draggedId, item?.id, {
+            announceAfterMove: true,
+            finalizeOnNoop: true,
+        });
+    }
+
+    function handlePlaylistPointerDown(event, item) {
+        if (
+            playlistReorderDisabled ||
+            !item?.id ||
+            (event.pointerType === "mouse" && event.button !== 0) ||
+            shouldIgnorePlaylistPointerStart(event.target)
+        ) {
+            return;
+        }
+
+        const itemId = String(item.id);
+        playlistPointerDragRef.current = {
+            pointerId: event.pointerId,
+            itemId,
+            startY: event.clientY,
+            currentY: event.clientY,
+        };
+        playlistDraggedItemIdRef.current = itemId;
+        playlistDragOverItemIdRef.current = "";
+        playlistDragDidReorderRef.current = false;
+
+        try {
+            event.currentTarget.setPointerCapture(event.pointerId);
+        } catch {
+            // Pointer capture is best-effort across mobile browsers.
+        }
+
+        setPlaylistDragState({
+            draggingId: itemId,
+            overId: "",
+            dragOffsetY: 0,
+        });
+
+        event.preventDefault();
+    }
+
+    function handlePlaylistPointerMove(event) {
+        const dragState = playlistPointerDragRef.current;
+
+        if (
+            dragState.pointerId !== event.pointerId ||
+            !dragState.itemId ||
+            playlistReorderDisabled
+        ) {
+            return;
+        }
+
+        playlistPointerDragRef.current = {
+            ...dragState,
+            currentY: event.clientY,
+        };
+
+        const dragOffsetY = event.clientY - Number(dragState.startY || event.clientY);
+        const targetId = getPlaylistTargetIdFromPointer(
+            event.clientY,
+            dragState.itemId
+        );
+
+        setPlaylistDragState((current) => ({
+            ...current,
+            draggingId: dragState.itemId,
+            dragOffsetY,
+        }));
+
+        if (!targetId || targetId === dragState.itemId) {
+            playlistDragOverItemIdRef.current = "";
+            setPlaylistDragState((current) =>
+                current.overId
+                    ? {
+                        ...current,
+                        overId: "",
+                    }
+                    : current
+            );
+            return;
+        }
+
+        playlistDragOverItemIdRef.current = targetId;
+        reorderPlaylistItemById(dragState.itemId, targetId);
+        event.preventDefault();
+    }
+
+    function handlePlaylistPointerUp(event) {
+        const dragState = playlistPointerDragRef.current;
+
+        if (dragState.pointerId !== event.pointerId || !dragState.itemId) {
+            return;
+        }
+
+        const targetId = playlistDragOverItemIdRef.current;
+
+        if (playlistDragDidReorderRef.current) {
+            resetPlaylistDragState({ announce: true });
+        } else {
+            reorderPlaylistItemById(dragState.itemId, targetId, {
+                announceAfterMove: true,
+                finalizeOnNoop: true,
+            });
+        }
+
+        try {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+        } catch {
+            // Pointer capture release is best-effort.
+        }
+    }
+
     function removePlaylistItem(id) {
         const currentIndex = activePlaylistIndexRef.current;
         const removedItem = playlistRef.current.find((item) => item.id === id);
@@ -8609,6 +9061,7 @@ export default function Audio() {
         playlistAdvanceTokenRef.current += 1;
         playlistLoadTokenRef.current += 1;
         playlistPreloadTokenRef.current += 1;
+        resetPlaylistDragState();
         playlistPreloadCacheRef.current.clear();
         clearPlaylistFileBlobs();
         setIsPreloadingPlaylist(false);
@@ -10600,6 +11053,11 @@ export default function Audio() {
                                     <Stack spacing={1.1}>
                                         {playlist.map((item, index) => {
                                             const active = index === activePlaylistIndex;
+                                            const dragging =
+                                                playlistDragState.draggingId === item.id;
+                                            const dropTarget =
+                                                playlistDragState.overId === item.id &&
+                                                playlistDragState.draggingId !== item.id;
                                             const itemArtworkSource = buildAbsoluteMediaAssetUrl(
                                                 getPlaylistItemArtworkSource(item)
                                             );
@@ -10607,29 +11065,176 @@ export default function Audio() {
                                             return (
                                                 <Box
                                                     key={item.id}
+                                                    ref={(node) => setPlaylistItemNode(item.id, node)}
+                                                    data-playlist-item-id={item.id}
+                                                    onDragOver={(event) =>
+                                                        handlePlaylistDragOver(event, item)
+                                                    }
+                                                    onDragEnter={(event) =>
+                                                        handlePlaylistDragOver(event, item)
+                                                    }
+                                                    onDragLeave={(event) =>
+                                                        handlePlaylistDragLeave(event, item)
+                                                    }
+                                                    onDrop={(event) => handlePlaylistDrop(event, item)}
+                                                    onPointerDown={(event) =>
+                                                        handlePlaylistPointerDown(event, item)
+                                                    }
+                                                    onPointerMove={handlePlaylistPointerMove}
+                                                    onPointerUp={handlePlaylistPointerUp}
+                                                    onPointerCancel={() =>
+                                                        resetPlaylistDragState({
+                                                            announce:
+                                                            playlistDragDidReorderRef.current,
+                                                        })
+                                                    }
                                                     sx={{
                                                         display: "grid",
                                                         gridTemplateColumns: {
-                                                            xs: "46px minmax(0, 1fr)",
-                                                            sm: "46px minmax(0, 1fr) auto auto",
+                                                            xs: "34px 46px minmax(0, 1fr)",
+                                                            sm: "34px 46px minmax(0, 1fr) auto auto",
                                                         },
                                                         gap: 1,
                                                         alignItems: "center",
                                                         borderRadius: 3,
                                                         p: 1.25,
-                                                        background: active
-                                                            ? "rgba(103,232,249,0.14)"
-                                                            : "rgba(255,255,255,0.06)",
-                                                        border: active
-                                                            ? "1px solid rgba(103,232,249,0.3)"
-                                                            : "1px solid rgba(255,255,255,0.08)",
+                                                        position: "relative",
+                                                        willChange: "transform, opacity, box-shadow",
+                                                        background: dropTarget
+                                                            ? "rgba(167,139,250,0.2)"
+                                                            : active
+                                                                ? "rgba(103,232,249,0.14)"
+                                                                : "rgba(255,255,255,0.06)",
+                                                        border: dropTarget
+                                                            ? "1px solid rgba(167,139,250,0.72)"
+                                                            : active
+                                                                ? "1px solid rgba(103,232,249,0.3)"
+                                                                : "1px solid rgba(255,255,255,0.08)",
+                                                        boxShadow: dropTarget
+                                                            ? "0 14px 32px rgba(167,139,250,0.18)"
+                                                            : dragging
+                                                                ? "0 18px 42px rgba(103,232,249,0.22)"
+                                                                : "none",
+                                                        opacity: dragging ? 0.76 : 1,
+                                                        transform: dropTarget
+                                                            ? "translateY(-1px)"
+                                                            : dragging
+                                                                ? `translate3d(0, ${playlistDragState.dragOffsetY}px, 0) scale(1.02)`
+                                                                : "translateY(0)",
+                                                        transition:
+                                                            dragging
+                                                                ? "background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease"
+                                                                : "background 180ms ease, border-color 180ms ease, box-shadow 220ms ease, opacity 160ms ease, transform 220ms cubic-bezier(0.22, 1, 0.36, 1)",
+                                                        zIndex: dragging ? 2 : dropTarget ? 1 : 0,
+                                                        cursor: playlistReorderDisabled
+                                                            ? "default"
+                                                            : dragging
+                                                                ? "grabbing"
+                                                                : "grab",
+                                                        "&::before": dropTarget
+                                                            ? {
+                                                                content: '""',
+                                                                position: "absolute",
+                                                                inset: -2,
+                                                                borderRadius: "inherit",
+                                                                pointerEvents: "none",
+                                                                border:
+                                                                    "1px solid rgba(167,139,250,0.42)",
+                                                                animation:
+                                                                    "amlPlaylistDropPulse 900ms ease-in-out infinite",
+                                                            }
+                                                            : {},
+                                                        "@keyframes amlPlaylistDropPulse": {
+                                                            "0%, 100%": {
+                                                                opacity: 0.45,
+                                                                transform: "scale(1)",
+                                                            },
+                                                            "50%": {
+                                                                opacity: 0.95,
+                                                                transform: "scale(1.012)",
+                                                            },
+                                                        },
                                                     }}
                                                 >
+                                                    <Box
+                                                        role="button"
+                                                        tabIndex={playlistReorderDisabled ? -1 : 0}
+                                                        draggable={false}
+                                                        title="Drag to reorder this playlist item"
+                                                        aria-label={`Drag ${item.title || "playlist item"} to reorder`}
+                                                        onDragStart={(event) => event.preventDefault()}
+                                                        onPointerDown={(event) => {
+                                                            event.stopPropagation();
+                                                            handlePlaylistPointerDown(event, item);
+                                                        }}
+                                                        onPointerMove={(event) => {
+                                                            event.stopPropagation();
+                                                            handlePlaylistPointerMove(event);
+                                                        }}
+                                                        onPointerUp={(event) => {
+                                                            event.stopPropagation();
+                                                            handlePlaylistPointerUp(event);
+                                                        }}
+                                                        onPointerCancel={(event) => {
+                                                            event.stopPropagation();
+                                                            resetPlaylistDragState({
+                                                                announce:
+                                                                playlistDragDidReorderRef.current,
+                                                            });
+                                                        }}
+                                                        sx={{
+                                                            width: 34,
+                                                            height: 46,
+                                                            borderRadius: 2,
+                                                            display: "grid",
+                                                            placeItems: "center",
+                                                            color: playlistReorderDisabled
+                                                                ? "rgba(255,255,255,0.24)"
+                                                                : "rgba(255,255,255,0.58)",
+                                                            cursor: playlistReorderDisabled
+                                                                ? "not-allowed"
+                                                                : dragging
+                                                                    ? "grabbing"
+                                                                    : "grab",
+                                                            touchAction: "none",
+                                                            userSelect: "none",
+                                                            background: dragging
+                                                                ? "rgba(103,232,249,0.16)"
+                                                                : "rgba(255,255,255,0.05)",
+                                                            border: dragging
+                                                                ? "1px solid rgba(103,232,249,0.46)"
+                                                                : "1px solid rgba(255,255,255,0.08)",
+                                                            boxShadow: dragging
+                                                                ? "0 0 0 3px rgba(103,232,249,0.1)"
+                                                                : "none",
+                                                            transition:
+                                                                "color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease, transform 160ms ease",
+                                                            transform: dragging
+                                                                ? "scale(1.06)"
+                                                                : "scale(1)",
+                                                            "&:hover, &:focus-visible": {
+                                                                color: playlistReorderDisabled
+                                                                    ? "rgba(255,255,255,0.24)"
+                                                                    : "#67e8f9",
+                                                                borderColor: playlistReorderDisabled
+                                                                    ? "rgba(255,255,255,0.08)"
+                                                                    : "rgba(103,232,249,0.42)",
+                                                                outline: "none",
+                                                            },
+                                                        }}
+                                                    >
+                                                        <DragIndicatorRoundedIcon
+                                                            sx={{ fontSize: 22 }}
+                                                        />
+                                                    </Box>
+
                                                     {itemArtworkSource ? (
                                                         <Box
                                                             component="img"
                                                             src={itemArtworkSource}
                                                             alt={`${item.title} artwork`}
+                                                            draggable={false}
+                                                            data-playlist-no-drag="true"
                                                             role="button"
                                                             tabIndex={0}
                                                             onClick={() =>
@@ -10707,6 +11312,7 @@ export default function Audio() {
                                                     <Button
                                                         size="small"
                                                         variant="outlined"
+                                                        data-playlist-no-drag="true"
                                                         onClick={() => loadPlaylistItem(index, true)}
                                                         disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                         sx={{
@@ -10715,7 +11321,7 @@ export default function Audio() {
                                                             borderColor: "rgba(255,255,255,0.18)",
                                                             fontWeight: 900,
                                                             gridColumn: {
-                                                                xs: "1 / span 2",
+                                                                xs: "1 / span 3",
                                                                 sm: "auto",
                                                             },
                                                         }}
@@ -10725,6 +11331,7 @@ export default function Audio() {
 
                                                     <Button
                                                         size="small"
+                                                        data-playlist-no-drag="true"
                                                         onClick={() => removePlaylistItem(item.id)}
                                                         disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                         sx={{
@@ -10735,7 +11342,7 @@ export default function Audio() {
                                                                 sm: "auto",
                                                             },
                                                             gridColumn: {
-                                                                xs: "1 / span 2",
+                                                                xs: "1 / span 3",
                                                                 sm: "auto",
                                                             },
                                                         }}
