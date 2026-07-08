@@ -4349,6 +4349,53 @@ export default function Audio() {
         return safeOffset;
     }
 
+    function freezePlaybackPositionForPause(reason = "Pause", options = {}) {
+        const buffer = audioBufferRef.current;
+        const durationValue = Number(buffer?.duration || getMediaSessionDuration() || 0);
+        const forcedOffset = Number(options.offset);
+        const pendingSeek = Number(pendingMediaSessionSeekRef.current);
+        const scrubTarget = getCurrentScrubTarget();
+        const liveOffset = getCurrentOffset();
+        const rawOffset = Number.isFinite(forcedOffset)
+            ? forcedOffset
+            : scrubbingRef.current || Number.isFinite(pendingSeek)
+                ? scrubTarget
+                : liveOffset;
+        const nextOffset = durationValue > 0
+            ? clamp(numberOrDefault(rawOffset, 0), 0, durationValue)
+            : Math.max(0, numberOrDefault(rawOffset, 0));
+
+        clearBrowserScrubAutoCommitTimer();
+        clearPageResumeScrubRecoveryTimer();
+        clearMediaSessionFastSeekCommitTimer();
+
+        scrubbingRef.current = false;
+        wasPlayingBeforeScrubRef.current = false;
+        browserScrubResumeIntentRef.current = false;
+        pendingMediaSessionSeekRef.current = null;
+        browserScrubLastValueRef.current = nextOffset;
+        mediaPositionRef.current = nextOffset;
+        startedOffsetRef.current = nextOffset;
+        startedAtContextTimeRef.current = 0;
+
+        stopPositionTimer();
+        stopVisualizer();
+        setIsScrubbing(false);
+        setPlayingState(false);
+
+        syncPlaybackPosition(nextOffset, {
+            forceMediaSession: true,
+            commitStartOffset: true,
+            clearPendingMediaSessionSeek: true,
+        });
+        updateMediaSessionState("paused", {
+            forcePosition: true,
+            reason,
+        });
+
+        return nextOffset;
+    }
+
     function syncVisiblePlaybackUiWithAudioRoute(reason = "visible route sync") {
         const context = audioContextRef.current;
         const hasLiveSource = Boolean(activeSourceRef.current);
@@ -4359,11 +4406,20 @@ export default function Audio() {
 
         if (scrubbingRef.current) {
             const pendingScrubPosition = getCurrentScrubTarget();
-            const shouldResumeAfterScrub = getScrubResumeIntent();
+            const pauseRecentlyRequested = Boolean(
+                pauseActionInFlightRef.current ||
+                Date.now() - (lastMediaSessionPauseAtRef.current || 0) < 1400
+            );
+            const shouldResumeAfterScrub = !pauseRecentlyRequested && getScrubResumeIntent();
 
             syncPlaybackPosition(pendingScrubPosition, {
                 forceMediaSession: true,
             });
+
+            if (pauseRecentlyRequested) {
+                freezePlaybackPositionForPause(reason, { offset: pendingScrubPosition });
+                return false;
+            }
 
             if (shouldResumeAfterScrub) {
                 playingRef.current = true;
@@ -5577,23 +5633,17 @@ export default function Audio() {
             // Best-effort click/stutter prevention before suspending WebAudio.
         }
 
-        startedOffsetRef.current = nextOffset;
-        startedAtContextTimeRef.current = context.currentTime || 0;
+        const frozenOffset = freezePlaybackPositionForPause(reason, {
+            offset: nextOffset,
+        });
+
         iPhoneLockScreenLivePauseRef.current = {
             active: true,
             source,
-            offset: nextOffset,
+            offset: frozenOffset,
             contextTime: context.currentTime || 0,
             reason,
         };
-
-        stopPositionTimer();
-        stopVisualizer();
-        syncPlaybackPosition(nextOffset, {
-            forceMediaSession: true,
-        });
-        setPlayingState(false);
-        updateMediaSessionState("paused", { forcePosition: true });
 
         try {
             if (context.state === "running") {
@@ -5824,6 +5874,25 @@ export default function Audio() {
     async function pauseFromMediaSession() {
         lastMediaSessionPauseAtRef.current = Date.now();
 
+        const pauseDuringScrub = Boolean(
+            scrubbingRef.current ||
+            pendingMediaSessionSeekRef.current !== null ||
+            mediaSessionFastSeekCommitTimerRef.current
+        );
+
+        if (pauseDuringScrub && (!activeSourceRef.current || !playingRef.current)) {
+            if (isIOSAudioDevice()) {
+                beginCleanPauseWindow(1500);
+                holdIPhonePauseSilence("Lock-screen Pause froze an active scrub");
+            }
+
+            freezePlaybackPositionForPause("Lock-screen Pause during scrub", {
+                offset: getCurrentScrubTarget(),
+            });
+            updateMediaSessionState("paused", { forcePosition: true });
+            return true;
+        }
+
         if (playingRef.current) {
             if (isIOSAudioDevice()) {
                 const heldLiveSource = await pauseLiveWebAudioForLockScreen(
@@ -5853,6 +5922,12 @@ export default function Audio() {
 
     async function stopFromMediaSession() {
         const keepIOSOutputAvailableForRestart = isIOSAudioDevice();
+
+        if (scrubbingRef.current || pendingMediaSessionSeekRef.current !== null || mediaSessionFastSeekCommitTimerRef.current) {
+            freezePlaybackPositionForPause("Lock-screen Stop cleared an active scrub", {
+                offset: getCurrentScrubTarget(),
+            });
+        }
 
         if (audioBufferRef.current || playingRef.current) {
             stopPlayback(true, {
@@ -5981,7 +6056,11 @@ export default function Audio() {
             0,
             durationValue
         );
-        const wasPlaying = Boolean(playingRef.current);
+        const pauseRecentlyRequested = Boolean(
+            pauseActionInFlightRef.current ||
+            Date.now() - (lastMediaSessionPauseAtRef.current || 0) < 900
+        );
+        const wasPlaying = Boolean(playingRef.current && !pauseRecentlyRequested);
         const isFastSeek = Boolean(details.fastSeek);
         let outputAlreadyRestarted = false;
 
@@ -9387,16 +9466,9 @@ export default function Audio() {
         manualStopRef.current = true;
         stopActiveSource();
 
-        startedOffsetRef.current = nextOffset;
-        startedAtContextTimeRef.current = 0;
-        syncPlaybackPosition(nextOffset, {
-            forceMediaSession: true,
+        freezePlaybackPositionForPause(options.reason || "Pause", {
+            offset: nextOffset,
         });
-
-        setPlayingState(false);
-        updateMediaSessionState("paused", { forcePosition: true });
-        stopPositionTimer();
-        stopVisualizer();
 
         if (isIPhone) {
             // Do not call element.play(), element.load(), or a keep-alive re-arm
