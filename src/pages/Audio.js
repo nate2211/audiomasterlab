@@ -5981,17 +5981,14 @@ export default function Audio() {
             0,
             durationValue
         );
-        const wasPlaying = Boolean(
-            playingRef.current ||
-            isPlayingStateRef.current ||
-            wasPlayingBeforeScrubRef.current
-        );
+        const wasPlaying = Boolean(playingRef.current);
         const isFastSeek = Boolean(details.fastSeek);
         let outputAlreadyRestarted = false;
 
         lastMediaSessionSeekAtRef.current = Date.now();
         pendingMediaSessionSeekRef.current = nextSeekTime;
-        rememberScrubTarget(nextSeekTime, { fromMediaSession: true });
+        browserScrubLastValueRef.current = nextSeekTime;
+        lastBrowserScrubChangeAtRef.current = Date.now();
         scrubbingRef.current = true;
         setIsScrubbing(true);
         syncPlaybackPosition(nextSeekTime, {
@@ -6009,6 +6006,7 @@ export default function Audio() {
 
             if (!alreadyFastSeeking) {
                 wasPlayingBeforeScrubRef.current = wasPlaying;
+                browserScrubResumeIntentRef.current = wasPlaying;
             }
 
             if (wasPlaying && activeSourceRef.current) {
@@ -6028,7 +6026,7 @@ export default function Audio() {
 
             startedOffsetRef.current = nextSeekTime;
             startedAtContextTimeRef.current = 0;
-            rememberScrubTarget(nextSeekTime, { fromMediaSession: true });
+            mediaPositionRef.current = nextSeekTime;
             mediaSessionFastSeekCommitTimerRef.current = window.setTimeout(() => {
                 mediaSessionFastSeekCommitTimerRef.current = null;
                 if (pendingMediaSessionSeekRef.current !== null && scrubbingRef.current) {
@@ -6047,11 +6045,10 @@ export default function Audio() {
         if (isIOSAudioDevice() && wasPlaying) {
             try {
                 const { context, nodes } = ensureLiveGraph();
-                forceRestoreAudibleWebAudioOutput(context, nodes);
-                outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
-                    "Lock-screen Scrub"
-                );
-                forceRestoreAudibleWebAudioOutput(context, nodes);
+                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                    rampSeconds: 0.05,
+                });
+                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
             } catch {
                 outputAlreadyRestarted = false;
             }
@@ -6060,7 +6057,7 @@ export default function Audio() {
         try {
             await seekTo(nextSeekTime, wasPlaying, {
                 fromMediaSession: true,
-                preserveUnlockedOutput: isIOSAudioDevice(),
+                preserveUnlockedOutput: true,
                 outputAlreadyRestarted,
                 forceIPhoneOutputPostStart: isIOSAudioDevice() && wasPlaying,
                 keepPlayingUiDuringSeek: wasPlaying,
@@ -6070,6 +6067,7 @@ export default function Audio() {
             scrubbingRef.current = false;
             setIsScrubbing(false);
             wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
             pendingMediaSessionSeekRef.current = null;
         }
 
@@ -7010,6 +7008,8 @@ export default function Audio() {
 
         if (!buffer) {
             scrubbingRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
             setIsScrubbing(false);
             return false;
         }
@@ -7025,22 +7025,16 @@ export default function Audio() {
 
         lastScrubCommitAtRef.current = Date.now();
 
+        // Use the older stable scrub implementation: pre-check the iPhone output
+        // route before seekTo() creates the fresh AudioBufferSourceNode. This avoids
+        // redundant element.play() calls during iOS lock-screen and browser scrubs.
         if (isIOSAudioDevice() && shouldResume && !outputAlreadyRestarted) {
             try {
                 const { context, nodes } = ensureLiveGraph();
-                forceRestoreAudibleWebAudioOutput(context, nodes, { allowDuringPause: true });
-
-                if (fromMediaSession || options.fromPageResume) {
-                    outputAlreadyRestarted = await restartIPhoneOutputStreamForLockScreenPlay(
-                        fromMediaSession ? "Lock-screen Scrub" : "Page resumed after scrub"
-                    );
-                } else {
-                    attachOutputElementToCurrentStream(outputAudioRef.current);
-                    releaseOutputAfterGlitchlessSourceStart(context, nodes, {
-                        rampSeconds: 0.05,
-                    });
-                    outputAlreadyRestarted = isIPhoneOutputRouteArmed();
-                }
+                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                    rampSeconds: 0.05,
+                });
+                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
             } catch {
                 outputAlreadyRestarted = false;
             }
@@ -9477,6 +9471,7 @@ export default function Audio() {
 
         startedOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = nextOffset;
         syncPlaybackPosition(nextOffset, {
             fromMediaSession: Boolean(options.fromMediaSession),
             forceMediaSession: true,
@@ -9531,13 +9526,11 @@ export default function Audio() {
         if (scrubbingRef.current) return;
 
         const currentOffset = getCurrentOffset();
-        const shouldKeepPlayingUi = Boolean(
-            playingRef.current || isPlayingStateRef.current
-        );
+        const wasPlaying = Boolean(playingRef.current);
 
         browserScrubSerialRef.current += 1;
-        wasPlayingBeforeScrubRef.current = shouldKeepPlayingUi;
-        browserScrubResumeIntentRef.current = shouldKeepPlayingUi;
+        wasPlayingBeforeScrubRef.current = wasPlaying;
+        browserScrubResumeIntentRef.current = wasPlaying;
         scrubbingRef.current = true;
         rememberScrubTarget(currentOffset);
 
@@ -9548,32 +9541,22 @@ export default function Audio() {
 
         startedOffsetRef.current = currentOffset;
         startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = currentOffset;
         syncPlaybackPosition(currentOffset, {
             forceMediaSession: true,
         });
 
-        setIsScrubbing(true);
-
-        if (shouldKeepPlayingUi) {
-            playingRef.current = true;
-            isPlayingStateRef.current = true;
-            setIsPlaying((current) => (current ? current : true));
-            updateMediaSessionState("playing", { forcePosition: true });
-
-            if (isIOSAudioDevice()) {
-                keepIPhoneOutputElementAliveForLockScreen(
-                    "Browser scrub started while preserving the iPhone output route"
-                ).catch(() => {
-                    iPhoneLockScreenOutputArmedRef.current = false;
-                });
-            }
-
-            scheduleBrowserScrubAutoCommit("browser scrub");
-            return;
-        }
-
         setPlayingState(false);
+        setIsScrubbing(true);
         updateMediaSessionState("paused", { forcePosition: true });
+
+        if (wasPlaying && isIOSAudioDevice()) {
+            keepIPhoneOutputElementAliveForLockScreen(
+                "Browser scrub started while preserving the iPhone output route"
+            ).catch(() => {
+                iPhoneLockScreenOutputArmedRef.current = false;
+            });
+        }
     }
 
     function handleScrubChange(_, nextValue) {
@@ -9590,17 +9573,12 @@ export default function Audio() {
 
         scrubbingRef.current = true;
         rememberScrubTarget(nextOffset);
+        mediaPositionRef.current = nextOffset;
         setIsScrubbing(true);
         syncPlaybackPosition(nextOffset, {
             forceMediaSession: true,
-            commitStartOffset: true,
         });
-
-        updateMediaSessionState(
-            browserScrubResumeIntentRef.current ? "playing" : "paused",
-            { forcePosition: true }
-        );
-        scheduleBrowserScrubAutoCommit("browser scrub");
+        updateMediaSessionState("paused", { forcePosition: true });
     }
 
     async function handleScrubCommit(_, nextValue) {
@@ -9608,16 +9586,38 @@ export default function Audio() {
 
         if (!buffer) return;
 
+        const shouldResume = Boolean(wasPlayingBeforeScrubRef.current);
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        let outputAlreadyRestarted = false;
 
         rememberScrubTarget(nextOffset);
 
-        await commitCurrentScrubTarget("browser scrub commit", {
+        // Correct older implementation: determine iOS output status before seekTo()
+        // so startBufferPlayback() can create the fresh source without fighting the
+        // already-unlocked hidden MediaStream element.
+        if (isIOSAudioDevice() && shouldResume) {
+            try {
+                const { context, nodes } = ensureLiveGraph();
+                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                    rampSeconds: 0.05,
+                });
+                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
+            } catch {
+                outputAlreadyRestarted = false;
+            }
+        }
+
+        scrubbingRef.current = false;
+        wasPlayingBeforeScrubRef.current = false;
+        browserScrubResumeIntentRef.current = false;
+        setIsScrubbing(false);
+
+        await seekTo(nextOffset, shouldResume, {
             preserveUnlockedOutput: isIOSAudioDevice(),
-            forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
-            keepPlayingUiDuringSeek: getScrubResumeIntent(),
-            quietStatus: true,
+            outputAlreadyRestarted,
+            forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
+            keepPlayingUiDuringSeek: shouldResume,
         });
     }
 
