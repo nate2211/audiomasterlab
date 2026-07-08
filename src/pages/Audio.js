@@ -533,9 +533,17 @@ const PLAYLIST_DRAG_MIME = "application/x-audiomasterlab-playlist-index";
 // from getting stranded when Safari throttles timers while the phone is locked.
 const BROWSER_SCRUB_AUTO_COMMIT_MS = 360;
 const LOCKSCREEN_SCRUB_RECOVERY_COMMIT_MS = 140;
+const STUCK_SCRUB_RECOVERY_MS = 1800;
+const LONG_RUNNING_PLAYBACK_WATCHDOG_MS = 1450;
+const LONG_RUNNING_SESSION_FORCE_SAVE_MS = 12000;
 const SESSION_SAVE_THROTTLE_MS = 650;
 const SESSION_RESTORE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const SESSION_RESTORE_END_GUARD_SECONDS = 0.75;
+// Keep the old stable behavior: if audio was playing when the scrub started,
+// the final seek resumes automatically even if the browser fires duplicate
+// release/commit events out of order after a long open tab or lock-screen wake.
+const SCRUB_RESUME_INTENT_GRACE_MS = 2800;
+const DUPLICATE_SCRUB_COMMIT_IGNORE_MS = 900;
 
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const COMMUNITY_FEED_POST_URL = "https://scrapewebsite.pages.dev/api/community/posts";
@@ -3791,6 +3799,9 @@ export default function Audio() {
     const visualizer3dSettingsRef = useRef(DEFAULT_VISUALIZER_3D_SETTINGS);
 
     const timerRef = useRef(null);
+    const playbackWatchdogTimerRef = useRef(null);
+    const lastPlaybackWatchdogSessionSaveAtRef = useRef(0);
+    const playbackEndedHandledRef = useRef(false);
 
     const startedAtContextTimeRef = useRef(0);
     const startedOffsetRef = useRef(0);
@@ -3826,6 +3837,17 @@ export default function Audio() {
     const lastMediaSessionSeekAtRef = useRef(0);
     const pendingMediaSessionSeekRef = useRef(null);
     const browserScrubResumeIntentRef = useRef(false);
+    const scrubCommitInFlightRef = useRef(false);
+    const recentScrubResumeIntentRef = useRef({
+        at: 0,
+        resume: false,
+        position: 0,
+    });
+    const lastCompletedScrubCommitRef = useRef({
+        at: 0,
+        position: 0,
+        resume: false,
+    });
     const lastBrowserScrubChangeAtRef = useRef(0);
     const browserScrubAutoCommitTimerRef = useRef(null);
     const browserScrubLastValueRef = useRef(0);
@@ -3920,6 +3942,7 @@ export default function Audio() {
         buildCarPlaySafeModeLabel(readPersistedCarPlaySafeMode())
     );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
+    const [expandedArtwork, setExpandedArtwork] = useState(null);
 
     const isPlayingStateRef = useRef(isPlaying);
     const statusMessageRef = useRef(status);
@@ -3955,9 +3978,55 @@ export default function Audio() {
         [mediaTitle, activePlaylistItem]
     );
 
+    function openArtworkPreview(src, title = "Artwork", subtitle = "") {
+        const cleanSrc = String(src || "").trim();
+
+        if (!cleanSrc) {
+            return;
+        }
+
+        setExpandedArtwork({
+            src: cleanSrc,
+            title: String(title || "Artwork").trim() || "Artwork",
+            subtitle: String(subtitle || "").trim(),
+        });
+    }
+
+    function closeArtworkPreview() {
+        setExpandedArtwork(null);
+    }
+
+    function handleArtworkPreviewKeyDown(event, src, title, subtitle = "") {
+        if (event.key !== "Enter" && event.key !== " ") {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        openArtworkPreview(src, title, subtitle);
+    }
+
     mediaTitleRef.current = mediaTitle;
     mediaDurationRef.current = Number.isFinite(duration) ? duration : 0;
     visualizer3dSettingsRef.current = visualizer3dSettings;
+
+    useEffect(() => {
+        if (!expandedArtwork) {
+            return undefined;
+        }
+
+        const handleKeyDown = (event) => {
+            if (event.key === "Escape") {
+                closeArtworkPreview();
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown);
+        };
+    }, [expandedArtwork]);
 
     // Do not let a stale React render overwrite the newest lock-screen scrub
     // position. Media Session seekto actions can arrive while the page is
@@ -4158,6 +4227,7 @@ export default function Audio() {
         return () => {
             stopPlayback(false);
             stopVisualizer();
+            clearPlaybackWatchdogTimer();
             clearCarPlayRecoveryTimer();
             clearPauseReleaseTimer();
             clearPauseUiQuietTimer();
@@ -4205,6 +4275,66 @@ export default function Audio() {
         updateMediaSessionState(isPlaying ? "playing" : "paused");
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isPlaying, position, duration]);
+
+    useEffect(() => {
+        const finishScrubFromGlobalRelease = (event) => {
+            const eventType = event?.type || "global-release";
+
+            if (eventType === "visibilitychange" && typeof document !== "undefined" && document.visibilityState !== "visible") {
+                persistPlaybackSessionSnapshot("page hidden during playback", {
+                    force: true,
+                    position: getCurrentScrubTarget(),
+                    playing: getScrubResumeIntent(),
+                });
+                return;
+            }
+
+            if (scrubbingRef.current) {
+                commitCurrentScrubTarget(`Global scrub release: ${eventType}`, {
+                    quietStatus: true,
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
+                    keepPlayingUiDuringSeek: getScrubResumeIntent(),
+                }).catch(() => {
+                    scrubbingRef.current = false;
+                    wasPlayingBeforeScrubRef.current = false;
+                    browserScrubResumeIntentRef.current = false;
+                    setIsScrubbing(false);
+                    syncVisiblePlaybackUiWithAudioRoute(`failed global scrub release: ${eventType}`);
+                });
+                return;
+            }
+
+            repairLongRunningPlaybackState(`global page event: ${eventType}`);
+        };
+
+        window.addEventListener("pointerup", finishScrubFromGlobalRelease, true);
+        window.addEventListener("pointercancel", finishScrubFromGlobalRelease, true);
+        window.addEventListener("mouseup", finishScrubFromGlobalRelease, true);
+        window.addEventListener("touchend", finishScrubFromGlobalRelease, true);
+        window.addEventListener("touchcancel", finishScrubFromGlobalRelease, true);
+        window.addEventListener("keyup", finishScrubFromGlobalRelease, true);
+        window.addEventListener("blur", finishScrubFromGlobalRelease);
+        window.addEventListener("focus", finishScrubFromGlobalRelease);
+        window.addEventListener("pagehide", finishScrubFromGlobalRelease);
+        window.addEventListener("pageshow", finishScrubFromGlobalRelease);
+        document.addEventListener("visibilitychange", finishScrubFromGlobalRelease);
+
+        return () => {
+            window.removeEventListener("pointerup", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("pointercancel", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("mouseup", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("touchend", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("touchcancel", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("keyup", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("blur", finishScrubFromGlobalRelease);
+            window.removeEventListener("focus", finishScrubFromGlobalRelease);
+            window.removeEventListener("pagehide", finishScrubFromGlobalRelease);
+            window.removeEventListener("pageshow", finishScrubFromGlobalRelease);
+            document.removeEventListener("visibilitychange", finishScrubFromGlobalRelease);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     useEffect(() => {
         if (!isIOSAudioDevice()) {
@@ -4399,8 +4529,12 @@ export default function Audio() {
 
         if (safeValue) {
             startCommunityListeningHeartbeat();
+            startPlaybackWatchdog();
         } else {
             stopCommunityListeningHeartbeat(true);
+            if (!scrubbingRef.current) {
+                clearPlaybackWatchdogTimer();
+            }
         }
 
         persistPlaybackSessionSnapshot(safeValue ? "playback started" : "playback paused", {
@@ -4738,6 +4872,7 @@ export default function Audio() {
 
         stopActiveSource();
         stopPositionTimer();
+        clearPlaybackWatchdogTimer();
         stopVisualizer();
 
         startedOffsetRef.current = nextOffset;
@@ -6188,6 +6323,7 @@ export default function Audio() {
         browserScrubLastValueRef.current = nextSeekTime;
         lastBrowserScrubChangeAtRef.current = Date.now();
         scrubbingRef.current = true;
+        markScrubResumeIntent(wasPlaying, nextSeekTime);
         setIsScrubbing(true);
         syncPlaybackPosition(nextSeekTime, {
             fromMediaSession: true,
@@ -6203,8 +6339,7 @@ export default function Audio() {
             clearMediaSessionFastSeekCommitTimer();
 
             if (!alreadyFastSeeking) {
-                wasPlayingBeforeScrubRef.current = wasPlaying;
-                browserScrubResumeIntentRef.current = wasPlaying;
+                markScrubResumeIntent(wasPlaying, nextSeekTime);
             }
 
             if (wasPlaying && activeSourceRef.current) {
@@ -6252,8 +6387,10 @@ export default function Audio() {
             }
         }
 
+        let didSeek = false;
+
         try {
-            await seekTo(nextSeekTime, wasPlaying, {
+            didSeek = await seekTo(nextSeekTime, wasPlaying, {
                 fromMediaSession: true,
                 preserveUnlockedOutput: true,
                 outputAlreadyRestarted,
@@ -6269,15 +6406,28 @@ export default function Audio() {
             pendingMediaSessionSeekRef.current = null;
         }
 
+        const actuallyPlaying = Boolean(wasPlaying && didSeek && playingRef.current);
+
+        lastCompletedScrubCommitRef.current = {
+            at: Date.now(),
+            position: nextSeekTime,
+            resume: actuallyPlaying,
+        };
+        recentScrubResumeIntentRef.current = {
+            at: Date.now(),
+            position: nextSeekTime,
+            resume: actuallyPlaying,
+        };
+
         syncPlaybackPosition(nextSeekTime, {
             fromMediaSession: true,
             forceMediaSession: true,
             clearPendingMediaSessionSeek: true,
         });
-        updateMediaSessionState(wasPlaying ? "playing" : "paused", {
+        updateMediaSessionState(actuallyPlaying ? "playing" : "paused", {
             forcePosition: true,
         });
-        return true;
+        return didSeek;
     }
 
     function installMediaSessionHandlers() {
@@ -7208,6 +7358,121 @@ export default function Audio() {
         }
     }
 
+    function clearPlaybackWatchdogTimer() {
+        if (playbackWatchdogTimerRef.current) {
+            window.clearInterval(playbackWatchdogTimerRef.current);
+            playbackWatchdogTimerRef.current = null;
+        }
+    }
+
+    function startPlaybackWatchdog() {
+        if (playbackWatchdogTimerRef.current || typeof window === "undefined") {
+            return;
+        }
+
+        playbackWatchdogTimerRef.current = window.setInterval(() => {
+            repairLongRunningPlaybackState("long-running playback watchdog");
+        }, LONG_RUNNING_PLAYBACK_WATCHDOG_MS);
+    }
+
+    function repairLongRunningPlaybackState(reason = "long-running playback repair") {
+        const buffer = audioBufferRef.current;
+
+        if (!buffer) {
+            hasMediaRef.current = false;
+            clearPlaybackWatchdogTimer();
+            return false;
+        }
+
+        if (!hasMediaRef.current) {
+            hasMediaRef.current = true;
+            setBufferReady(true);
+        }
+
+        const now = Date.now();
+
+        if (scrubbingRef.current) {
+            const msSinceLastScrubMove = now - (lastBrowserScrubChangeAtRef.current || 0);
+
+            if (msSinceLastScrubMove > STUCK_SCRUB_RECOVERY_MS) {
+                commitCurrentScrubTarget(`${reason}: finished stale scrub`, {
+                    quietStatus: true,
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
+                    keepPlayingUiDuringSeek: getScrubResumeIntent(),
+                }).catch(() => {
+                    scrubbingRef.current = false;
+                    wasPlayingBeforeScrubRef.current = false;
+                    browserScrubResumeIntentRef.current = false;
+                    setIsScrubbing(false);
+                });
+            }
+
+            return true;
+        }
+
+        const context = audioContextRef.current;
+        const hasLiveSource = Boolean(activeSourceRef.current);
+        const shouldBePlaying = Boolean(playingRef.current || isPlayingStateRef.current);
+        const safeOffset = getCurrentOffset();
+        const seekOrControlActionInFlight = Boolean(
+            pendingMediaSessionSeekRef.current !== null ||
+            mediaSessionFastSeekCommitTimerRef.current ||
+            Date.now() - (lastScrubCommitAtRef.current || 0) < 2400 ||
+            pauseActionInFlightRef.current
+        );
+
+        syncPlaybackPosition(safeOffset, {
+            forceMediaSession: true,
+            skipSessionPersist: true,
+        });
+
+        if (seekOrControlActionInFlight) {
+            updateMediaSessionState(shouldBePlaying ? "playing" : "paused", {
+                forcePosition: true,
+                reason,
+            });
+            return true;
+        }
+
+        if (shouldBePlaying && hasLiveSource) {
+            if (!timerRef.current) {
+                startPositionTimer();
+            }
+
+            if (context && context.state === "suspended" && !isInsideCleanPauseWindow()) {
+                context.resume().catch(() => {});
+            }
+
+            if (!isPlayingStateRef.current) {
+                isPlayingStateRef.current = true;
+                setIsPlaying(true);
+            }
+
+            updateMediaSessionState("playing", { forcePosition: true, reason });
+        } else if (shouldBePlaying && !hasLiveSource) {
+            setPlayingState(false);
+            syncPlaybackPosition(safeOffset, {
+                forceMediaSession: true,
+                commitStartOffset: true,
+            });
+            updateMediaSessionState("paused", { forcePosition: true, reason });
+        } else {
+            updateMediaSessionState("paused", { forcePosition: true, reason });
+        }
+
+        if (now - (lastPlaybackWatchdogSessionSaveAtRef.current || 0) > LONG_RUNNING_SESSION_FORCE_SAVE_MS) {
+            lastPlaybackWatchdogSessionSaveAtRef.current = now;
+            persistPlaybackSessionSnapshot(`${reason}: durable checkpoint`, {
+                force: true,
+                position: safeOffset,
+                playing: Boolean(playingRef.current),
+            });
+        }
+
+        return true;
+    }
+
     function clearMediaSessionFastSeekCommitTimer() {
         if (mediaSessionFastSeekCommitTimerRef.current) {
             window.clearTimeout(mediaSessionFastSeekCommitTimerRef.current);
@@ -7253,12 +7518,47 @@ export default function Audio() {
         return Math.max(0, chosen || 0);
     }
 
+    function markScrubResumeIntent(shouldResume, positionValue = getCurrentScrubTarget()) {
+        const resume = Boolean(shouldResume);
+
+        recentScrubResumeIntentRef.current = {
+            at: Date.now(),
+            resume,
+            position: Math.max(0, numberOrDefault(positionValue, 0)),
+        };
+
+        wasPlayingBeforeScrubRef.current = resume;
+        browserScrubResumeIntentRef.current = resume;
+
+        return resume;
+    }
+
+    function getRecentScrubResumeIntent() {
+        const recent = recentScrubResumeIntentRef.current || {};
+        const now = Date.now();
+        const pauseRecentlyRequested = Boolean(
+            pauseActionInFlightRef.current ||
+            isPauseUiSettlingRef.current ||
+            now - (lastMediaSessionPauseAtRef.current || 0) < 1200
+        );
+
+        if (pauseRecentlyRequested) {
+            return false;
+        }
+
+        return Boolean(
+            recent.resume &&
+            now - (recent.at || 0) <= SCRUB_RESUME_INTENT_GRACE_MS
+        );
+    }
+
     function getScrubResumeIntent() {
         return Boolean(
             wasPlayingBeforeScrubRef.current ||
             browserScrubResumeIntentRef.current ||
             playingRef.current ||
-            isPlayingStateRef.current
+            isPlayingStateRef.current ||
+            getRecentScrubResumeIntent()
         );
     }
 
@@ -7346,69 +7646,123 @@ export default function Audio() {
             return false;
         }
 
-        clearBrowserScrubAutoCommitTimer();
-        clearPageResumeScrubRecoveryTimer();
-        clearMediaSessionFastSeekCommitTimer();
-
         const nextOffset = clamp(getCurrentScrubTarget(), 0, buffer.duration);
-        const shouldResume = Boolean(getScrubResumeIntent() && nextOffset < buffer.duration);
-        const fromMediaSession = Boolean(options.fromMediaSession);
-        let outputAlreadyRestarted = Boolean(options.outputAlreadyRestarted);
 
-        lastScrubCommitAtRef.current = Date.now();
+        // Browsers can fire both a global pointer/touch release and MUI's
+        // onChangeCommitted for the same gesture. After long-running playback or
+        // iOS lock/unlock, those events can arrive late/out of order. Do not let
+        // the duplicate second commit pause audio that the first commit already
+        // resumed.
+        if (scrubCommitInFlightRef.current) {
+            rememberScrubTarget(nextOffset);
+            markScrubResumeIntent(getScrubResumeIntent(), nextOffset);
+            return true;
+        }
 
-        // Use the older stable scrub implementation: pre-check the iPhone output
-        // route before seekTo() creates the fresh AudioBufferSourceNode. This avoids
-        // redundant element.play() calls during iOS lock-screen and browser scrubs.
-        if (isIOSAudioDevice() && shouldResume && !outputAlreadyRestarted) {
-            try {
-                const { context, nodes } = ensureLiveGraph();
-                releaseOutputAfterGlitchlessSourceStart(context, nodes, {
-                    rampSeconds: 0.05,
-                });
-                outputAlreadyRestarted = isIPhoneOutputRouteArmed();
-            } catch {
-                outputAlreadyRestarted = false;
+        const lastCompleted = lastCompletedScrubCommitRef.current || {};
+        const duplicateRecentCommit = Boolean(
+            lastCompleted.at &&
+            Date.now() - lastCompleted.at < DUPLICATE_SCRUB_COMMIT_IGNORE_MS &&
+            Math.abs(Number(lastCompleted.position || 0) - nextOffset) < 0.08
+        );
+
+        if (duplicateRecentCommit && !scrubbingRef.current) {
+            syncPlaybackPosition(nextOffset, {
+                fromMediaSession: Boolean(options.fromMediaSession),
+                forceMediaSession: true,
+                commitStartOffset: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+            });
+            updateMediaSessionState(lastCompleted.resume ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            return true;
+        }
+
+        scrubCommitInFlightRef.current = true;
+
+        try {
+            clearBrowserScrubAutoCommitTimer();
+            clearPageResumeScrubRecoveryTimer();
+            clearMediaSessionFastSeekCommitTimer();
+
+            const resumeIntent = getScrubResumeIntent();
+            const shouldResume = Boolean(resumeIntent && nextOffset < buffer.duration);
+            const fromMediaSession = Boolean(options.fromMediaSession);
+            let outputAlreadyRestarted = Boolean(options.outputAlreadyRestarted);
+
+            lastScrubCommitAtRef.current = Date.now();
+            markScrubResumeIntent(shouldResume, nextOffset);
+
+            // Use the older stable scrub implementation: pre-check the iPhone output
+            // route before seekTo() creates the fresh AudioBufferSourceNode. This avoids
+            // redundant element.play() calls during iOS lock-screen and browser scrubs.
+            if (isIOSAudioDevice() && shouldResume && !outputAlreadyRestarted) {
+                try {
+                    const { context, nodes } = ensureLiveGraph();
+                    releaseOutputAfterGlitchlessSourceStart(context, nodes, {
+                        rampSeconds: 0.05,
+                    });
+                    outputAlreadyRestarted = isIPhoneOutputRouteArmed();
+                } catch {
+                    outputAlreadyRestarted = false;
+                }
             }
+
+            scrubbingRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
+            setIsScrubbing(false);
+
+            const didSeek = await seekTo(nextOffset, shouldResume, {
+                fromMediaSession,
+                preserveUnlockedOutput: options.preserveUnlockedOutput ?? isIOSAudioDevice(),
+                outputAlreadyRestarted,
+                forceIPhoneOutputPostStart:
+                    Boolean(options.forceIPhoneOutputPostStart) ||
+                    (isIOSAudioDevice() && shouldResume),
+                keepPlayingUiDuringSeek:
+                    Boolean(options.keepPlayingUiDuringSeek) || shouldResume,
+                quietStatus: Boolean(options.quietStatus),
+            });
+
+            const actuallyPlaying = Boolean(shouldResume && didSeek && playingRef.current);
+
+            syncPlaybackPosition(nextOffset, {
+                fromMediaSession,
+                forceMediaSession: true,
+                commitStartOffset: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+            });
+            updateMediaSessionState(actuallyPlaying ? "playing" : "paused", {
+                forcePosition: true,
+            });
+
+            lastCompletedScrubCommitRef.current = {
+                at: Date.now(),
+                position: nextOffset,
+                resume: actuallyPlaying,
+            };
+            recentScrubResumeIntentRef.current = {
+                at: Date.now(),
+                resume: actuallyPlaying,
+                position: nextOffset,
+            };
+
+            if (!options.quietStatus) {
+                setInfo(
+                    actuallyPlaying
+                        ? `Scrubbed to ${formatTime(nextOffset)} and resumed playback.`
+                        : `Scrubbed to ${formatTime(nextOffset)}.`
+                );
+            }
+
+            return didSeek;
+        } finally {
+            scrubCommitInFlightRef.current = false;
         }
-
-        scrubbingRef.current = false;
-        wasPlayingBeforeScrubRef.current = false;
-        browserScrubResumeIntentRef.current = false;
-        setIsScrubbing(false);
-
-        const didSeek = await seekTo(nextOffset, shouldResume, {
-            fromMediaSession,
-            preserveUnlockedOutput: options.preserveUnlockedOutput ?? isIOSAudioDevice(),
-            outputAlreadyRestarted,
-            forceIPhoneOutputPostStart:
-                Boolean(options.forceIPhoneOutputPostStart) ||
-                (isIOSAudioDevice() && shouldResume),
-            keepPlayingUiDuringSeek:
-                Boolean(options.keepPlayingUiDuringSeek) || shouldResume,
-            quietStatus: Boolean(options.quietStatus),
-        });
-
-        syncPlaybackPosition(nextOffset, {
-            fromMediaSession,
-            forceMediaSession: true,
-            commitStartOffset: true,
-            clearPendingMediaSessionSeek: true,
-            forceSessionPersist: true,
-        });
-        updateMediaSessionState(shouldResume && didSeek ? "playing" : "paused", {
-            forcePosition: true,
-        });
-
-        if (!options.quietStatus) {
-            setInfo(
-                shouldResume && didSeek
-                    ? `Scrubbed to ${formatTime(nextOffset)} and resumed playback.`
-                    : `Scrubbed to ${formatTime(nextOffset)}.`
-            );
-        }
-
-        return didSeek;
     }
 
     function getCurrentOffset() {
@@ -7438,6 +7792,7 @@ export default function Audio() {
 
     function startPositionTimer() {
         stopPositionTimer();
+        startPlaybackWatchdog();
 
         timerRef.current = window.setInterval(() => {
             const buffer = audioBufferRef.current;
@@ -7451,17 +7806,21 @@ export default function Audio() {
             syncPlaybackPosition(nextOffset);
             updateMediaSessionPositionState();
 
-            if (nextOffset >= buffer.duration) {
-                startedOffsetRef.current = 0;
-                startedAtContextTimeRef.current = 0;
-                syncPlaybackPosition(0, {
-                    commitStartOffset: true,
+            if (nextOffset >= buffer.duration - 0.035) {
+                syncPlaybackPosition(buffer.duration, {
                     forceMediaSession: true,
+                    skipSessionPersist: true,
                 });
-                setPlayingState(false);
-                updateMediaSessionState("paused", { forcePosition: true });
-                stopPositionTimer();
-                stopVisualizer();
+
+                if (!playbackEndedHandledRef.current && !manualStopRef.current) {
+                    playbackEndedHandledRef.current = true;
+                    handlePlaybackEnded().catch((error) => {
+                        setError(
+                            error?.message ||
+                            "Playback reached the end, but the next playlist step could not be started."
+                        );
+                    });
+                }
             }
         }, 120);
     }
@@ -7597,6 +7956,9 @@ export default function Audio() {
 
         scrubbingRef.current = false;
         wasPlayingBeforeScrubRef.current = false;
+        browserScrubResumeIntentRef.current = false;
+        pendingMediaSessionSeekRef.current = null;
+        playbackEndedHandledRef.current = false;
 
         setIsScrubbing(false);
         mediaDurationRef.current = 0;
@@ -7679,6 +8041,9 @@ export default function Audio() {
 
         scrubbingRef.current = false;
         wasPlayingBeforeScrubRef.current = false;
+        browserScrubResumeIntentRef.current = false;
+        pendingMediaSessionSeekRef.current = null;
+        playbackEndedHandledRef.current = false;
 
         setIsScrubbing(false);
         setBufferReady(false);
@@ -7711,6 +8076,8 @@ export default function Audio() {
         audioBufferRef.current = decodedBuffer;
         lastDecodedArrayBufferRef.current = arrayBuffer;
         lastDecodedMetadataRef.current = metadata;
+        playbackEndedHandledRef.current = false;
+        pendingMediaSessionSeekRef.current = null;
 
         startedOffsetRef.current = 0;
         startedAtContextTimeRef.current = 0;
@@ -9345,6 +9712,11 @@ export default function Audio() {
     async function handlePlaybackEnded() {
         if (manualStopRef.current) return;
 
+        playbackEndedHandledRef.current = true;
+        clearBrowserScrubAutoCommitTimer();
+        clearPageResumeScrubRecoveryTimer();
+        clearMediaSessionFastSeekCommitTimer();
+
         activeSourceRef.current = null;
         startedOffsetRef.current = 0;
         startedAtContextTimeRef.current = 0;
@@ -9591,6 +9963,7 @@ export default function Audio() {
             }
 
             manualStopRef.current = false;
+            playbackEndedHandledRef.current = false;
             stopActiveSource();
 
             let safeOffset = resetToBeginning ? 0 : startedOffsetRef.current;
@@ -9625,6 +9998,12 @@ export default function Audio() {
             prepareOutputForGlitchlessSourceStart(context, nodes);
 
             source.onended = () => {
+                if (playbackEndedHandledRef.current || manualStopRef.current) {
+                    return;
+                }
+
+                playbackEndedHandledRef.current = true;
+
                 const runEndedHandler = () => {
                     handlePlaybackEnded().catch((error) => {
                         setError(
@@ -9847,13 +10226,27 @@ export default function Audio() {
         });
 
         if (shouldResumeAfterSeek) {
-            await startBufferPlayback(false, {
+            const startedAfterSeek = await startBufferPlayback(false, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                 outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                 forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                 quietStatus: Boolean(options.quietStatus),
             });
+
+            if (!startedAfterSeek) {
+                setPlayingState(false);
+                syncPlaybackPosition(nextOffset, {
+                    fromMediaSession: Boolean(options.fromMediaSession),
+                    forceMediaSession: true,
+                    commitStartOffset: true,
+                    clearPendingMediaSessionSeek: true,
+                    forceSessionPersist: true,
+                });
+                updateMediaSessionState("paused", { forcePosition: true });
+                return false;
+            }
+
             syncPlaybackPosition(nextOffset, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 forceMediaSession: true,
@@ -9883,18 +10276,46 @@ export default function Audio() {
         return true;
     }
 
+    function handleScrubRelease(reason = "browser scrub released") {
+        if (!scrubbingRef.current || !audioBufferRef.current) {
+            repairLongRunningPlaybackState(reason);
+            return;
+        }
+
+        commitCurrentScrubTarget(reason, {
+            quietStatus: true,
+            preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
+            keepPlayingUiDuringSeek: getScrubResumeIntent(),
+        }).catch(() => {
+            scrubbingRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
+            setIsScrubbing(false);
+            syncVisiblePlaybackUiWithAudioRoute(`${reason} failed`);
+        });
+    }
+
     function handleScrubStart() {
-        if (!hasMediaRef.current || isRendering || isLoading) return;
+        if (audioBufferRef.current && !hasMediaRef.current) {
+            hasMediaRef.current = true;
+            setBufferReady(true);
+        }
+
+        if (!audioBufferRef.current || isRendering || isLoading) return;
         if (scrubbingRef.current) return;
 
         const currentOffset = getCurrentOffset();
-        const wasPlaying = Boolean(playingRef.current);
+        const wasPlaying = Boolean(
+            (playingRef.current || isPlayingStateRef.current || activeSourceRef.current) &&
+            !pauseActionInFlightRef.current &&
+            !isPauseUiSettlingRef.current
+        );
 
         browserScrubSerialRef.current += 1;
-        wasPlayingBeforeScrubRef.current = wasPlaying;
-        browserScrubResumeIntentRef.current = wasPlaying;
         scrubbingRef.current = true;
         rememberScrubTarget(currentOffset);
+        markScrubResumeIntent(wasPlaying, currentOffset);
 
         manualStopRef.current = true;
         stopActiveSource();
@@ -9947,6 +10368,7 @@ export default function Audio() {
 
         scrubbingRef.current = true;
         rememberScrubTarget(nextOffset);
+        markScrubResumeIntent(getScrubResumeIntent(), nextOffset);
         mediaPositionRef.current = nextOffset;
         setIsScrubbing(true);
         syncPlaybackPosition(nextOffset, {
@@ -9963,14 +10385,37 @@ export default function Audio() {
 
         if (!buffer) return;
 
-        const shouldResume = Boolean(wasPlayingBeforeScrubRef.current);
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        const lastCompleted = lastCompletedScrubCommitRef.current || {};
+        const isDuplicateFinalCommit = Boolean(
+            !scrubbingRef.current &&
+            lastCompleted.at &&
+            Date.now() - lastCompleted.at < DUPLICATE_SCRUB_COMMIT_IGNORE_MS &&
+            Math.abs(Number(lastCompleted.position || 0) - nextOffset) < 0.08
+        );
+
+        if (isDuplicateFinalCommit) {
+            syncPlaybackPosition(nextOffset, {
+                forceMediaSession: true,
+                commitStartOffset: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+            });
+            updateMediaSessionState(lastCompleted.resume ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            return;
+        }
+
+        const shouldResume = Boolean(getScrubResumeIntent() && nextOffset < buffer.duration);
         let outputAlreadyRestarted = false;
 
         clearBrowserScrubAutoCommitTimer();
         clearPageResumeScrubRecoveryTimer();
         rememberScrubTarget(nextOffset);
+        markScrubResumeIntent(shouldResume, nextOffset);
+        lastScrubCommitAtRef.current = Date.now();
 
         // Correct older implementation: determine iOS output status before seekTo()
         // so startBufferPlayback() can create the fresh source without fighting the
@@ -9992,12 +10437,25 @@ export default function Audio() {
         browserScrubResumeIntentRef.current = false;
         setIsScrubbing(false);
 
-        await seekTo(nextOffset, shouldResume, {
+        const didSeek = await seekTo(nextOffset, shouldResume, {
             preserveUnlockedOutput: isIOSAudioDevice(),
             outputAlreadyRestarted,
             forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
             keepPlayingUiDuringSeek: shouldResume,
         });
+
+        lastCompletedScrubCommitRef.current = {
+            at: Date.now(),
+            position: nextOffset,
+            resume: Boolean(shouldResume && didSeek && playingRef.current),
+        };
+        recentScrubResumeIntentRef.current = {
+            at: Date.now(),
+            position: nextOffset,
+            resume: Boolean(shouldResume && didSeek && playingRef.current),
+        };
+
+        repairLongRunningPlaybackState("browser scrub committed");
     }
 
     function handleScrubKeyDown(event) {
@@ -10324,1430 +10782,682 @@ export default function Audio() {
     }
 
     return (
-        <PageShell>
-            <Box
-                component="audio"
-                ref={outputAudioRef}
-                playsInline
-                preload="auto"
-                controls={false}
-                controlsList="nodownload noplaybackrate"
-                sx={{
-                    position: "fixed",
-                    width: 1,
-                    height: 1,
-                    opacity: 0,
-                    pointerEvents: "none",
-                    left: -9999,
-                    top: -9999,
-                }}
-            />
-
-            <Helmet>
-                <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
-                <link rel="canonical" href="https://audiomasterlab.com/audio" />
-                <meta
-                    name="description"
-                    content="Use AudioMaster Lab's WebAudio tool to import files from desktop, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, and Dropbox, decode audio files, preview a live processing graph, visualize waveform and frequency spectrum, apply effects, and export WAV."
-                />
-                <meta
-                    name="keywords"
-                    content="WebAudio mixer, audio visualizer, waveform visualizer, frequency spectrum, online audio mastering, WAV renderer, EQ, compressor, de-esser, delay, reverb, iPhone audio file picker, iCloud Drive audio, Proton Drive audio"
-                />
-                <link rel="canonical" href="https://audiomasterlab.com/audio" />
-
-                <meta
-                    property="og:title"
-                    content="AudioMaster Lab Audio Tool | WebAudio Mixer & WAV Renderer"
-                />
-                <meta
-                    property="og:description"
-                    content="Process audio in the browser with the upload media button, iPhone Files support, WebAudio effects, waveform and frequency visualizers, EQ, compression, delay, reverb, and WAV export."
-                />
-                <meta property="og:url" content="https://audiomasterlab.com/audio" />
-                <meta
-                    property="og:image"
-                    content="https://audiomasterlab.com/social-preview.png"
+        <>
+            <PageShell>
+                <Box
+                    component="audio"
+                    ref={outputAudioRef}
+                    playsInline
+                    preload="auto"
+                    controls={false}
+                    controlsList="nodownload noplaybackrate"
+                    sx={{
+                        position: "fixed",
+                        width: 1,
+                        height: 1,
+                        opacity: 0,
+                        pointerEvents: "none",
+                        left: -9999,
+                        top: -9999,
+                    }}
                 />
 
-                <meta
-                    name="twitter:title"
-                    content="AudioMaster Lab Audio Tool | WebAudio Mixer & WAV Renderer"
-                />
-                <meta
-                    name="twitter:description"
-                    content="Master audio in the browser with the upload media button, iPhone Files import, WebAudio effects, visualizers, and WAV export."
-                />
-                <meta
-                    name="twitter:image"
-                    content="https://audiomasterlab.com/social-preview.png"
-                />
+                <Helmet>
+                    <title>Audio Tool | WebAudio Mixer, Visualizer & WAV Renderer</title>
+                    <link rel="canonical" href="https://audiomasterlab.com/audio" />
+                    <meta
+                        name="description"
+                        content="Use AudioMaster Lab's WebAudio tool to import files from desktop, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, and Dropbox, decode audio files, preview a live processing graph, visualize waveform and frequency spectrum, apply effects, and export WAV."
+                    />
+                    <meta
+                        name="keywords"
+                        content="WebAudio mixer, audio visualizer, waveform visualizer, frequency spectrum, online audio mastering, WAV renderer, EQ, compressor, de-esser, delay, reverb, iPhone audio file picker, iCloud Drive audio, Proton Drive audio"
+                    />
+                    <link rel="canonical" href="https://audiomasterlab.com/audio" />
 
-                <script type="application/ld+json">
-                    {JSON.stringify({
-                        "@context": "https://schema.org",
-                        "@type": "WebApplication",
-                        name: "AudioMaster Lab Audio Tool",
-                        applicationCategory: "MultimediaApplication",
-                        operatingSystem: "Web Browser",
-                        url: "https://audiomasterlab.com/audio",
-                        description:
-                            "A browser-based WebAudio mixer and renderer with upload media file support for desktop files, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, waveform visualization, frequency spectrum visualization, EQ, compression, panning, delay, reverb, de-essing, and WAV export.",
-                        featureList: [
-                            "Audio file decoding",
-                            "Upload media file button",
-                            "iPhone Files picker support",
-                            "On My iPhone import",
-                            "iCloud Drive, Google Drive, Proton Drive, and Dropbox import",
-                            "Live WebAudio graph",
-                            "Waveform visualizer",
-                            "Frequency spectrum visualizer",
-                            "Base volume control",
-                            "Stereo panning",
-                            "Convolution reverb",
-                            "Delay and feedback",
-                            "EQ filters",
-                            "Compression",
-                            "De-essing",
-                            "WAV export",
-                            "Local file playlists",
-                            "Direct media URL playlists",
-                            "Repeat current song toggle",
-                            "Automatic next-track playback",
-                            "CarPlay and wired iPhone USB safe output mode",
-                            "Media Session lock-screen and car-control metadata",
-                        ],
-                    })}
-                </script>
-            </Helmet>
+                    <meta
+                        property="og:title"
+                        content="AudioMaster Lab Audio Tool | WebAudio Mixer & WAV Renderer"
+                    />
+                    <meta
+                        property="og:description"
+                        content="Process audio in the browser with the upload media button, iPhone Files support, WebAudio effects, waveform and frequency visualizers, EQ, compression, delay, reverb, and WAV export."
+                    />
+                    <meta property="og:url" content="https://audiomasterlab.com/audio" />
+                    <meta
+                        property="og:image"
+                        content="https://audiomasterlab.com/social-preview.png"
+                    />
 
-            <Stack spacing={4}>
-                <SectionTitle
-                    eyebrow="Audio tool"
-                    title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
-                    description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies, and use the CarPlay / USB safe mode for more stable wired iPhone playback."
-                />
+                    <meta
+                        name="twitter:title"
+                        content="AudioMaster Lab Audio Tool | WebAudio Mixer & WAV Renderer"
+                    />
+                    <meta
+                        name="twitter:description"
+                        content="Master audio in the browser with the upload media button, iPhone Files import, WebAudio effects, visualizers, and WAV export."
+                    />
+                    <meta
+                        name="twitter:image"
+                        content="https://audiomasterlab.com/social-preview.png"
+                    />
 
-                <StoragePersistencePanel
-                    storageInfo={storageInfo}
-                    onClearSavedSession={clearSavedBrowserSession}
-                />
+                    <script type="application/ld+json">
+                        {JSON.stringify({
+                            "@context": "https://schema.org",
+                            "@type": "WebApplication",
+                            name: "AudioMaster Lab Audio Tool",
+                            applicationCategory: "MultimediaApplication",
+                            operatingSystem: "Web Browser",
+                            url: "https://audiomasterlab.com/audio",
+                            description:
+                                "A browser-based WebAudio mixer and renderer with upload media file support for desktop files, iPhone Files, On My iPhone, iCloud Drive, Google Drive, Proton Drive, Dropbox, waveform visualization, frequency spectrum visualization, EQ, compression, panning, delay, reverb, de-essing, and WAV export.",
+                            featureList: [
+                                "Audio file decoding",
+                                "Upload media file button",
+                                "iPhone Files picker support",
+                                "On My iPhone import",
+                                "iCloud Drive, Google Drive, Proton Drive, and Dropbox import",
+                                "Live WebAudio graph",
+                                "Waveform visualizer",
+                                "Frequency spectrum visualizer",
+                                "Base volume control",
+                                "Stereo panning",
+                                "Convolution reverb",
+                                "Delay and feedback",
+                                "EQ filters",
+                                "Compression",
+                                "De-essing",
+                                "WAV export",
+                                "Local file playlists",
+                                "Direct media URL playlists",
+                                "Repeat current song toggle",
+                                "Automatic next-track playback",
+                                "CarPlay and wired iPhone USB safe output mode",
+                                "Media Session lock-screen and car-control metadata",
+                            ],
+                        })}
+                    </script>
+                </Helmet>
 
-                <GlassCard>
-                    <Stack spacing={2.75}>
-                        <Box
-                            sx={{
-                                display: "flex",
-                                alignItems: "flex-start",
-                                justifyContent: "space-between",
-                                gap: 2,
-                                flexWrap: "wrap",
-                                minWidth: 0,
-                            }}
-                        >
-                            <Box sx={{ minWidth: 0, flex: "1 1 520px" }}>
-                                <Stack
-                                    direction="row"
-                                    spacing={1.25}
-                                    alignItems="center"
-                                    sx={{ minWidth: 0, mb: 0.75 }}
-                                >
-                                    <Box
-                                        sx={{
-                                            width: 42,
-                                            height: 42,
-                                            flex: "0 0 auto",
-                                            borderRadius: 3,
-                                            display: "grid",
-                                            placeItems: "center",
-                                            background:
-                                                "linear-gradient(135deg, rgba(103,232,249,0.2), rgba(167,139,250,0.18))",
-                                            border: "1px solid rgba(255,255,255,0.12)",
-                                            color: "#67e8f9",
-                                        }}
-                                    >
-                                        <GraphicEqRoundedIcon />
-                                    </Box>
+                <Stack spacing={4}>
+                    <SectionTitle
+                        eyebrow="Audio tool"
+                        title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
+                        description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies, and use the CarPlay / USB safe mode for more stable wired iPhone playback."
+                    />
 
-                                    <Typography
-                                        variant="h5"
-                                        sx={{
-                                            fontWeight: 950,
-                                            lineHeight: 1.15,
-                                            whiteSpace: "normal",
-                                            overflow: "visible",
-                                            textOverflow: "unset",
-                                            wordBreak: "break-word",
-                                            minWidth: 0,
-                                        }}
-                                    >
-                                        Live full-width visualizer
-                                    </Typography>
-                                </Stack>
+                    <StoragePersistencePanel
+                        storageInfo={storageInfo}
+                        onClearSavedSession={clearSavedBrowserSession}
+                    />
 
-                                <Typography
-                                    sx={{
-                                        color: "rgba(255,255,255,0.62)",
-                                        lineHeight: 1.65,
-                                        maxWidth: 980,
-                                    }}
-                                >
-                                    This reads from the final processed AnalyserNode after
-                                    ClarityChain, Demudder, De-Esser, EQ, WaveShaper distortion,
-                                    warm bitcrusher, delay, reverb, panning, compression, and gain.
-                                </Typography>
-                            </Box>
-
-                            <Stack
-                                direction="row"
-                                spacing={1}
+                    <GlassCard>
+                        <Stack spacing={2.75}>
+                            <Box
                                 sx={{
-                                    flex: "0 1 auto",
+                                    display: "flex",
+                                    alignItems: "flex-start",
+                                    justifyContent: "space-between",
+                                    gap: 2,
                                     flexWrap: "wrap",
-                                    justifyContent: { xs: "flex-start", md: "flex-end" },
+                                    minWidth: 0,
                                 }}
                             >
-                                <Button
-                                    type="button"
-                                    variant={visualizer3dSettings.enabled ? "contained" : "outlined"}
-                                    onClick={() =>
-                                        updateVisualizer3DSetting(
-                                            "enabled",
-                                            !visualizer3dSettings.enabled
-                                        )
-                                    }
-                                    sx={{
-                                        borderRadius: 999,
-                                        px: 1.6,
-                                        py: 0.7,
-                                        color: visualizer3dSettings.enabled ? "#06111e" : "#fff",
-                                        borderColor: "rgba(103,232,249,0.28)",
-                                        background: visualizer3dSettings.enabled
-                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                            : "rgba(255,255,255,0.04)",
-                                        fontSize: 12,
-                                        fontWeight: 950,
-                                    }}
-                                >
-                                    {visualizer3dSettings.enabled ? "3D on" : "3D off"}
-                                </Button>
-
-                                {visualizer3dSettings.enabled && (
-                                    <FormControl
-                                        size="small"
-                                        sx={{
-                                            minWidth: 170,
-                                            "& .MuiInputLabel-root": {
-                                                color: "rgba(255,255,255,0.66)",
-                                            },
-                                            "& .MuiOutlinedInput-root": {
-                                                color: "#fff",
-                                                borderRadius: 999,
-                                                background: "rgba(7,10,19,0.72)",
-                                                fontSize: 12,
-                                                fontWeight: 850,
-                                                "& fieldset": {
-                                                    borderColor: "rgba(103,232,249,0.24)",
-                                                },
-                                            },
-                                            "& .MuiSvgIcon-root": {
-                                                color: "#67e8f9",
-                                            },
-                                        }}
+                                <Box sx={{ minWidth: 0, flex: "1 1 520px" }}>
+                                    <Stack
+                                        direction="row"
+                                        spacing={1.25}
+                                        alignItems="center"
+                                        sx={{ minWidth: 0, mb: 0.75 }}
                                     >
-                                        <InputLabel id="visualizer-3d-model-label">
-                                            Model
-                                        </InputLabel>
-                                        <Select
-                                            labelId="visualizer-3d-model-label"
-                                            value={visualizer3dSettings.model}
-                                            label="Model"
-                                            onChange={(event) =>
-                                                updateVisualizer3DSetting(
-                                                    "model",
-                                                    event.target.value
-                                                )
-                                            }
-                                        >
-                                            {VISUALIZER_3D_MODE_OPTIONS.map((mode) => (
-                                                <MenuItem key={mode.value} value={mode.value}>
-                                                    {mode.label}
-                                                </MenuItem>
-                                            ))}
-                                        </Select>
-                                    </FormControl>
-                                )}
-
-                                <Box
-                                    sx={{
-                                        display: "inline-flex",
-                                        alignItems: "center",
-                                        gap: 0.75,
-                                        px: 1.4,
-                                        py: 0.8,
-                                        borderRadius: 999,
-                                        background: "rgba(103,232,249,0.09)",
-                                        border: "1px solid rgba(103,232,249,0.18)",
-                                        color: "#67e8f9",
-                                        fontSize: 12,
-                                        fontWeight: 900,
-                                        letterSpacing: 0.3,
-                                    }}
-                                >
-                                    <EqualizerRoundedIcon sx={{ fontSize: 18 }} />
-                                    processed analyser
-                                </Box>
-
-                                <Box
-                                    sx={{
-                                        display: "inline-flex",
-                                        alignItems: "center",
-                                        gap: 0.75,
-                                        px: 1.4,
-                                        py: 0.8,
-                                        borderRadius: 999,
-                                        background: "rgba(167,139,250,0.09)",
-                                        border: "1px solid rgba(167,139,250,0.18)",
-                                        color: "#c4b5fd",
-                                        fontSize: 12,
-                                        fontWeight: 900,
-                                        letterSpacing: 0.3,
-                                    }}
-                                >
-                                    <TuneRoundedIcon sx={{ fontSize: 18 }} />
-                                    live graph
-                                </Box>
-
-                                <Box
-                                    sx={{
-                                        display: "inline-flex",
-                                        alignItems: "center",
-                                        gap: 0.75,
-                                        px: 1.4,
-                                        py: 0.8,
-                                        borderRadius: 999,
-                                        background: repeatEnabled
-                                            ? "rgba(103,232,249,0.15)"
-                                            : "rgba(255,255,255,0.07)",
-                                        border: repeatEnabled
-                                            ? "1px solid rgba(103,232,249,0.28)"
-                                            : "1px solid rgba(255,255,255,0.12)",
-                                        color: repeatEnabled ? "#67e8f9" : "rgba(255,255,255,0.7)",
-                                        fontSize: 12,
-                                        fontWeight: 900,
-                                        letterSpacing: 0.3,
-                                    }}
-                                >
-                                    <RepeatRoundedIcon sx={{ fontSize: 18 }} />
-                                    {repeatEnabled ? "repeat on" : "repeat off"}
-                                </Box>
-                            </Stack>
-                        </Box>
-
-                        <Box
-                            sx={{
-                                display: "grid",
-                                gridTemplateColumns: { xs: "1fr", lg: "1fr 1fr" },
-                                gap: 2,
-                            }}
-                        >
-                            <Box
-                                component="canvas"
-                                ref={waveformCanvasRef}
-                                sx={{
-                                    width: "100%",
-                                    height: { xs: 180, md: 230 },
-                                    display: "block",
-                                    borderRadius: 4,
-                                    border: "1px solid rgba(255,255,255,0.1)",
-                                    background: "rgba(7,10,19,0.96)",
-                                }}
-                            />
-
-                            <Box
-                                component="canvas"
-                                ref={frequencyCanvasRef}
-                                sx={{
-                                    width: "100%",
-                                    height: { xs: 180, md: 230 },
-                                    display: "block",
-                                    borderRadius: 4,
-                                    border: "1px solid rgba(255,255,255,0.1)",
-                                    background: "rgba(7,10,19,0.96)",
-                                }}
-                            />
-                        </Box>
-
-                        {visualizer3dSettings.enabled && (
-                            <Box
-                                component="canvas"
-                                ref={visualizer3dCanvasRef}
-                                sx={{
-                                    width: "100%",
-                                    height: { xs: 240, md: 340 },
-                                    display: "block",
-                                    borderRadius: 4,
-                                    border: "1px solid rgba(103,232,249,0.14)",
-                                    background:
-                                        "radial-gradient(circle at 50% 18%, rgba(103,232,249,0.12), transparent 38%), rgba(7,10,19,0.98)",
-                                }}
-                            />
-                        )}
-                    </Stack>
-                </GlassCard>
-
-                <Box
-                    sx={{
-                        display: "grid",
-                        gridTemplateColumns: { xs: "1fr", lg: "0.82fr 1.18fr" },
-                        gap: 3,
-                        alignItems: "start",
-                    }}
-                >
-                    <Stack spacing={3}>
-                        <MediaInputForm
-                            fileName={inputFile?.name || ""}
-                            linkValue={directLink}
-                            onLinkChange={setDirectLink}
-                            onFileSelect={(file) => handleFileSelect(file, "Upload media file")}
-                            onLoadLink={handleLoadDirectLink}
-                            onClear={handleClearMedia}
-                            disabled={isRendering || isLoading}
-                        />
-
-                        <GlassCard>
-                            <Stack spacing={2.5}>
-                                <Box>
-                                    <Stack direction="row" alignItems="center" spacing={1.1}>
-                                        <QueueMusicRoundedIcon sx={{ color: "#67e8f9" }} />
-
-                                        <Typography variant="h5" sx={{ fontWeight: 950 }}>
-                                            Playlist player: uploads and direct links
-                                        </Typography>
-                                    </Stack>
-
-                                    <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
-                                        Add uploaded files, paste direct media URLs, preload the queue, start
-                                        from track 1 with one large button, repeat the current song, or let
-                                        playback auto-skip bad items and continue when repeat is off. On iPhone,
-                                        auto-next preserves the unlocked hidden audio output so the next track can
-                                        start when the current track finishes.
-                                    </Typography>
-                                </Box>
-
-                                <Button
-                                    fullWidth
-                                    size="large"
-                                    variant="contained"
-                                    startIcon={
-                                        showPauseForPlaylistControls ? (
-                                            <PauseRoundedIcon />
-                                        ) : (
-                                            <PlayArrowRoundedIcon />
-                                        )
-                                    }
-                                    onClick={handlePlaylistPrimaryPlay}
-                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
-                                    sx={{
-                                        borderRadius: 5,
-                                        py: { xs: 1.9, md: 2.35 },
-                                        px: 2.25,
-                                        fontSize: { xs: 17, md: 20 },
-                                        fontWeight: 1000,
-                                        letterSpacing: 0.2,
-                                        color: "#06111e",
-                                        background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                        boxShadow:
-                                            "0 24px 70px rgba(103,232,249,0.26), inset 0 1px 0 rgba(255,255,255,0.25)",
-                                        "&:hover": {
-                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            filter: "brightness(1.05)",
-                                            transform: "translateY(-1px)",
-                                        },
-                                    }}
-                                >
-                                    {showPauseForPlaylistControls
-                                        ? "Pause playlist"
-                                        : "Start playlist"}
-                                </Button>
-
-                                <Button
-                                    fullWidth
-                                    size="large"
-                                    variant="outlined"
-                                    startIcon={
-                                        isPreloadingPlaylist ? (
-                                            <LinearProgress
-                                                sx={{
-                                                    width: 28,
-                                                    height: 6,
-                                                    borderRadius: 999,
-                                                    background: "rgba(255,255,255,0.16)",
-                                                    "& .MuiLinearProgress-bar": {
-                                                        background: "#67e8f9",
-                                                    },
-                                                }}
-                                            />
-                                        ) : (
-                                            <QueueMusicRoundedIcon />
-                                        )
-                                    }
-                                    onClick={preloadPlaylist}
-                                    disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
-                                    sx={{
-                                        borderRadius: 5,
-                                        py: { xs: 1.35, md: 1.55 },
-                                        px: 2.25,
-                                        fontWeight: 950,
-                                        color: "#fff",
-                                        borderColor: "rgba(103,232,249,0.34)",
-                                        background: "rgba(103,232,249,0.07)",
-                                        "&:hover": {
-                                            borderColor: "rgba(103,232,249,0.62)",
-                                            background: "rgba(103,232,249,0.12)",
-                                        },
-                                    }}
-                                >
-                                    {isPreloadingPlaylist
-                                        ? "Preloading playlist..."
-                                        : "Preload playlist direct + proxy fallback"}
-                                </Button>
-
-                                {playlistPreloadSummary && (
-                                    <Typography
-                                        variant="caption"
-                                        sx={{
-                                            color: "rgba(255,255,255,0.64)",
-                                            lineHeight: 1.55,
-                                            mt: -0.5,
-                                        }}
-                                    >
-                                        {playlistPreloadSummary}
-                                    </Typography>
-                                )}
-
-
-                                <Box
-                                    sx={{
-                                        borderRadius: 4,
-                                        p: 1.6,
-                                        background: carPlaySafeMode
-                                            ? "rgba(103,232,249,0.1)"
-                                            : "rgba(255,255,255,0.045)",
-                                        border: carPlaySafeMode
-                                            ? "1px solid rgba(103,232,249,0.24)"
-                                            : "1px solid rgba(255,255,255,0.08)",
-                                    }}
-                                >
-                                    <Stack spacing={1.15}>
-                                        <Stack
-                                            direction={{ xs: "column", sm: "row" }}
-                                            alignItems={{ xs: "stretch", sm: "center" }}
-                                            justifyContent="space-between"
-                                            spacing={1}
-                                        >
-                                            <Box>
-                                                <Typography sx={{ fontWeight: 950, color: "#fff" }}>
-                                                    CarPlay / USB safe mode
-                                                </Typography>
-                                                <Typography
-                                                    variant="caption"
-                                                    sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.55 }}
-                                                >
-                                                    Best for wired iPhone CarPlay where effects or route output can jump.
-                                                </Typography>
-                                            </Box>
-
-                                            <Button
-                                                variant={carPlaySafeMode ? "contained" : "outlined"}
-                                                onClick={toggleCarPlaySafeMode}
-                                                disabled={isRendering || isLoading}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    color: carPlaySafeMode ? "#06111e" : "#fff",
-                                                    borderColor: "rgba(255,255,255,0.18)",
-                                                    fontWeight: 950,
-                                                    background: carPlaySafeMode
-                                                        ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                        : "transparent",
-                                                    whiteSpace: "nowrap",
-                                                }}
-                                            >
-                                                {carPlaySafeMode ? "Safe mode ON" : "Safe mode OFF"}
-                                            </Button>
-                                        </Stack>
-
-                                        <Typography sx={{ color: "rgba(255,255,255,0.72)", lineHeight: 1.65 }}>
-                                            {carPlayOutputStatus}
-                                        </Typography>
-                                    </Stack>
-                                </Box>
-
-                                <Button
-                                    component="label"
-                                    variant="contained"
-                                    startIcon={<PlaylistAddRoundedIcon />}
-                                    disabled={isRendering || isLoading}
-                                    sx={{
-                                        borderRadius: 999,
-                                        py: 1.35,
-                                        fontWeight: 950,
-                                        color: "#06111e",
-                                        background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                        boxShadow: "0 18px 46px rgba(103,232,249,0.18)",
-                                        "&:hover": {
-                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            filter: "brightness(1.04)",
-                                        },
-                                    }}
-                                >
-                                    Add uploaded files to playlist
-                                    <input
-                                        hidden
-                                        multiple
-                                        type="file"
-                                        accept="audio/*,video/*,.mp3,.wav,.ogg,.oga,.opus,.webm,.m4a,.mp4,.mov,.aac,.flac,.aif,.aiff"
-                                        onChange={(event) => {
-                                            addFilesToPlaylist(event.target.files);
-                                            event.target.value = "";
-                                        }}
-                                    />
-                                </Button>
-
-                                <Box
-                                    sx={{
-                                        borderRadius: 4,
-                                        p: 1.5,
-                                        background: "rgba(255,255,255,0.045)",
-                                        border: "1px solid rgba(255,255,255,0.08)",
-                                    }}
-                                >
-                                    <Stack spacing={1.25}>
-                                        <TextField
-                                            fullWidth
-                                            multiline
-                                            minRows={2}
-                                            value={playlistLink}
-                                            onChange={(event) => setPlaylistLink(event.target.value)}
-                                            disabled={isRendering || isLoading}
-                                            placeholder="Paste direct media URL(s), one per line or comma-separated: .mp3, .wav, .m4a, .mp4, .mov, .webm, .ogg..."
-                                            label="Direct file links for playlist"
-                                            variant="outlined"
+                                        <Box
                                             sx={{
+                                                width: 42,
+                                                height: 42,
+                                                flex: "0 0 auto",
+                                                borderRadius: 3,
+                                                display: "grid",
+                                                placeItems: "center",
+                                                background:
+                                                    "linear-gradient(135deg, rgba(103,232,249,0.2), rgba(167,139,250,0.18))",
+                                                border: "1px solid rgba(255,255,255,0.12)",
+                                                color: "#67e8f9",
+                                            }}
+                                        >
+                                            <GraphicEqRoundedIcon />
+                                        </Box>
+
+                                        <Typography
+                                            variant="h5"
+                                            sx={{
+                                                fontWeight: 950,
+                                                lineHeight: 1.15,
+                                                whiteSpace: "normal",
+                                                overflow: "visible",
+                                                textOverflow: "unset",
+                                                wordBreak: "break-word",
+                                                minWidth: 0,
+                                            }}
+                                        >
+                                            Live full-width visualizer
+                                        </Typography>
+                                    </Stack>
+
+                                    <Typography
+                                        sx={{
+                                            color: "rgba(255,255,255,0.62)",
+                                            lineHeight: 1.65,
+                                            maxWidth: 980,
+                                        }}
+                                    >
+                                        This reads from the final processed AnalyserNode after
+                                        ClarityChain, Demudder, De-Esser, EQ, WaveShaper distortion,
+                                        warm bitcrusher, delay, reverb, panning, compression, and gain.
+                                    </Typography>
+                                </Box>
+
+                                <Stack
+                                    direction="row"
+                                    spacing={1}
+                                    sx={{
+                                        flex: "0 1 auto",
+                                        flexWrap: "wrap",
+                                        justifyContent: { xs: "flex-start", md: "flex-end" },
+                                    }}
+                                >
+                                    <Button
+                                        type="button"
+                                        variant={visualizer3dSettings.enabled ? "contained" : "outlined"}
+                                        onClick={() =>
+                                            updateVisualizer3DSetting(
+                                                "enabled",
+                                                !visualizer3dSettings.enabled
+                                            )
+                                        }
+                                        sx={{
+                                            borderRadius: 999,
+                                            px: 1.6,
+                                            py: 0.7,
+                                            color: visualizer3dSettings.enabled ? "#06111e" : "#fff",
+                                            borderColor: "rgba(103,232,249,0.28)",
+                                            background: visualizer3dSettings.enabled
+                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                : "rgba(255,255,255,0.04)",
+                                            fontSize: 12,
+                                            fontWeight: 950,
+                                        }}
+                                    >
+                                        {visualizer3dSettings.enabled ? "3D on" : "3D off"}
+                                    </Button>
+
+                                    {visualizer3dSettings.enabled && (
+                                        <FormControl
+                                            size="small"
+                                            sx={{
+                                                minWidth: 170,
+                                                "& .MuiInputLabel-root": {
+                                                    color: "rgba(255,255,255,0.66)",
+                                                },
                                                 "& .MuiOutlinedInput-root": {
                                                     color: "#fff",
-                                                    borderRadius: 3,
-                                                    background: "rgba(7,10,19,0.48)",
+                                                    borderRadius: 999,
+                                                    background: "rgba(7,10,19,0.72)",
+                                                    fontSize: 12,
+                                                    fontWeight: 850,
                                                     "& fieldset": {
-                                                        borderColor: "rgba(255,255,255,0.16)",
-                                                    },
-                                                    "&:hover fieldset": {
-                                                        borderColor: "rgba(103,232,249,0.35)",
-                                                    },
-                                                    "&.Mui-focused fieldset": {
-                                                        borderColor: "#67e8f9",
+                                                        borderColor: "rgba(103,232,249,0.24)",
                                                     },
                                                 },
-                                                "& .MuiInputLabel-root": {
-                                                    color: "rgba(255,255,255,0.68)",
-                                                },
-                                                "& .MuiInputLabel-root.Mui-focused": {
+                                                "& .MuiSvgIcon-root": {
                                                     color: "#67e8f9",
                                                 },
                                             }}
-                                        />
-
-                                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
-                                            <Button
-                                                fullWidth
-                                                variant="outlined"
-                                                startIcon={<PlaylistAddRoundedIcon />}
-                                                onClick={addDirectLinksToPlaylist}
-                                                disabled={isRendering || isLoading}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    py: 1.15,
-                                                    color: "#fff",
-                                                    borderColor: "rgba(255,255,255,0.18)",
-                                                    fontWeight: 950,
-                                                }}
+                                        >
+                                            <InputLabel id="visualizer-3d-model-label">
+                                                Model
+                                            </InputLabel>
+                                            <Select
+                                                labelId="visualizer-3d-model-label"
+                                                value={visualizer3dSettings.model}
+                                                label="Model"
+                                                onChange={(event) =>
+                                                    updateVisualizer3DSetting(
+                                                        "model",
+                                                        event.target.value
+                                                    )
+                                                }
                                             >
-                                                Add direct link(s)
-                                            </Button>
+                                                {VISUALIZER_3D_MODE_OPTIONS.map((mode) => (
+                                                    <MenuItem key={mode.value} value={mode.value}>
+                                                        {mode.label}
+                                                    </MenuItem>
+                                                ))}
+                                            </Select>
+                                        </FormControl>
+                                    )}
 
-                                            <Button
-                                                fullWidth
-                                                variant="text"
-                                                onClick={addCurrentMediaToPlaylist}
-                                                disabled={isRendering || isLoading || (!hasMedia && !sourceUrl)}
-                                                sx={{
-                                                    color: "rgba(255,255,255,0.78)",
-                                                    fontWeight: 950,
-                                                }}
-                                            >
-                                                Add loaded source
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-                                </Box>
+                                    <Box
+                                        sx={{
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            gap: 0.75,
+                                            px: 1.4,
+                                            py: 0.8,
+                                            borderRadius: 999,
+                                            background: "rgba(103,232,249,0.09)",
+                                            border: "1px solid rgba(103,232,249,0.18)",
+                                            color: "#67e8f9",
+                                            fontSize: 12,
+                                            fontWeight: 900,
+                                            letterSpacing: 0.3,
+                                        }}
+                                    >
+                                        <EqualizerRoundedIcon sx={{ fontSize: 18 }} />
+                                        processed analyser
+                                    </Box>
 
-                                <Button
-                                    variant={repeatEnabled ? "contained" : "outlined"}
-                                    startIcon={<RepeatRoundedIcon />}
-                                    onClick={toggleRepeat}
-                                    disabled={isRendering || isLoading}
+                                    <Box
+                                        sx={{
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            gap: 0.75,
+                                            px: 1.4,
+                                            py: 0.8,
+                                            borderRadius: 999,
+                                            background: "rgba(167,139,250,0.09)",
+                                            border: "1px solid rgba(167,139,250,0.18)",
+                                            color: "#c4b5fd",
+                                            fontSize: 12,
+                                            fontWeight: 900,
+                                            letterSpacing: 0.3,
+                                        }}
+                                    >
+                                        <TuneRoundedIcon sx={{ fontSize: 18 }} />
+                                        live graph
+                                    </Box>
+
+                                    <Box
+                                        sx={{
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            gap: 0.75,
+                                            px: 1.4,
+                                            py: 0.8,
+                                            borderRadius: 999,
+                                            background: repeatEnabled
+                                                ? "rgba(103,232,249,0.15)"
+                                                : "rgba(255,255,255,0.07)",
+                                            border: repeatEnabled
+                                                ? "1px solid rgba(103,232,249,0.28)"
+                                                : "1px solid rgba(255,255,255,0.12)",
+                                            color: repeatEnabled ? "#67e8f9" : "rgba(255,255,255,0.7)",
+                                            fontSize: 12,
+                                            fontWeight: 900,
+                                            letterSpacing: 0.3,
+                                        }}
+                                    >
+                                        <RepeatRoundedIcon sx={{ fontSize: 18 }} />
+                                        {repeatEnabled ? "repeat on" : "repeat off"}
+                                    </Box>
+                                </Stack>
+                            </Box>
+
+                            <Box
+                                sx={{
+                                    display: "grid",
+                                    gridTemplateColumns: { xs: "1fr", lg: "1fr 1fr" },
+                                    gap: 2,
+                                }}
+                            >
+                                <Box
+                                    component="canvas"
+                                    ref={waveformCanvasRef}
                                     sx={{
+                                        width: "100%",
+                                        height: { xs: 180, md: 230 },
+                                        display: "block",
                                         borderRadius: 4,
-                                        py: 1.25,
-                                        color: repeatEnabled ? "#06111e" : "#fff",
-                                        borderColor: "rgba(255,255,255,0.18)",
-                                        fontWeight: 950,
-                                        background: repeatEnabled
-                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                            : "transparent",
+                                        border: "1px solid rgba(255,255,255,0.1)",
+                                        background: "rgba(7,10,19,0.96)",
                                     }}
-                                >
-                                    {repeatEnabled
-                                        ? "Repeat current song: ON"
-                                        : "Repeat current song: OFF"}
-                                </Button>
+                                />
 
                                 <Box
+                                    component="canvas"
+                                    ref={frequencyCanvasRef}
                                     sx={{
+                                        width: "100%",
+                                        height: { xs: 180, md: 230 },
+                                        display: "block",
                                         borderRadius: 4,
-                                        p: 2,
-                                        background: repeatEnabled
-                                            ? "rgba(103,232,249,0.1)"
-                                            : "rgba(255,255,255,0.055)",
-                                        border: repeatEnabled
-                                            ? "1px solid rgba(103,232,249,0.2)"
-                                            : "1px solid rgba(255,255,255,0.08)",
+                                        border: "1px solid rgba(255,255,255,0.1)",
+                                        background: "rgba(7,10,19,0.96)",
                                     }}
-                                >
-                                    <Typography sx={{ color: "rgba(255,255,255,0.78)", lineHeight: 1.7 }}>
-                                        {playlistStatusLabel}
-                                    </Typography>
-                                </Box>
+                                />
+                            </Box>
 
-                                {activePlaylistItem && (
-                                    <Box
-                                        sx={{
-                                            borderRadius: 4,
-                                            p: 1.6,
-                                            background: "rgba(103,232,249,0.08)",
-                                            border: "1px solid rgba(103,232,249,0.16)",
-                                        }}
-                                    >
-                                        <Typography
-                                            variant="caption"
-                                            sx={{
-                                                color: "#67e8f9",
-                                                fontWeight: 950,
-                                                textTransform: "uppercase",
-                                                letterSpacing: 0.8,
-                                            }}
-                                        >
-                                            Active playlist track
+                            {visualizer3dSettings.enabled && (
+                                <Box
+                                    component="canvas"
+                                    ref={visualizer3dCanvasRef}
+                                    sx={{
+                                        width: "100%",
+                                        height: { xs: 240, md: 340 },
+                                        display: "block",
+                                        borderRadius: 4,
+                                        border: "1px solid rgba(103,232,249,0.14)",
+                                        background:
+                                            "radial-gradient(circle at 50% 18%, rgba(103,232,249,0.12), transparent 38%), rgba(7,10,19,0.98)",
+                                    }}
+                                />
+                            )}
+                        </Stack>
+                    </GlassCard>
+
+                    <Box
+                        sx={{
+                            display: "grid",
+                            gridTemplateColumns: { xs: "1fr", lg: "0.82fr 1.18fr" },
+                            gap: 3,
+                            alignItems: "start",
+                        }}
+                    >
+                        <Stack spacing={3}>
+                            <MediaInputForm
+                                fileName={inputFile?.name || ""}
+                                linkValue={directLink}
+                                onLinkChange={setDirectLink}
+                                onFileSelect={(file) => handleFileSelect(file, "Upload media file")}
+                                onLoadLink={handleLoadDirectLink}
+                                onClear={handleClearMedia}
+                                disabled={isRendering || isLoading}
+                            />
+
+                            <GlassCard>
+                                <Stack spacing={2.5}>
+                                    <Box>
+                                        <Stack direction="row" alignItems="center" spacing={1.1}>
+                                            <QueueMusicRoundedIcon sx={{ color: "#67e8f9" }} />
+
+                                            <Typography variant="h5" sx={{ fontWeight: 950 }}>
+                                                Playlist player: uploads and direct links
+                                            </Typography>
+                                        </Stack>
+
+                                        <Typography sx={{ color: "rgba(255,255,255,0.62)", mt: 0.75 }}>
+                                            Add uploaded files, paste direct media URLs, preload the queue, start
+                                            from track 1 with one large button, repeat the current song, or let
+                                            playback auto-skip bad items and continue when repeat is off. On iPhone,
+                                            auto-next preserves the unlocked hidden audio output so the next track can
+                                            start when the current track finishes.
                                         </Typography>
-
-                                        <Stack
-                                            direction="row"
-                                            alignItems="center"
-                                            spacing={1.15}
-                                            sx={{ mt: 0.8, minWidth: 0 }}
-                                        >
-                                            {activePlaylistArtworkSource ? (
-                                                <Box
-                                                    component="img"
-                                                    src={activePlaylistArtworkSource}
-                                                    alt=""
-                                                    sx={{
-                                                        width: 46,
-                                                        height: 46,
-                                                        borderRadius: 2.25,
-                                                        objectFit: "cover",
-                                                        flex: "0 0 auto",
-                                                        border: "1px solid rgba(255,255,255,0.16)",
-                                                        background: "rgba(255,255,255,0.08)",
-                                                    }}
-                                                />
-                                            ) : (
-                                                <Box
-                                                    sx={{
-                                                        width: 46,
-                                                        height: 46,
-                                                        borderRadius: 2.25,
-                                                        display: "grid",
-                                                        placeItems: "center",
-                                                        flex: "0 0 auto",
-                                                        color: "#67e8f9",
-                                                        background:
-                                                            "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
-                                                        border: "1px solid rgba(255,255,255,0.12)",
-                                                    }}
-                                                >
-                                                    <AudioFileRoundedIcon sx={{ fontSize: 23 }} />
-                                                </Box>
-                                            )}
-
-                                            <Typography
-                                                sx={{
-                                                    color: "#fff",
-                                                    fontWeight: 900,
-                                                    overflow: "hidden",
-                                                    textOverflow: "ellipsis",
-                                                    whiteSpace: "nowrap",
-                                                    minWidth: 0,
-                                                }}
-                                                title={activePlaylistItem.title}
-                                            >
-                                                {activePlaylistIndex + 1}. {activePlaylistItem.title}
-                                            </Typography>
-                                        </Stack>
                                     </Box>
-                                )}
 
-                                {!playlist.length ? (
-                                    <Box
-                                        sx={{
-                                            borderRadius: 4,
-                                            p: 3,
-                                            textAlign: "center",
-                                            border: "1px dashed rgba(255,255,255,0.18)",
-                                            color: "rgba(255,255,255,0.62)",
-                                        }}
-                                    >
-                                        No playlist items yet. Add uploaded files or paste direct file links above.
-                                    </Box>
-                                ) : (
-                                    <Stack spacing={1.1}>
-                                        {playlist.map((item, index) => {
-                                            const active = index === activePlaylistIndex;
-                                            const isDragSource =
-                                                playlistDragState.fromIndex === index;
-                                            const isDropTarget =
-                                                playlistDragState.overIndex === index &&
-                                                playlistDragState.fromIndex !== index;
-                                            const itemArtworkSource = buildAbsoluteMediaAssetUrl(
-                                                getPlaylistItemArtworkSource(item)
-                                            );
-
-                                            return (
-                                                <Box
-                                                    key={item.id}
-                                                    onDragOver={(event) => handlePlaylistDragOver(event, index)}
-                                                    onDrop={(event) => handlePlaylistDrop(event, index)}
-                                                    sx={{
-                                                        display: "grid",
-                                                        gridTemplateColumns: {
-                                                            xs: "46px minmax(0, 1fr)",
-                                                            sm: "46px minmax(0, 1fr) auto auto 44px",
-                                                        },
-                                                        gap: 1,
-                                                        alignItems: "center",
-                                                        borderRadius: 3,
-                                                        p: 1.25,
-                                                        transform: isDragSource
-                                                            ? "scale(0.985)"
-                                                            : isDropTarget
-                                                                ? "translateY(-2px)"
-                                                                : "none",
-                                                        transition:
-                                                            "transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease",
-                                                        background: active
-                                                            ? "rgba(103,232,249,0.14)"
-                                                            : isDropTarget
-                                                                ? "rgba(167,139,250,0.13)"
-                                                                : "rgba(255,255,255,0.06)",
-                                                        border: active
-                                                            ? "1px solid rgba(103,232,249,0.3)"
-                                                            : isDropTarget
-                                                                ? "1px solid rgba(167,139,250,0.45)"
-                                                                : "1px solid rgba(255,255,255,0.08)",
-                                                        boxShadow: isDropTarget
-                                                            ? "0 18px 36px rgba(167,139,250,0.15)"
-                                                            : "none",
-                                                        opacity: isDragSource ? 0.72 : 1,
-                                                    }}
-                                                >
-                                                    {itemArtworkSource ? (
-                                                        <Box
-                                                            component="img"
-                                                            src={itemArtworkSource}
-                                                            alt=""
-                                                            sx={{
-                                                                width: 46,
-                                                                height: 46,
-                                                                borderRadius: 2.25,
-                                                                objectFit: "cover",
-                                                                border: "1px solid rgba(255,255,255,0.12)",
-                                                                background: "rgba(255,255,255,0.08)",
-                                                            }}
-                                                        />
-                                                    ) : (
-                                                        <Box
-                                                            sx={{
-                                                                width: 46,
-                                                                height: 46,
-                                                                borderRadius: 2.25,
-                                                                display: "grid",
-                                                                placeItems: "center",
-                                                                color: "#67e8f9",
-                                                                background:
-                                                                    "linear-gradient(135deg, rgba(103,232,249,0.16), rgba(167,139,250,0.12))",
-                                                                border: "1px solid rgba(255,255,255,0.12)",
-                                                            }}
-                                                        >
-                                                            <AudioFileRoundedIcon sx={{ fontSize: 22 }} />
-                                                        </Box>
-                                                    )}
-
-                                                    <Box sx={{ minWidth: 0 }}>
-                                                        <Typography
-                                                            sx={{
-                                                                fontWeight: 900,
-                                                                overflow: "hidden",
-                                                                textOverflow: "ellipsis",
-                                                                whiteSpace: "nowrap",
-                                                            }}
-                                                            title={item.title}
-                                                        >
-                                                            {index + 1}. {item.title}
-                                                        </Typography>
-
-                                                        <Typography
-                                                            variant="caption"
-                                                            sx={{ color: "rgba(255,255,255,0.55)" }}
-                                                        >
-                                                            {getPlaylistItemMeta(item)}
-                                                        </Typography>
-                                                    </Box>
-
-                                                    <Button
-                                                        size="small"
-                                                        variant="outlined"
-                                                        onClick={() => loadPlaylistItem(index, true)}
-                                                        disabled={isRendering || isLoading || isPreloadingPlaylist}
-                                                        sx={{
-                                                            borderRadius: 999,
-                                                            color: "#fff",
-                                                            borderColor: "rgba(255,255,255,0.18)",
-                                                            fontWeight: 900,
-                                                            gridColumn: {
-                                                                xs: "1 / span 2",
-                                                                sm: "auto",
-                                                            },
-                                                        }}
-                                                    >
-                                                        Play
-                                                    </Button>
-
-                                                    <Button
-                                                        size="small"
-                                                        onClick={() => removePlaylistItem(item.id)}
-                                                        disabled={isRendering || isLoading || isPreloadingPlaylist}
-                                                        sx={{
-                                                            minWidth: 42,
-                                                            color: "rgba(255,255,255,0.68)",
-                                                            justifySelf: {
-                                                                xs: "end",
-                                                                sm: "auto",
-                                                            },
-                                                            gridColumn: {
-                                                                xs: "1 / span 2",
-                                                                sm: "auto",
-                                                            },
-                                                        }}
-                                                    >
-                                                        <DeleteRoundedIcon fontSize="small" />
-                                                    </Button>
-
-                                                    <Button
-                                                        size="small"
-                                                        draggable={
-                                                            !isRendering &&
-                                                            !isLoading &&
-                                                            !isPreloadingPlaylist &&
-                                                            playlist.length > 1
-                                                        }
-                                                        onDragStart={(event) =>
-                                                            handlePlaylistDragStart(event, index)
-                                                        }
-                                                        onDragEnd={handlePlaylistDragEnd}
-                                                        disabled={
-                                                            isRendering ||
-                                                            isLoading ||
-                                                            isPreloadingPlaylist ||
-                                                            playlist.length < 2
-                                                        }
-                                                        aria-label={`Drag ${item.title} to reorder playlist`}
-                                                        title="Drag from here to reorder"
-                                                        sx={{
-                                                            minWidth: 42,
-                                                            width: 42,
-                                                            height: 42,
-                                                            borderRadius: 2.5,
-                                                            color: "rgba(255,255,255,0.72)",
-                                                            cursor: playlist.length > 1 ? "grab" : "default",
-                                                            justifySelf: "end",
-                                                            gridColumn: {
-                                                                xs: "2",
-                                                                sm: "auto",
-                                                            },
-                                                            touchAction: "none",
-                                                            userSelect: "none",
-                                                            border: "1px solid rgba(255,255,255,0.12)",
-                                                            background: "rgba(255,255,255,0.045)",
-                                                            "&:active": {
-                                                                cursor: "grabbing",
-                                                            },
-                                                            "&:hover": {
-                                                                color: "#fff",
-                                                                borderColor: "rgba(167,139,250,0.42)",
-                                                                background: "rgba(167,139,250,0.12)",
-                                                            },
-                                                        }}
-                                                    >
-                                                        <DragIndicatorRoundedIcon fontSize="small" />
-                                                    </Button>
-                                                </Box>
-                                            );
-                                        })}
-
-                                        <Stack direction="row" flexWrap="wrap" gap={1}>
-                                            <Button
-                                                variant="outlined"
-                                                startIcon={<SkipPreviousRoundedIcon />}
-                                                onClick={playPreviousPlaylistItem}
-                                                disabled={isRendering || isLoading}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    color: "#fff",
-                                                    borderColor: "rgba(255,255,255,0.18)",
-                                                    fontWeight: 900,
-                                                }}
-                                            >
-                                                Play previous
-                                            </Button>
-
-                                            <Button
-                                                variant="outlined"
-                                                startIcon={<SkipNextRoundedIcon />}
-                                                onClick={playNextPlaylistItem}
-                                                disabled={isRendering || isLoading}
-                                                sx={{
-                                                    borderRadius: 999,
-                                                    color: "#fff",
-                                                    borderColor: "rgba(255,255,255,0.18)",
-                                                    fontWeight: 900,
-                                                }}
-                                            >
-                                                Play next
-                                            </Button>
-
-                                            <Button
-                                                variant="text"
-                                                onClick={clearPlaylist}
-                                                disabled={isRendering || isLoading}
-                                                sx={{
-                                                    color: "rgba(255,255,255,0.72)",
-                                                    fontWeight: 900,
-                                                }}
-                                            >
-                                                Clear playlist
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-                                )}
-                            </Stack>
-                        </GlassCard>
-
-                        <GlassCard>
-                            <Stack spacing={2.5}>
-                                <Box>
-                                    <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.5 }}>
-                                        Buffer player
-                                    </Typography>
-                                    <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
-                                        Playback uses fresh AudioBufferSourceNodes so scrubbing,
-                                        speed, pitch, panning, delay, and reverb stay stable.
-                                    </Typography>
-                                </Box>
-
-                                {!hasMedia && (
-                                    <Box
-                                        sx={{
-                                            borderRadius: 4,
-                                            p: 3,
-                                            textAlign: "center",
-                                            border: "1px dashed rgba(255,255,255,0.18)",
-                                            color: "rgba(255,255,255,0.62)",
-                                        }}
-                                    >
-                                        {isLoading
-                                            ? "Loading, sniffing, and decoding media..."
-                                            : "No decoded media loaded yet."}
-                                    </Box>
-                                )}
-
-                                {hasMedia && (
-                                    <Box
-                                        sx={{
-                                            borderRadius: 4,
-                                            p: 2.5,
-                                            background:
-                                                "linear-gradient(135deg, rgba(255,255,255,0.075), rgba(255,255,255,0.035))",
-                                            border: "1px solid rgba(255,255,255,0.11)",
-                                            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.06)",
-                                        }}
-                                    >
-                                        <Stack spacing={1.75}>
-                                            <Box
-                                                sx={{
-                                                    display: "grid",
-                                                    gridTemplateColumns: {
-                                                        xs: "1fr",
-                                                        md: "minmax(0, 1fr) 330px",
-                                                    },
-                                                    gap: 2,
-                                                    alignItems: "center",
-                                                }}
-                                            >
-                                                <Box sx={{ minWidth: 0 }}>
-                                                    <Stack
-                                                        direction="row"
-                                                        alignItems="center"
-                                                        spacing={1.15}
-                                                        sx={{ mb: 0.9, minWidth: 0 }}
-                                                    >
-                                                        {playerArtworkSource ? (
-                                                            <Box
-                                                                component="img"
-                                                                src={playerArtworkSource}
-                                                                alt=""
-                                                                sx={{
-                                                                    width: 58,
-                                                                    height: 58,
-                                                                    borderRadius: 3,
-                                                                    objectFit: "cover",
-                                                                    flex: "0 0 auto",
-                                                                    border: "1px solid rgba(255,255,255,0.14)",
-                                                                    background: "rgba(255,255,255,0.08)",
-                                                                    boxShadow: "0 12px 28px rgba(0,0,0,0.22)",
-                                                                }}
-                                                            />
-                                                        ) : (
-                                                            <Box
-                                                                sx={{
-                                                                    width: 58,
-                                                                    height: 58,
-                                                                    borderRadius: 3,
-                                                                    display: "grid",
-                                                                    placeItems: "center",
-                                                                    flex: "0 0 auto",
-                                                                    color: "#67e8f9",
-                                                                    background:
-                                                                        "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
-                                                                    border: "1px solid rgba(255,255,255,0.11)",
-                                                                }}
-                                                            >
-                                                                <AudioFileRoundedIcon sx={{ fontSize: 26 }} />
-                                                            </Box>
-                                                        )}
-
-                                                        <Box sx={{ minWidth: 0 }}>
-                                                            <Typography
-                                                                variant="caption"
-                                                                sx={{
-                                                                    color: "rgba(255,255,255,0.5)",
-                                                                    fontWeight: 900,
-                                                                    textTransform: "uppercase",
-                                                                    letterSpacing: 0.8,
-                                                                    display: "block",
-                                                                    mb: 0.15,
-                                                                }}
-                                                            >
-                                                                Current audio
-                                                            </Typography>
-
-                                                            <Typography
-                                                                sx={{
-                                                                    color: "rgba(255,255,255,0.94)",
-                                                                    fontWeight: 950,
-                                                                    lineHeight: 1.25,
-                                                                    overflow: "hidden",
-                                                                    textOverflow: "ellipsis",
-                                                                    whiteSpace: "nowrap",
-                                                                }}
-                                                                title={mediaTitle}
-                                                            >
-                                                                {mediaTitle}
-                                                            </Typography>
-                                                        </Box>
-                                                    </Stack>
-
-                                                    <Stack
-                                                        direction="row"
-                                                        alignItems="center"
-                                                        justifyContent="space-between"
-                                                        spacing={1.5}
-                                                        sx={{ minWidth: 0 }}
-                                                    >
-                                                        <Typography
-                                                            sx={{
-                                                                fontWeight: 900,
-                                                                color: "rgba(255,255,255,0.82)",
-                                                            }}
-                                                        >
-                                                            {isScrubbing
-                                                                ? "Scrubbing"
-                                                                : isPlaying
-                                                                    ? isMuted
-                                                                        ? "Playing muted preview"
-                                                                        : "Playing processed buffer"
-                                                                    : "Ready"}
-                                                        </Typography>
-
-                                                        <Typography
-                                                            sx={{
-                                                                color: "#67e8f9",
-                                                                fontWeight: 950,
-                                                                flex: "0 0 auto",
-                                                                fontVariantNumeric: "tabular-nums",
-                                                            }}
-                                                        >
-                                                            {formatTime(position)} / {formatTime(duration)}
-                                                        </Typography>
-                                                    </Stack>
-
-                                                    {mediaInfo && (
-                                                        <Typography
-                                                            variant="caption"
-                                                            sx={{
-                                                                color: "rgba(255,255,255,0.6)",
-                                                                display: "block",
-                                                                lineHeight: 1.5,
-                                                                mt: 0.4,
-                                                            }}
-                                                        >
-                                                            {mediaInfo}
-                                                        </Typography>
-                                                    )}
-                                                </Box>
-
-                                                <Box
-                                                    sx={{
-                                                        borderRadius: 3.5,
-                                                        px: 1.75,
-                                                        py: 1.35,
-                                                        background:
-                                                            "linear-gradient(135deg, rgba(7,10,19,0.76), rgba(15,23,42,0.56))",
-                                                        border: "1px solid rgba(255,255,255,0.11)",
-                                                        boxShadow:
-                                                            "0 14px 40px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.06)",
-                                                    }}
-                                                >
-                                                    <Stack spacing={0.8}>
-                                                        <Stack
-                                                            direction="row"
-                                                            alignItems="center"
-                                                            justifyContent="space-between"
-                                                            spacing={1}
-                                                        >
-                                                            <Stack
-                                                                direction="row"
-                                                                alignItems="center"
-                                                                spacing={0.8}
-                                                            >
-                                                                <VolumeUpRoundedIcon
-                                                                    sx={{
-                                                                        fontSize: 19,
-                                                                        color: "#67e8f9",
-                                                                    }}
-                                                                />
-                                                                <Typography
-                                                                    variant="caption"
-                                                                    sx={{
-                                                                        color: "rgba(255,255,255,0.86)",
-                                                                        fontWeight: 950,
-                                                                        textTransform: "uppercase",
-                                                                        letterSpacing: 0.8,
-                                                                    }}
-                                                                >
-                                                                    Base volume
-                                                                </Typography>
-                                                            </Stack>
-
-                                                            <Typography
-                                                                variant="caption"
-                                                                sx={{
-                                                                    color: "#67e8f9",
-                                                                    fontWeight: 950,
-                                                                    fontVariantNumeric: "tabular-nums",
-                                                                }}
-                                                            >
-                                                                {settingsView.baseVolume.toFixed(2)}x
-                                                            </Typography>
-                                                        </Stack>
-
-                                                        <Stack direction="row" alignItems="center" spacing={1.15}>
-                                                            <VolumeDownRoundedIcon
-                                                                sx={{
-                                                                    fontSize: 18,
-                                                                    color: "rgba(255,255,255,0.5)",
-                                                                    flex: "0 0 auto",
-                                                                }}
-                                                            />
-
-                                                            <Slider
-                                                                value={settingsView.baseVolume}
-                                                                min={0}
-                                                                max={HUMAN_SAFE_LIMITS.baseVolume.max}
-                                                                step={0.01}
-                                                                aria-label="Safe base volume"
-                                                                disabled={isRendering || isLoading || isPreloadingPlaylist}
-                                                                onChange={(_, value) =>
-                                                                    updateSetting(
-                                                                        "baseVolume",
-                                                                        Array.isArray(value) ? value[0] : value
-                                                                    )
-                                                                }
-                                                                valueLabelDisplay="auto"
-                                                                valueLabelFormat={(value) =>
-                                                                    `${Number(value).toFixed(2)}x`
-                                                                }
-                                                                sx={{
-                                                                    color: "#67e8f9",
-                                                                    py: 0,
-                                                                    "& .MuiSlider-thumb": {
-                                                                        width: 16,
-                                                                        height: 16,
-                                                                        boxShadow:
-                                                                            "0 0 0 7px rgba(103,232,249,0.08)",
-                                                                    },
-                                                                    "& .MuiSlider-rail": {
-                                                                        color: "rgba(255,255,255,0.18)",
-                                                                    },
-                                                                    "& .MuiSlider-track": {
-                                                                        border: "none",
-                                                                    },
-                                                                }}
-                                                            />
-
-                                                            <VolumeUpRoundedIcon
-                                                                sx={{
-                                                                    fontSize: 18,
-                                                                    color: "rgba(255,255,255,0.68)",
-                                                                    flex: "0 0 auto",
-                                                                }}
-                                                            />
-                                                        </Stack>
-                                                    </Stack>
-                                                </Box>
-                                            </Box>
-
-                                            <Slider
-                                                value={clamp(position, 0, duration || 0)}
-                                                min={0}
-                                                max={duration || 0}
-                                                step={0.01}
-                                                disabled={!hasMedia || isRendering || isLoading}
-                                                onPointerDown={handleScrubStart}
-                                                onMouseDown={handleScrubStart}
-                                                onTouchStart={handleScrubStart}
-                                                onKeyDown={handleScrubKeyDown}
-                                                onChange={handleScrubChange}
-                                                onChangeCommitted={handleScrubCommit}
-                                                valueLabelDisplay="auto"
-                                                valueLabelFormat={(value) => formatTime(value)}
-                                                sx={{
-                                                    color: "#67e8f9",
-                                                    "& .MuiSlider-thumb": {
-                                                        boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
-                                                    },
-                                                    "& .MuiSlider-rail": {
-                                                        color: "rgba(255,255,255,0.18)",
-                                                    },
-                                                }}
-                                            />
-
-                                            <LinearProgress
-                                                variant="determinate"
-                                                value={progressValue}
-                                                sx={{
-                                                    height: 10,
-                                                    borderRadius: 999,
-                                                    background: "rgba(255,255,255,0.12)",
-                                                    "& .MuiLinearProgress-bar": {
-                                                        background:
-                                                            "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                                    },
-                                                }}
-                                            />
-
-                                            <Typography
-                                                variant="caption"
-                                                sx={{ color: "rgba(255,255,255,0.58)" }}
-                                            >
-                                                pan = {settingsView.pan.toFixed(2)} | delay ={" "}
-                                                {settingsView.delayMix.toFixed(2)} | reverb ={" "}
-                                                {settingsView.reverbMix.toFixed(2)} | playbackRate ={" "}
-                                                {settingsView.speed.toFixed(2)}x | detune ={" "}
-                                                {pitchCents.toFixed(0)} cents | effective rate ={" "}
-                                                {effectiveRate.toFixed(2)}x
-                                            </Typography>
-                                        </Stack>
-                                    </Box>
-                                )}
-
-                                <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
                                     <Button
                                         fullWidth
                                         size="large"
                                         variant="contained"
                                         startIcon={
-                                            showPauseForMainControls ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
+                                            showPauseForPlaylistControls ? (
+                                                <PauseRoundedIcon />
+                                            ) : (
+                                                <PlayArrowRoundedIcon />
+                                            )
                                         }
-                                        onClick={handlePlayPause}
-                                        disabled={!hasMedia || isRendering || isLoading}
+                                        onClick={handlePlaylistPrimaryPlay}
+                                        disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
                                         sx={{
-                                            borderRadius: 4,
-                                            py: 1.35,
-                                            fontWeight: 950,
+                                            borderRadius: 5,
+                                            py: { xs: 1.9, md: 2.35 },
+                                            px: 2.25,
+                                            fontSize: { xs: 17, md: 20 },
+                                            fontWeight: 1000,
+                                            letterSpacing: 0.2,
                                             color: "#06111e",
                                             background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            boxShadow:
+                                                "0 24px 70px rgba(103,232,249,0.26), inset 0 1px 0 rgba(255,255,255,0.25)",
+                                            "&:hover": {
+                                                background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                filter: "brightness(1.05)",
+                                                transform: "translateY(-1px)",
+                                            },
                                         }}
                                     >
-                                        {showPauseForMainControls ? "Pause playback" : "Play processed audio"}
+                                        {showPauseForPlaylistControls
+                                            ? "Pause playlist"
+                                            : "Start playlist"}
                                     </Button>
 
                                     <Button
                                         fullWidth
                                         size="large"
                                         variant="outlined"
-                                        startIcon={<RestartAltRoundedIcon />}
-                                        onClick={restartPlayback}
-                                        disabled={!hasMedia || isRendering || isLoading}
+                                        startIcon={
+                                            isPreloadingPlaylist ? (
+                                                <LinearProgress
+                                                    sx={{
+                                                        width: 28,
+                                                        height: 6,
+                                                        borderRadius: 999,
+                                                        background: "rgba(255,255,255,0.16)",
+                                                        "& .MuiLinearProgress-bar": {
+                                                            background: "#67e8f9",
+                                                        },
+                                                    }}
+                                                />
+                                            ) : (
+                                                <QueueMusicRoundedIcon />
+                                            )
+                                        }
+                                        onClick={preloadPlaylist}
+                                        disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
                                         sx={{
-                                            borderRadius: 4,
-                                            py: 1.35,
-                                            color: "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
+                                            borderRadius: 5,
+                                            py: { xs: 1.35, md: 1.55 },
+                                            px: 2.25,
                                             fontWeight: 950,
+                                            color: "#fff",
+                                            borderColor: "rgba(103,232,249,0.34)",
+                                            background: "rgba(103,232,249,0.07)",
+                                            "&:hover": {
+                                                borderColor: "rgba(103,232,249,0.62)",
+                                                background: "rgba(103,232,249,0.12)",
+                                            },
                                         }}
                                     >
-                                        Restart
+                                        {isPreloadingPlaylist
+                                            ? "Preloading playlist..."
+                                            : "Preload playlist direct + proxy fallback"}
                                     </Button>
+
+                                    {playlistPreloadSummary && (
+                                        <Typography
+                                            variant="caption"
+                                            sx={{
+                                                color: "rgba(255,255,255,0.64)",
+                                                lineHeight: 1.55,
+                                                mt: -0.5,
+                                            }}
+                                        >
+                                            {playlistPreloadSummary}
+                                        </Typography>
+                                    )}
+
+
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 1.6,
+                                            background: carPlaySafeMode
+                                                ? "rgba(103,232,249,0.1)"
+                                                : "rgba(255,255,255,0.045)",
+                                            border: carPlaySafeMode
+                                                ? "1px solid rgba(103,232,249,0.24)"
+                                                : "1px solid rgba(255,255,255,0.08)",
+                                        }}
+                                    >
+                                        <Stack spacing={1.15}>
+                                            <Stack
+                                                direction={{ xs: "column", sm: "row" }}
+                                                alignItems={{ xs: "stretch", sm: "center" }}
+                                                justifyContent="space-between"
+                                                spacing={1}
+                                            >
+                                                <Box>
+                                                    <Typography sx={{ fontWeight: 950, color: "#fff" }}>
+                                                        CarPlay / USB safe mode
+                                                    </Typography>
+                                                    <Typography
+                                                        variant="caption"
+                                                        sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.55 }}
+                                                    >
+                                                        Best for wired iPhone CarPlay where effects or route output can jump.
+                                                    </Typography>
+                                                </Box>
+
+                                                <Button
+                                                    variant={carPlaySafeMode ? "contained" : "outlined"}
+                                                    onClick={toggleCarPlaySafeMode}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: carPlaySafeMode ? "#06111e" : "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 950,
+                                                        background: carPlaySafeMode
+                                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                            : "transparent",
+                                                        whiteSpace: "nowrap",
+                                                    }}
+                                                >
+                                                    {carPlaySafeMode ? "Safe mode ON" : "Safe mode OFF"}
+                                                </Button>
+                                            </Stack>
+
+                                            <Typography sx={{ color: "rgba(255,255,255,0.72)", lineHeight: 1.65 }}>
+                                                {carPlayOutputStatus}
+                                            </Typography>
+                                        </Stack>
+                                    </Box>
+
                                     <Button
-                                        fullWidth
-                                        size="large"
+                                        component="label"
+                                        variant="contained"
+                                        startIcon={<PlaylistAddRoundedIcon />}
+                                        disabled={isRendering || isLoading}
+                                        sx={{
+                                            borderRadius: 999,
+                                            py: 1.35,
+                                            fontWeight: 950,
+                                            color: "#06111e",
+                                            background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            boxShadow: "0 18px 46px rgba(103,232,249,0.18)",
+                                            "&:hover": {
+                                                background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                filter: "brightness(1.04)",
+                                            },
+                                        }}
+                                    >
+                                        Add uploaded files to playlist
+                                        <input
+                                            hidden
+                                            multiple
+                                            type="file"
+                                            accept="audio/*,video/*,.mp3,.wav,.ogg,.oga,.opus,.webm,.m4a,.mp4,.mov,.aac,.flac,.aif,.aiff"
+                                            onChange={(event) => {
+                                                addFilesToPlaylist(event.target.files);
+                                                event.target.value = "";
+                                            }}
+                                        />
+                                    </Button>
+
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 1.5,
+                                            background: "rgba(255,255,255,0.045)",
+                                            border: "1px solid rgba(255,255,255,0.08)",
+                                        }}
+                                    >
+                                        <Stack spacing={1.25}>
+                                            <TextField
+                                                fullWidth
+                                                multiline
+                                                minRows={2}
+                                                value={playlistLink}
+                                                onChange={(event) => setPlaylistLink(event.target.value)}
+                                                disabled={isRendering || isLoading}
+                                                placeholder="Paste direct media URL(s), one per line or comma-separated: .mp3, .wav, .m4a, .mp4, .mov, .webm, .ogg..."
+                                                label="Direct file links for playlist"
+                                                variant="outlined"
+                                                sx={{
+                                                    "& .MuiOutlinedInput-root": {
+                                                        color: "#fff",
+                                                        borderRadius: 3,
+                                                        background: "rgba(7,10,19,0.48)",
+                                                        "& fieldset": {
+                                                            borderColor: "rgba(255,255,255,0.16)",
+                                                        },
+                                                        "&:hover fieldset": {
+                                                            borderColor: "rgba(103,232,249,0.35)",
+                                                        },
+                                                        "&.Mui-focused fieldset": {
+                                                            borderColor: "#67e8f9",
+                                                        },
+                                                    },
+                                                    "& .MuiInputLabel-root": {
+                                                        color: "rgba(255,255,255,0.68)",
+                                                    },
+                                                    "& .MuiInputLabel-root.Mui-focused": {
+                                                        color: "#67e8f9",
+                                                    },
+                                                }}
+                                            />
+
+                                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                                                <Button
+                                                    fullWidth
+                                                    variant="outlined"
+                                                    startIcon={<PlaylistAddRoundedIcon />}
+                                                    onClick={addDirectLinksToPlaylist}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        py: 1.15,
+                                                        color: "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 950,
+                                                    }}
+                                                >
+                                                    Add direct link(s)
+                                                </Button>
+
+                                                <Button
+                                                    fullWidth
+                                                    variant="text"
+                                                    onClick={addCurrentMediaToPlaylist}
+                                                    disabled={isRendering || isLoading || (!hasMedia && !sourceUrl)}
+                                                    sx={{
+                                                        color: "rgba(255,255,255,0.78)",
+                                                        fontWeight: 950,
+                                                    }}
+                                                >
+                                                    Add loaded source
+                                                </Button>
+                                            </Stack>
+                                        </Stack>
+                                    </Box>
+
+                                    <Button
                                         variant={repeatEnabled ? "contained" : "outlined"}
                                         startIcon={<RepeatRoundedIcon />}
                                         onClick={toggleRepeat}
-                                        disabled={!hasMedia || isRendering || isLoading}
+                                        disabled={isRendering || isLoading}
                                         sx={{
                                             borderRadius: 4,
-                                            py: 1.35,
+                                            py: 1.25,
                                             color: repeatEnabled ? "#06111e" : "#fff",
                                             borderColor: "rgba(255,255,255,0.18)",
                                             fontWeight: 950,
@@ -11756,626 +11466,1603 @@ export default function Audio() {
                                                 : "transparent",
                                         }}
                                     >
-                                        {repeatEnabled ? "Repeat on" : "Repeat off"}
+                                        {repeatEnabled
+                                            ? "Repeat current song: ON"
+                                            : "Repeat current song: OFF"}
                                     </Button>
 
-                                    <Button
-                                        fullWidth
-                                        size="large"
-                                        variant="outlined"
-                                        startIcon={<SkipPreviousRoundedIcon />}
-                                        onClick={playPreviousPlaylistItem}
-                                        disabled={!playlist.length || isRendering || isLoading}
+                                    <Box
                                         sx={{
                                             borderRadius: 4,
-                                            py: 1.35,
-                                            color: "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
+                                            p: 2,
+                                            background: repeatEnabled
+                                                ? "rgba(103,232,249,0.1)"
+                                                : "rgba(255,255,255,0.055)",
+                                            border: repeatEnabled
+                                                ? "1px solid rgba(103,232,249,0.2)"
+                                                : "1px solid rgba(255,255,255,0.08)",
                                         }}
                                     >
-                                        Previous track
-                                    </Button>
+                                        <Typography sx={{ color: "rgba(255,255,255,0.78)", lineHeight: 1.7 }}>
+                                            {playlistStatusLabel}
+                                        </Typography>
+                                    </Box>
 
-                                    <Button
-                                        fullWidth
-                                        size="large"
-                                        variant="outlined"
-                                        startIcon={<SkipNextRoundedIcon />}
-                                        onClick={playNextPlaylistItem}
-                                        disabled={!playlist.length || isRendering || isLoading}
-                                        sx={{
-                                            borderRadius: 4,
-                                            py: 1.35,
-                                            color: "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
-                                            fontWeight: 950,
-                                        }}
-                                    >
-                                        Next track
-                                    </Button>
+                                    {activePlaylistItem && (
+                                        <Box
+                                            sx={{
+                                                borderRadius: 4,
+                                                p: 1.6,
+                                                background: "rgba(103,232,249,0.08)",
+                                                border: "1px solid rgba(103,232,249,0.16)",
+                                            }}
+                                        >
+                                            <Typography
+                                                variant="caption"
+                                                sx={{
+                                                    color: "#67e8f9",
+                                                    fontWeight: 950,
+                                                    textTransform: "uppercase",
+                                                    letterSpacing: 0.8,
+                                                }}
+                                            >
+                                                Active playlist track
+                                            </Typography>
+
+                                            <Stack
+                                                direction="row"
+                                                alignItems="center"
+                                                spacing={1.15}
+                                                sx={{ mt: 0.8, minWidth: 0 }}
+                                            >
+                                                {activePlaylistArtworkSource ? (
+                                                    <Box
+                                                        component="img"
+                                                        src={activePlaylistArtworkSource}
+                                                        alt={`${activePlaylistItem.title} artwork`}
+                                                        role="button"
+                                                        tabIndex={0}
+                                                        aria-label={`Open larger artwork for ${activePlaylistItem.title}`}
+                                                        onClick={() =>
+                                                            openArtworkPreview(
+                                                                activePlaylistArtworkSource,
+                                                                activePlaylistItem.title,
+                                                                "Active playlist artwork"
+                                                            )
+                                                        }
+                                                        onKeyDown={(event) =>
+                                                            handleArtworkPreviewKeyDown(
+                                                                event,
+                                                                activePlaylistArtworkSource,
+                                                                activePlaylistItem.title,
+                                                                "Active playlist artwork"
+                                                            )
+                                                        }
+                                                        sx={{
+                                                            width: 46,
+                                                            height: 46,
+                                                            borderRadius: 2.25,
+                                                            objectFit: "cover",
+                                                            flex: "0 0 auto",
+                                                            border: "1px solid rgba(255,255,255,0.16)",
+                                                            background: "rgba(255,255,255,0.08)",
+                                                            cursor: "zoom-in",
+                                                            boxShadow: "0 10px 22px rgba(0,0,0,0.18)",
+                                                            transition:
+                                                                "transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease",
+                                                            "&:hover, &:focus-visible": {
+                                                                transform: "scale(1.055)",
+                                                                borderColor: "rgba(103,232,249,0.55)",
+                                                                boxShadow: "0 16px 34px rgba(103,232,249,0.14)",
+                                                                outline: "none",
+                                                            },
+                                                        }}
+                                                    />
+                                                ) : (
+                                                    <Box
+                                                        sx={{
+                                                            width: 46,
+                                                            height: 46,
+                                                            borderRadius: 2.25,
+                                                            display: "grid",
+                                                            placeItems: "center",
+                                                            flex: "0 0 auto",
+                                                            color: "#67e8f9",
+                                                            background:
+                                                                "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
+                                                            border: "1px solid rgba(255,255,255,0.12)",
+                                                        }}
+                                                    >
+                                                        <AudioFileRoundedIcon sx={{ fontSize: 23 }} />
+                                                    </Box>
+                                                )}
+
+                                                <Typography
+                                                    sx={{
+                                                        color: "#fff",
+                                                        fontWeight: 900,
+                                                        overflow: "hidden",
+                                                        textOverflow: "ellipsis",
+                                                        whiteSpace: "nowrap",
+                                                        minWidth: 0,
+                                                    }}
+                                                    title={activePlaylistItem.title}
+                                                >
+                                                    {activePlaylistIndex + 1}. {activePlaylistItem.title}
+                                                </Typography>
+                                            </Stack>
+                                        </Box>
+                                    )}
+
+                                    {!playlist.length ? (
+                                        <Box
+                                            sx={{
+                                                borderRadius: 4,
+                                                p: 3,
+                                                textAlign: "center",
+                                                border: "1px dashed rgba(255,255,255,0.18)",
+                                                color: "rgba(255,255,255,0.62)",
+                                            }}
+                                        >
+                                            No playlist items yet. Add uploaded files or paste direct file links above.
+                                        </Box>
+                                    ) : (
+                                        <Stack spacing={1.1}>
+                                            {playlist.map((item, index) => {
+                                                const active = index === activePlaylistIndex;
+                                                const isDragSource =
+                                                    playlistDragState.fromIndex === index;
+                                                const isDropTarget =
+                                                    playlistDragState.overIndex === index &&
+                                                    playlistDragState.fromIndex !== index;
+                                                const itemArtworkSource = buildAbsoluteMediaAssetUrl(
+                                                    getPlaylistItemArtworkSource(item)
+                                                );
+
+                                                return (
+                                                    <Box
+                                                        key={item.id}
+                                                        onDragOver={(event) => handlePlaylistDragOver(event, index)}
+                                                        onDrop={(event) => handlePlaylistDrop(event, index)}
+                                                        sx={{
+                                                            display: "grid",
+                                                            gridTemplateColumns: {
+                                                                xs: "46px minmax(0, 1fr)",
+                                                                sm: "46px minmax(0, 1fr) auto auto 44px",
+                                                            },
+                                                            gap: 1,
+                                                            alignItems: "center",
+                                                            borderRadius: 3,
+                                                            p: 1.25,
+                                                            transform: isDragSource
+                                                                ? "scale(0.985)"
+                                                                : isDropTarget
+                                                                    ? "translateY(-2px)"
+                                                                    : "none",
+                                                            transition:
+                                                                "transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease",
+                                                            background: active
+                                                                ? "rgba(103,232,249,0.14)"
+                                                                : isDropTarget
+                                                                    ? "rgba(167,139,250,0.13)"
+                                                                    : "rgba(255,255,255,0.06)",
+                                                            border: active
+                                                                ? "1px solid rgba(103,232,249,0.3)"
+                                                                : isDropTarget
+                                                                    ? "1px solid rgba(167,139,250,0.45)"
+                                                                    : "1px solid rgba(255,255,255,0.08)",
+                                                            boxShadow: isDropTarget
+                                                                ? "0 18px 36px rgba(167,139,250,0.15)"
+                                                                : "none",
+                                                            opacity: isDragSource ? 0.72 : 1,
+                                                        }}
+                                                    >
+                                                        {itemArtworkSource ? (
+                                                            <Box
+                                                                component="img"
+                                                                src={itemArtworkSource}
+                                                                alt={`${item.title} artwork`}
+                                                                role="button"
+                                                                tabIndex={0}
+                                                                aria-label={`Open larger artwork for ${item.title}`}
+                                                                onClick={(event) => {
+                                                                    event.stopPropagation();
+                                                                    openArtworkPreview(
+                                                                        itemArtworkSource,
+                                                                        item.title,
+                                                                        `Playlist item ${index + 1}`
+                                                                    );
+                                                                }}
+                                                                onKeyDown={(event) =>
+                                                                    handleArtworkPreviewKeyDown(
+                                                                        event,
+                                                                        itemArtworkSource,
+                                                                        item.title,
+                                                                        `Playlist item ${index + 1}`
+                                                                    )
+                                                                }
+                                                                sx={{
+                                                                    width: 46,
+                                                                    height: 46,
+                                                                    borderRadius: 2.25,
+                                                                    objectFit: "cover",
+                                                                    border: "1px solid rgba(255,255,255,0.12)",
+                                                                    background: "rgba(255,255,255,0.08)",
+                                                                    cursor: "zoom-in",
+                                                                    boxShadow: "0 10px 22px rgba(0,0,0,0.16)",
+                                                                    transition:
+                                                                        "transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease",
+                                                                    "&:hover, &:focus-visible": {
+                                                                        transform: "scale(1.055)",
+                                                                        borderColor: "rgba(167,139,250,0.55)",
+                                                                        boxShadow: "0 16px 34px rgba(167,139,250,0.14)",
+                                                                        outline: "none",
+                                                                    },
+                                                                }}
+                                                            />
+                                                        ) : (
+                                                            <Box
+                                                                sx={{
+                                                                    width: 46,
+                                                                    height: 46,
+                                                                    borderRadius: 2.25,
+                                                                    display: "grid",
+                                                                    placeItems: "center",
+                                                                    color: "#67e8f9",
+                                                                    background:
+                                                                        "linear-gradient(135deg, rgba(103,232,249,0.16), rgba(167,139,250,0.12))",
+                                                                    border: "1px solid rgba(255,255,255,0.12)",
+                                                                }}
+                                                            >
+                                                                <AudioFileRoundedIcon sx={{ fontSize: 22 }} />
+                                                            </Box>
+                                                        )}
+
+                                                        <Box sx={{ minWidth: 0 }}>
+                                                            <Typography
+                                                                sx={{
+                                                                    fontWeight: 900,
+                                                                    overflow: "hidden",
+                                                                    textOverflow: "ellipsis",
+                                                                    whiteSpace: "nowrap",
+                                                                }}
+                                                                title={item.title}
+                                                            >
+                                                                {index + 1}. {item.title}
+                                                            </Typography>
+
+                                                            <Typography
+                                                                variant="caption"
+                                                                sx={{ color: "rgba(255,255,255,0.55)" }}
+                                                            >
+                                                                {getPlaylistItemMeta(item)}
+                                                            </Typography>
+                                                        </Box>
+
+                                                        <Button
+                                                            size="small"
+                                                            variant="outlined"
+                                                            onClick={() => loadPlaylistItem(index, true)}
+                                                            disabled={isRendering || isLoading || isPreloadingPlaylist}
+                                                            sx={{
+                                                                borderRadius: 999,
+                                                                color: "#fff",
+                                                                borderColor: "rgba(255,255,255,0.18)",
+                                                                fontWeight: 900,
+                                                                gridColumn: {
+                                                                    xs: "1 / span 2",
+                                                                    sm: "auto",
+                                                                },
+                                                            }}
+                                                        >
+                                                            Play
+                                                        </Button>
+
+                                                        <Button
+                                                            size="small"
+                                                            onClick={() => removePlaylistItem(item.id)}
+                                                            disabled={isRendering || isLoading || isPreloadingPlaylist}
+                                                            sx={{
+                                                                minWidth: 42,
+                                                                color: "rgba(255,255,255,0.68)",
+                                                                justifySelf: {
+                                                                    xs: "end",
+                                                                    sm: "auto",
+                                                                },
+                                                                gridColumn: {
+                                                                    xs: "1 / span 2",
+                                                                    sm: "auto",
+                                                                },
+                                                            }}
+                                                        >
+                                                            <DeleteRoundedIcon fontSize="small" />
+                                                        </Button>
+
+                                                        <Button
+                                                            size="small"
+                                                            draggable={
+                                                                !isRendering &&
+                                                                !isLoading &&
+                                                                !isPreloadingPlaylist &&
+                                                                playlist.length > 1
+                                                            }
+                                                            onDragStart={(event) =>
+                                                                handlePlaylistDragStart(event, index)
+                                                            }
+                                                            onDragEnd={handlePlaylistDragEnd}
+                                                            disabled={
+                                                                isRendering ||
+                                                                isLoading ||
+                                                                isPreloadingPlaylist ||
+                                                                playlist.length < 2
+                                                            }
+                                                            aria-label={`Drag ${item.title} to reorder playlist`}
+                                                            title="Drag from here to reorder"
+                                                            sx={{
+                                                                minWidth: 42,
+                                                                width: 42,
+                                                                height: 42,
+                                                                borderRadius: 2.5,
+                                                                color: "rgba(255,255,255,0.72)",
+                                                                cursor: playlist.length > 1 ? "grab" : "default",
+                                                                justifySelf: "end",
+                                                                gridColumn: {
+                                                                    xs: "2",
+                                                                    sm: "auto",
+                                                                },
+                                                                touchAction: "none",
+                                                                userSelect: "none",
+                                                                border: "1px solid rgba(255,255,255,0.12)",
+                                                                background: "rgba(255,255,255,0.045)",
+                                                                "&:active": {
+                                                                    cursor: "grabbing",
+                                                                },
+                                                                "&:hover": {
+                                                                    color: "#fff",
+                                                                    borderColor: "rgba(167,139,250,0.42)",
+                                                                    background: "rgba(167,139,250,0.12)",
+                                                                },
+                                                            }}
+                                                        >
+                                                            <DragIndicatorRoundedIcon fontSize="small" />
+                                                        </Button>
+                                                    </Box>
+                                                );
+                                            })}
+
+                                            <Stack direction="row" flexWrap="wrap" gap={1}>
+                                                <Button
+                                                    variant="outlined"
+                                                    startIcon={<SkipPreviousRoundedIcon />}
+                                                    onClick={playPreviousPlaylistItem}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                >
+                                                    Play previous
+                                                </Button>
+
+                                                <Button
+                                                    variant="outlined"
+                                                    startIcon={<SkipNextRoundedIcon />}
+                                                    onClick={playNextPlaylistItem}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                >
+                                                    Play next
+                                                </Button>
+
+                                                <Button
+                                                    variant="text"
+                                                    onClick={clearPlaylist}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        color: "rgba(255,255,255,0.72)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                >
+                                                    Clear playlist
+                                                </Button>
+                                            </Stack>
+                                        </Stack>
+                                    )}
                                 </Stack>
+                            </GlassCard>
 
-                                <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
+                            <GlassCard>
+                                <Stack spacing={2.5}>
+                                    <Box>
+                                        <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.5 }}>
+                                            Buffer player
+                                        </Typography>
+                                        <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
+                                            Playback uses fresh AudioBufferSourceNodes so scrubbing,
+                                            speed, pitch, panning, delay, and reverb stay stable.
+                                        </Typography>
+                                    </Box>
+
+                                    {!hasMedia && (
+                                        <Box
+                                            sx={{
+                                                borderRadius: 4,
+                                                p: 3,
+                                                textAlign: "center",
+                                                border: "1px dashed rgba(255,255,255,0.18)",
+                                                color: "rgba(255,255,255,0.62)",
+                                            }}
+                                        >
+                                            {isLoading
+                                                ? "Loading, sniffing, and decoding media..."
+                                                : "No decoded media loaded yet."}
+                                        </Box>
+                                    )}
+
+                                    {hasMedia && (
+                                        <Box
+                                            sx={{
+                                                borderRadius: 4,
+                                                p: 2.5,
+                                                background:
+                                                    "linear-gradient(135deg, rgba(255,255,255,0.075), rgba(255,255,255,0.035))",
+                                                border: "1px solid rgba(255,255,255,0.11)",
+                                                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.06)",
+                                            }}
+                                        >
+                                            <Stack spacing={1.75}>
+                                                <Box
+                                                    sx={{
+                                                        display: "grid",
+                                                        gridTemplateColumns: {
+                                                            xs: "1fr",
+                                                            md: "minmax(0, 1fr) 330px",
+                                                        },
+                                                        gap: 2,
+                                                        alignItems: "center",
+                                                    }}
+                                                >
+                                                    <Box sx={{ minWidth: 0 }}>
+                                                        <Stack
+                                                            direction="row"
+                                                            alignItems="center"
+                                                            spacing={1.15}
+                                                            sx={{ mb: 0.9, minWidth: 0 }}
+                                                        >
+                                                            {playerArtworkSource ? (
+                                                                <Box
+                                                                    component="img"
+                                                                    src={playerArtworkSource}
+                                                                    alt={`${mediaTitle} artwork`}
+                                                                    role="button"
+                                                                    tabIndex={0}
+                                                                    aria-label={`Open larger artwork for ${mediaTitle}`}
+                                                                    onClick={() =>
+                                                                        openArtworkPreview(
+                                                                            playerArtworkSource,
+                                                                            mediaTitle,
+                                                                            "Current audio artwork"
+                                                                        )
+                                                                    }
+                                                                    onKeyDown={(event) =>
+                                                                        handleArtworkPreviewKeyDown(
+                                                                            event,
+                                                                            playerArtworkSource,
+                                                                            mediaTitle,
+                                                                            "Current audio artwork"
+                                                                        )
+                                                                    }
+                                                                    sx={{
+                                                                        width: 58,
+                                                                        height: 58,
+                                                                        borderRadius: 3,
+                                                                        objectFit: "cover",
+                                                                        flex: "0 0 auto",
+                                                                        border: "1px solid rgba(255,255,255,0.14)",
+                                                                        background: "rgba(255,255,255,0.08)",
+                                                                        boxShadow: "0 12px 28px rgba(0,0,0,0.22)",
+                                                                        cursor: "zoom-in",
+                                                                        transition:
+                                                                            "transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease",
+                                                                        "&:hover, &:focus-visible": {
+                                                                            transform: "scale(1.045)",
+                                                                            borderColor: "rgba(103,232,249,0.55)",
+                                                                            boxShadow: "0 18px 40px rgba(103,232,249,0.15)",
+                                                                            outline: "none",
+                                                                        },
+                                                                    }}
+                                                                />
+                                                            ) : (
+                                                                <Box
+                                                                    sx={{
+                                                                        width: 58,
+                                                                        height: 58,
+                                                                        borderRadius: 3,
+                                                                        display: "grid",
+                                                                        placeItems: "center",
+                                                                        flex: "0 0 auto",
+                                                                        color: "#67e8f9",
+                                                                        background:
+                                                                            "linear-gradient(135deg, rgba(103,232,249,0.18), rgba(167,139,250,0.14))",
+                                                                        border: "1px solid rgba(255,255,255,0.11)",
+                                                                    }}
+                                                                >
+                                                                    <AudioFileRoundedIcon sx={{ fontSize: 26 }} />
+                                                                </Box>
+                                                            )}
+
+                                                            <Box sx={{ minWidth: 0 }}>
+                                                                <Typography
+                                                                    variant="caption"
+                                                                    sx={{
+                                                                        color: "rgba(255,255,255,0.5)",
+                                                                        fontWeight: 900,
+                                                                        textTransform: "uppercase",
+                                                                        letterSpacing: 0.8,
+                                                                        display: "block",
+                                                                        mb: 0.15,
+                                                                    }}
+                                                                >
+                                                                    Current audio
+                                                                </Typography>
+
+                                                                <Typography
+                                                                    sx={{
+                                                                        color: "rgba(255,255,255,0.94)",
+                                                                        fontWeight: 950,
+                                                                        lineHeight: 1.25,
+                                                                        overflow: "hidden",
+                                                                        textOverflow: "ellipsis",
+                                                                        whiteSpace: "nowrap",
+                                                                    }}
+                                                                    title={mediaTitle}
+                                                                >
+                                                                    {mediaTitle}
+                                                                </Typography>
+                                                            </Box>
+                                                        </Stack>
+
+                                                        <Stack
+                                                            direction="row"
+                                                            alignItems="center"
+                                                            justifyContent="space-between"
+                                                            spacing={1.5}
+                                                            sx={{ minWidth: 0 }}
+                                                        >
+                                                            <Typography
+                                                                sx={{
+                                                                    fontWeight: 900,
+                                                                    color: "rgba(255,255,255,0.82)",
+                                                                }}
+                                                            >
+                                                                {isScrubbing
+                                                                    ? "Scrubbing"
+                                                                    : isPlaying
+                                                                        ? isMuted
+                                                                            ? "Playing muted preview"
+                                                                            : "Playing processed buffer"
+                                                                        : "Ready"}
+                                                            </Typography>
+
+                                                            <Typography
+                                                                sx={{
+                                                                    color: "#67e8f9",
+                                                                    fontWeight: 950,
+                                                                    flex: "0 0 auto",
+                                                                    fontVariantNumeric: "tabular-nums",
+                                                                }}
+                                                            >
+                                                                {formatTime(position)} / {formatTime(duration)}
+                                                            </Typography>
+                                                        </Stack>
+
+                                                        {mediaInfo && (
+                                                            <Typography
+                                                                variant="caption"
+                                                                sx={{
+                                                                    color: "rgba(255,255,255,0.6)",
+                                                                    display: "block",
+                                                                    lineHeight: 1.5,
+                                                                    mt: 0.4,
+                                                                }}
+                                                            >
+                                                                {mediaInfo}
+                                                            </Typography>
+                                                        )}
+                                                    </Box>
+
+                                                    <Box
+                                                        sx={{
+                                                            borderRadius: 3.5,
+                                                            px: 1.75,
+                                                            py: 1.35,
+                                                            background:
+                                                                "linear-gradient(135deg, rgba(7,10,19,0.76), rgba(15,23,42,0.56))",
+                                                            border: "1px solid rgba(255,255,255,0.11)",
+                                                            boxShadow:
+                                                                "0 14px 40px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.06)",
+                                                        }}
+                                                    >
+                                                        <Stack spacing={0.8}>
+                                                            <Stack
+                                                                direction="row"
+                                                                alignItems="center"
+                                                                justifyContent="space-between"
+                                                                spacing={1}
+                                                            >
+                                                                <Stack
+                                                                    direction="row"
+                                                                    alignItems="center"
+                                                                    spacing={0.8}
+                                                                >
+                                                                    <VolumeUpRoundedIcon
+                                                                        sx={{
+                                                                            fontSize: 19,
+                                                                            color: "#67e8f9",
+                                                                        }}
+                                                                    />
+                                                                    <Typography
+                                                                        variant="caption"
+                                                                        sx={{
+                                                                            color: "rgba(255,255,255,0.86)",
+                                                                            fontWeight: 950,
+                                                                            textTransform: "uppercase",
+                                                                            letterSpacing: 0.8,
+                                                                        }}
+                                                                    >
+                                                                        Base volume
+                                                                    </Typography>
+                                                                </Stack>
+
+                                                                <Typography
+                                                                    variant="caption"
+                                                                    sx={{
+                                                                        color: "#67e8f9",
+                                                                        fontWeight: 950,
+                                                                        fontVariantNumeric: "tabular-nums",
+                                                                    }}
+                                                                >
+                                                                    {settingsView.baseVolume.toFixed(2)}x
+                                                                </Typography>
+                                                            </Stack>
+
+                                                            <Stack direction="row" alignItems="center" spacing={1.15}>
+                                                                <VolumeDownRoundedIcon
+                                                                    sx={{
+                                                                        fontSize: 18,
+                                                                        color: "rgba(255,255,255,0.5)",
+                                                                        flex: "0 0 auto",
+                                                                    }}
+                                                                />
+
+                                                                <Slider
+                                                                    value={settingsView.baseVolume}
+                                                                    min={0}
+                                                                    max={HUMAN_SAFE_LIMITS.baseVolume.max}
+                                                                    step={0.01}
+                                                                    aria-label="Safe base volume"
+                                                                    disabled={isRendering || isLoading || isPreloadingPlaylist}
+                                                                    onChange={(_, value) =>
+                                                                        updateSetting(
+                                                                            "baseVolume",
+                                                                            Array.isArray(value) ? value[0] : value
+                                                                        )
+                                                                    }
+                                                                    valueLabelDisplay="auto"
+                                                                    valueLabelFormat={(value) =>
+                                                                        `${Number(value).toFixed(2)}x`
+                                                                    }
+                                                                    sx={{
+                                                                        color: "#67e8f9",
+                                                                        py: 0,
+                                                                        "& .MuiSlider-thumb": {
+                                                                            width: 16,
+                                                                            height: 16,
+                                                                            boxShadow:
+                                                                                "0 0 0 7px rgba(103,232,249,0.08)",
+                                                                        },
+                                                                        "& .MuiSlider-rail": {
+                                                                            color: "rgba(255,255,255,0.18)",
+                                                                        },
+                                                                        "& .MuiSlider-track": {
+                                                                            border: "none",
+                                                                        },
+                                                                    }}
+                                                                />
+
+                                                                <VolumeUpRoundedIcon
+                                                                    sx={{
+                                                                        fontSize: 18,
+                                                                        color: "rgba(255,255,255,0.68)",
+                                                                        flex: "0 0 auto",
+                                                                    }}
+                                                                />
+                                                            </Stack>
+                                                        </Stack>
+                                                    </Box>
+                                                </Box>
+
+                                                <Slider
+                                                    value={clamp(position, 0, duration || 0)}
+                                                    min={0}
+                                                    max={duration || 0}
+                                                    step={0.01}
+                                                    disabled={!hasMedia || isRendering || isLoading}
+                                                    onPointerDown={handleScrubStart}
+                                                    onPointerUp={() => handleScrubRelease("slider pointer release")}
+                                                    onPointerCancel={() => handleScrubRelease("slider pointer cancel")}
+                                                    onMouseDown={handleScrubStart}
+                                                    onMouseUp={() => handleScrubRelease("slider mouse release")}
+                                                    onTouchStart={handleScrubStart}
+                                                    onTouchEnd={() => handleScrubRelease("slider touch release")}
+                                                    onTouchCancel={() => handleScrubRelease("slider touch cancel")}
+                                                    onKeyDown={handleScrubKeyDown}
+                                                    onKeyUp={() => handleScrubRelease("slider keyboard release")}
+                                                    onChange={handleScrubChange}
+                                                    onChangeCommitted={handleScrubCommit}
+                                                    valueLabelDisplay="auto"
+                                                    valueLabelFormat={(value) => formatTime(value)}
+                                                    sx={{
+                                                        color: "#67e8f9",
+                                                        touchAction: "none",
+                                                        userSelect: "none",
+                                                        "& .MuiSlider-thumb": {
+                                                            boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
+                                                        },
+                                                        "& .MuiSlider-rail": {
+                                                            color: "rgba(255,255,255,0.18)",
+                                                        },
+                                                    }}
+                                                />
+
+                                                <LinearProgress
+                                                    variant="determinate"
+                                                    value={progressValue}
+                                                    sx={{
+                                                        height: 10,
+                                                        borderRadius: 999,
+                                                        background: "rgba(255,255,255,0.12)",
+                                                        "& .MuiLinearProgress-bar": {
+                                                            background:
+                                                                "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                        },
+                                                    }}
+                                                />
+
+                                                <Typography
+                                                    variant="caption"
+                                                    sx={{ color: "rgba(255,255,255,0.58)" }}
+                                                >
+                                                    pan = {settingsView.pan.toFixed(2)} | delay ={" "}
+                                                    {settingsView.delayMix.toFixed(2)} | reverb ={" "}
+                                                    {settingsView.reverbMix.toFixed(2)} | playbackRate ={" "}
+                                                    {settingsView.speed.toFixed(2)}x | detune ={" "}
+                                                    {pitchCents.toFixed(0)} cents | effective rate ={" "}
+                                                    {effectiveRate.toFixed(2)}x
+                                                </Typography>
+                                            </Stack>
+                                        </Box>
+                                    )}
+
+                                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant="contained"
+                                            startIcon={
+                                                showPauseForMainControls ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
+                                            }
+                                            onClick={handlePlayPause}
+                                            disabled={!hasMedia || isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.35,
+                                                fontWeight: 950,
+                                                color: "#06111e",
+                                                background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            }}
+                                        >
+                                            {showPauseForMainControls ? "Pause playback" : "Play processed audio"}
+                                        </Button>
+
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant="outlined"
+                                            startIcon={<RestartAltRoundedIcon />}
+                                            onClick={restartPlayback}
+                                            disabled={!hasMedia || isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.35,
+                                                color: "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                            }}
+                                        >
+                                            Restart
+                                        </Button>
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant={repeatEnabled ? "contained" : "outlined"}
+                                            startIcon={<RepeatRoundedIcon />}
+                                            onClick={toggleRepeat}
+                                            disabled={!hasMedia || isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.35,
+                                                color: repeatEnabled ? "#06111e" : "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                                background: repeatEnabled
+                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                    : "transparent",
+                                            }}
+                                        >
+                                            {repeatEnabled ? "Repeat on" : "Repeat off"}
+                                        </Button>
+
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant="outlined"
+                                            startIcon={<SkipPreviousRoundedIcon />}
+                                            onClick={playPreviousPlaylistItem}
+                                            disabled={!playlist.length || isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.35,
+                                                color: "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                            }}
+                                        >
+                                            Previous track
+                                        </Button>
+
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant="outlined"
+                                            startIcon={<SkipNextRoundedIcon />}
+                                            onClick={playNextPlaylistItem}
+                                            disabled={!playlist.length || isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.35,
+                                                color: "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                            }}
+                                        >
+                                            Next track
+                                        </Button>
+                                    </Stack>
+
+                                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
+                                        <Button
+                                            fullWidth
+                                            size="large"
+                                            variant={isMuted ? "contained" : "outlined"}
+                                            startIcon={
+                                                isMuted ? (
+                                                    <VolumeUpRoundedIcon />
+                                                ) : (
+                                                    <VolumeOffRoundedIcon />
+                                                )
+                                            }
+                                            onClick={toggleMute}
+                                            disabled={isRendering || isLoading}
+                                            sx={{
+                                                borderRadius: 4,
+                                                py: 1.25,
+                                                color: isMuted ? "#06111e" : "#fff",
+                                                borderColor: "rgba(255,255,255,0.18)",
+                                                fontWeight: 950,
+                                                background: isMuted
+                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                    : "transparent",
+                                            }}
+                                        >
+                                            {isMuted ? "Unmute preview" : "Mute preview"}
+                                        </Button>
+
+                                        <Button
+                                            fullWidth
+                                            variant="text"
+                                            onClick={() => stopPlayback(true)}
+                                            disabled={!hasMedia || isRendering || isLoading}
+                                            sx={{
+                                                color: "rgba(255,255,255,0.72)",
+                                                fontWeight: 900,
+                                            }}
+                                        >
+                                            Stop and reset position
+                                        </Button>
+                                    </Stack>
+
                                     <Button
                                         fullWidth
                                         size="large"
-                                        variant={isMuted ? "contained" : "outlined"}
-                                        startIcon={
-                                            isMuted ? (
-                                                <VolumeUpRoundedIcon />
-                                            ) : (
-                                                <VolumeOffRoundedIcon />
-                                            )
+                                        variant="contained"
+                                        startIcon={<PlaylistAddRoundedIcon />}
+                                        onClick={postCurrentMediaToCommunityFeed}
+                                        disabled={
+                                            !hasMedia ||
+                                            isRendering ||
+                                            isLoading ||
+                                            isPostingCommunityPost
                                         }
-                                        onClick={toggleMute}
-                                        disabled={isRendering || isLoading}
                                         sx={{
                                             borderRadius: 4,
                                             py: 1.25,
-                                            color: isMuted ? "#06111e" : "#fff",
-                                            borderColor: "rgba(255,255,255,0.18)",
+                                            color: "#06111e",
                                             fontWeight: 950,
-                                            background: isMuted
-                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                : "transparent",
+                                            background:
+                                                "linear-gradient(135deg, #67e8f9, #a78bfa)",
                                         }}
                                     >
-                                        {isMuted ? "Unmute preview" : "Mute preview"}
+                                        {isPostingCommunityPost
+                                            ? "Posting to community feed..."
+                                            : "Add post to community feed"}
                                     </Button>
 
-                                    <Button
-                                        fullWidth
-                                        variant="text"
-                                        onClick={() => stopPlayback(true)}
-                                        disabled={!hasMedia || isRendering || isLoading}
-                                        sx={{
-                                            color: "rgba(255,255,255,0.72)",
-                                            fontWeight: 900,
-                                        }}
-                                    >
-                                        Stop and reset position
-                                    </Button>
+                                    <StatusBanner status={status} tone={statusTone} />
+
+                                    {(isRendering || isLoading) && (
+                                        <LinearProgress
+                                            sx={{
+                                                borderRadius: 999,
+                                                background: "rgba(255,255,255,0.12)",
+                                                "& .MuiLinearProgress-bar": {
+                                                    background:
+                                                        "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                },
+                                            }}
+                                        />
+                                    )}
                                 </Stack>
+                            </GlassCard>
+                        </Stack>
 
-                                <Button
-                                    fullWidth
-                                    size="large"
-                                    variant="contained"
-                                    startIcon={<PlaylistAddRoundedIcon />}
-                                    onClick={postCurrentMediaToCommunityFeed}
-                                    disabled={
-                                        !hasMedia ||
-                                        isRendering ||
-                                        isLoading ||
-                                        isPostingCommunityPost
-                                    }
+                        <GlassCard>
+                            <Stack spacing={3}>
+                                <Box>
+                                    <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.5 }}>
+                                        WebAudio mixer
+                                    </Typography>
+                                    <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
+                                        Processing controls feed the same graph used for preview,
+                                        visualization, and WAV export. Base volume is inside the Buffer
+                                        player panel beside the duration readout.
+                                    </Typography>
+                                </Box>
+
+                                <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                                <Box
                                     sx={{
+                                        p: 2,
                                         borderRadius: 4,
-                                        py: 1.25,
-                                        color: "#06111e",
-                                        fontWeight: 950,
+                                        border: "1px solid rgba(103,232,249,0.18)",
                                         background:
-                                            "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                            "linear-gradient(135deg, rgba(103,232,249,0.08), rgba(167,139,250,0.08))",
                                     }}
                                 >
-                                    {isPostingCommunityPost
-                                        ? "Posting to community feed..."
-                                        : "Add post to community feed"}
+                                    <Stack spacing={2}>
+                                        <Stack
+                                            direction={{ xs: "column", md: "row" }}
+                                            spacing={2}
+                                            alignItems={{ xs: "stretch", md: "center" }}
+                                        >
+                                            <FormControl
+                                                fullWidth
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    "& .MuiInputLabel-root": {
+                                                        color: "rgba(255,255,255,0.72)",
+                                                    },
+                                                    "& .MuiOutlinedInput-root": {
+                                                        color: "#fff",
+                                                        borderRadius: 3,
+                                                        background: "rgba(7,10,19,0.66)",
+                                                        "& fieldset": {
+                                                            borderColor: "rgba(255,255,255,0.18)",
+                                                        },
+                                                        "&:hover fieldset": {
+                                                            borderColor: "rgba(103,232,249,0.5)",
+                                                        },
+                                                    },
+                                                    "& .MuiSvgIcon-root": {
+                                                        color: "#67e8f9",
+                                                    },
+                                                }}
+                                            >
+                                                <InputLabel id="mixer-preset-label">
+                                                    Mixer preset
+                                                </InputLabel>
+                                                <Select
+                                                    labelId="mixer-preset-label"
+                                                    id="mixer-preset-select"
+                                                    value={activePresetKey}
+                                                    label="Mixer preset"
+                                                    onChange={(event) =>
+                                                        applyMixerPreset(event.target.value)
+                                                    }
+                                                    inputProps={{
+                                                        "aria-label": "Choose a safe mixer preset",
+                                                    }}
+                                                >
+                                                    {activePresetKey === "custom" && (
+                                                        <MenuItem value="custom" disabled>
+                                                            Custom safe mix
+                                                        </MenuItem>
+                                                    )}
+
+                                                    {MIXER_PRESETS.map((preset) => (
+                                                        <MenuItem key={preset.key} value={preset.key}>
+                                                            {preset.label}
+                                                        </MenuItem>
+                                                    ))}
+                                                </Select>
+                                            </FormControl>
+
+                                            <Stack
+                                                direction="row"
+                                                spacing={1}
+                                                flexWrap="wrap"
+                                                useFlexGap
+                                                aria-label="Preset safety limits"
+                                            >
+                                                <Chip
+                                                    size="small"
+                                                    label="Min speed 0.80x"
+                                                    sx={{
+                                                        color: "#67e8f9",
+                                                        borderColor: "rgba(103,232,249,0.35)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                    variant="outlined"
+                                                />
+                                                <Chip
+                                                    size="small"
+                                                    label="High EQ max +6 dB"
+                                                    sx={{
+                                                        color: "#a78bfa",
+                                                        borderColor: "rgba(167,139,250,0.35)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                    variant="outlined"
+                                                />
+                                                <Chip
+                                                    size="small"
+                                                    label="Output max +6 dB"
+                                                    sx={{
+                                                        color: "#fff",
+                                                        borderColor: "rgba(255,255,255,0.22)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                    variant="outlined"
+                                                />
+                                            </Stack>
+                                        </Stack>
+
+                                        <Typography
+                                            variant="body2"
+                                            sx={{ color: "rgba(255,255,255,0.68)", lineHeight: 1.65 }}
+                                        >
+                                            {selectedPresetDescription}
+                                        </Typography>
+
+                                        <Box
+                                            role="list"
+                                            aria-label="Quick mixer preset buttons"
+                                            sx={{
+                                                display: "grid",
+                                                gridTemplateColumns: {
+                                                    xs: "1fr",
+                                                    sm: "1fr 1fr",
+                                                    lg: "repeat(4, 1fr)",
+                                                },
+                                                gap: 1,
+                                            }}
+                                        >
+                                            {MIXER_PRESETS.map((preset) => {
+                                                const selected = activePresetKey === preset.key;
+
+                                                return (
+                                                    <Box key={preset.key} role="listitem">
+                                                        <Button
+                                                            type="button"
+                                                            variant={selected ? "contained" : "outlined"}
+                                                            aria-pressed={selected}
+                                                            onClick={() => applyMixerPreset(preset.key)}
+                                                            disabled={isRendering || isLoading}
+                                                            fullWidth
+                                                            sx={{
+                                                                justifyContent: "flex-start",
+                                                                borderRadius: 3,
+                                                                px: 1.4,
+                                                                py: 1,
+                                                                color: selected ? "#06111e" : "#fff",
+                                                                borderColor: "rgba(255,255,255,0.16)",
+                                                                fontWeight: 950,
+                                                                background: selected
+                                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                                    : "rgba(255,255,255,0.03)",
+                                                                textAlign: "left",
+                                                            }}
+                                                        >
+                                                            {preset.shortLabel || preset.label}
+                                                        </Button>
+                                                    </Box>
+                                                );
+                                            })}
+                                        </Box>
+                                    </Stack>
+                                </Box>
+
+                                <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                                <Box
+                                    sx={{
+                                        display: "grid",
+                                        gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                        gap: 2.5,
+                                    }}
+                                >
+                                    <ControlSlider
+                                        label="Stereo pan"
+                                        value={settingsView.pan}
+                                        min={-1}
+                                        max={1}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("pan", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Convolution reverb"
+                                        value={settingsView.reverbMix}
+                                        min={HUMAN_SAFE_LIMITS.reverbMix.min}
+                                        max={HUMAN_SAFE_LIMITS.reverbMix.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("reverbMix", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Reverb size"
+                                        value={settingsView.reverbSeconds}
+                                        min={HUMAN_SAFE_LIMITS.reverbSeconds.min}
+                                        max={HUMAN_SAFE_LIMITS.reverbSeconds.max}
+                                        step={0.05}
+                                        unit=" sec"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("reverbSeconds", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Delay mix"
+                                        value={settingsView.delayMix}
+                                        min={HUMAN_SAFE_LIMITS.delayMix.min}
+                                        max={HUMAN_SAFE_LIMITS.delayMix.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("delayMix", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Delay time"
+                                        value={settingsView.delayTime}
+                                        min={HUMAN_SAFE_LIMITS.delayTime.min}
+                                        max={HUMAN_SAFE_LIMITS.delayTime.max}
+                                        step={0.01}
+                                        unit=" sec"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("delayTime", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Delay feedback"
+                                        value={settingsView.delayFeedback}
+                                        min={HUMAN_SAFE_LIMITS.delayFeedback.min}
+                                        max={HUMAN_SAFE_LIMITS.delayFeedback.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("delayFeedback", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="ClarityChain"
+                                        value={settingsView.clarityAmount}
+                                        min={HUMAN_SAFE_LIMITS.clarityAmount.min}
+                                        max={HUMAN_SAFE_LIMITS.clarityAmount.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("clarityAmount", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Demudder"
+                                        value={settingsView.demudAmount}
+                                        min={HUMAN_SAFE_LIMITS.demudAmount.min}
+                                        max={HUMAN_SAFE_LIMITS.demudAmount.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("demudAmount", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="De-esser"
+                                        value={settingsView.deEssAmount}
+                                        min={HUMAN_SAFE_LIMITS.deEssAmount.min}
+                                        max={HUMAN_SAFE_LIMITS.deEssAmount.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("deEssAmount", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="De-ess frequency"
+                                        value={settingsView.deEssFrequency}
+                                        min={4000}
+                                        max={11000}
+                                        step={100}
+                                        unit=" Hz"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("deEssFrequency", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Low EQ"
+                                        value={settingsView.lowGain}
+                                        min={HUMAN_SAFE_LIMITS.lowGain.min}
+                                        max={HUMAN_SAFE_LIMITS.lowGain.max}
+                                        step={0.5}
+                                        unit=" dB"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("lowGain", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Mid EQ"
+                                        value={settingsView.midGain}
+                                        min={HUMAN_SAFE_LIMITS.midGain.min}
+                                        max={HUMAN_SAFE_LIMITS.midGain.max}
+                                        step={0.5}
+                                        unit=" dB"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("midGain", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="High EQ"
+                                        value={settingsView.highGain}
+                                        min={HUMAN_SAFE_LIMITS.highGain.min}
+                                        max={HUMAN_SAFE_LIMITS.highGain.max}
+                                        step={0.5}
+                                        unit=" dB"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("highGain", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="High-pass filter"
+                                        value={settingsView.highPass}
+                                        min={20}
+                                        max={1000}
+                                        step={5}
+                                        unit=" Hz"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("highPass", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Low-pass filter"
+                                        value={settingsView.lowPass}
+                                        min={2000}
+                                        max={20000}
+                                        step={100}
+                                        unit=" Hz"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("lowPass", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Speed playbackRate"
+                                        value={settingsView.speed}
+                                        min={HUMAN_SAFE_LIMITS.speed.min}
+                                        max={HUMAN_SAFE_LIMITS.speed.max}
+                                        step={0.01}
+                                        unit="x"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("speed", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Pitch detune"
+                                        value={settingsView.pitchSemitones}
+                                        min={HUMAN_SAFE_LIMITS.pitchSemitones.min}
+                                        max={HUMAN_SAFE_LIMITS.pitchSemitones.max}
+                                        step={0.1}
+                                        unit=" st"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("pitchSemitones", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="WaveShaper distortion"
+                                        value={settingsView.distortionAmount}
+                                        min={HUMAN_SAFE_LIMITS.distortionAmount.min}
+                                        max={HUMAN_SAFE_LIMITS.distortionAmount.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("distortionAmount", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Warm bitcrusher"
+                                        value={settingsView.bitcrusherWarmth}
+                                        min={HUMAN_SAFE_LIMITS.bitcrusherWarmth.min}
+                                        max={HUMAN_SAFE_LIMITS.bitcrusherWarmth.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("bitcrusherWarmth", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Bitcrusher variance"
+                                        value={settingsView.bitcrusherVariance}
+                                        min={HUMAN_SAFE_LIMITS.bitcrusherVariance.min}
+                                        max={HUMAN_SAFE_LIMITS.bitcrusherVariance.max}
+                                        step={0.01}
+                                        unit=""
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) =>
+                                            updateSetting("bitcrusherVariance", value)
+                                        }
+                                    />
+
+                                    <ControlSlider
+                                        label="Compressor threshold"
+                                        value={settingsView.compressorThreshold}
+                                        min={HUMAN_SAFE_LIMITS.compressorThreshold.min}
+                                        max={HUMAN_SAFE_LIMITS.compressorThreshold.max}
+                                        step={1}
+                                        unit=" dB"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) =>
+                                            updateSetting("compressorThreshold", value)
+                                        }
+                                    />
+
+                                    <ControlSlider
+                                        label="Compressor ratio"
+                                        value={settingsView.compressorRatio}
+                                        min={HUMAN_SAFE_LIMITS.compressorRatio.min}
+                                        max={HUMAN_SAFE_LIMITS.compressorRatio.max}
+                                        step={0.5}
+                                        unit=":1"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("compressorRatio", value)}
+                                    />
+
+                                    <ControlSlider
+                                        label="Output gain"
+                                        value={settingsView.outputGain}
+                                        min={HUMAN_SAFE_LIMITS.outputGain.min}
+                                        max={HUMAN_SAFE_LIMITS.outputGain.max}
+                                        step={0.5}
+                                        unit=" dB"
+                                        disabled={isRendering || isLoading}
+                                        onChange={(value) => updateSetting("outputGain", value)}
+                                    />
+                                </Box>
+
+                                <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
+
+                                <RenderButton
+                                    onClick={renderMixedFile}
+                                    disabled={!hasMedia || isRendering || isLoading}
+                                    rendering={isRendering}
+                                />
+
+                                <Button
+                                    variant="outlined"
+                                    onClick={resetMixer}
+                                    disabled={isRendering || isLoading}
+                                    sx={{
+                                        borderRadius: 4,
+                                        py: 1.2,
+                                        color: "#fff",
+                                        borderColor: "rgba(255,255,255,0.18)",
+                                        fontWeight: 950,
+                                    }}
+                                >
+                                    Reset mixer settings
                                 </Button>
 
-                                <StatusBanner status={status} tone={statusTone} />
+                                <Typography
+                                    variant="caption"
+                                    sx={{ color: "rgba(255,255,255,0.52)", lineHeight: 1.6 }}
+                                >
+                                    Best support: MP3, WAV, OGG/Opus, WebM audio/video,
+                                    M4A, MP4, MOV, AAC, CAF, and browser-supported containers.
+                                    Mixer knobs are clamped to human-safe ranges: speed cannot go
+                                    below 0.80x, high EQ cannot exceed +6 dB, and output gain cannot
+                                    exceed +6 dB. iPhone files from iCloud Drive, Google Drive, Proton
+                                    Drive, Dropbox, and other providers may need to be downloaded
+                                    locally first. HLS/DASH manifests, DRM streams, and normal
+                                    streaming pages are not direct decodable files.
+                                </Typography>
 
-                                {(isRendering || isLoading) && (
-                                    <LinearProgress
-                                        sx={{
-                                            borderRadius: 999,
-                                            background: "rgba(255,255,255,0.12)",
-                                            "& .MuiLinearProgress-bar": {
-                                                background:
-                                                    "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            },
-                                        }}
-                                    />
+                                {mixerEnabled && (
+                                    <Typography
+                                        variant="caption"
+                                        sx={{ color: "#67e8f9", fontWeight: 800 }}
+                                    >
+                                        Live buffer mixer active. The visualizer is reading from the
+                                        processed AnalyserNode.
+                                    </Typography>
                                 )}
                             </Stack>
                         </GlassCard>
-                    </Stack>
+                    </Box>
+                </Stack>
+            </PageShell>
 
-                    <GlassCard>
-                        <Stack spacing={3}>
-                            <Box>
-                                <Typography variant="h5" sx={{ fontWeight: 950, mb: 0.5 }}>
-                                    WebAudio mixer
-                                </Typography>
-                                <Typography sx={{ color: "rgba(255,255,255,0.62)" }}>
-                                    Processing controls feed the same graph used for preview,
-                                    visualization, and WAV export. Base volume is inside the Buffer
-                                    player panel beside the duration readout.
-                                </Typography>
-                            </Box>
-
-                            <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
-
-                            <Box
-                                sx={{
-                                    p: 2,
-                                    borderRadius: 4,
-                                    border: "1px solid rgba(103,232,249,0.18)",
-                                    background:
-                                        "linear-gradient(135deg, rgba(103,232,249,0.08), rgba(167,139,250,0.08))",
-                                }}
-                            >
-                                <Stack spacing={2}>
-                                    <Stack
-                                        direction={{ xs: "column", md: "row" }}
-                                        spacing={2}
-                                        alignItems={{ xs: "stretch", md: "center" }}
-                                    >
-                                        <FormControl
-                                            fullWidth
-                                            disabled={isRendering || isLoading}
-                                            sx={{
-                                                "& .MuiInputLabel-root": {
-                                                    color: "rgba(255,255,255,0.72)",
-                                                },
-                                                "& .MuiOutlinedInput-root": {
-                                                    color: "#fff",
-                                                    borderRadius: 3,
-                                                    background: "rgba(7,10,19,0.66)",
-                                                    "& fieldset": {
-                                                        borderColor: "rgba(255,255,255,0.18)",
-                                                    },
-                                                    "&:hover fieldset": {
-                                                        borderColor: "rgba(103,232,249,0.5)",
-                                                    },
-                                                },
-                                                "& .MuiSvgIcon-root": {
-                                                    color: "#67e8f9",
-                                                },
-                                            }}
-                                        >
-                                            <InputLabel id="mixer-preset-label">
-                                                Mixer preset
-                                            </InputLabel>
-                                            <Select
-                                                labelId="mixer-preset-label"
-                                                id="mixer-preset-select"
-                                                value={activePresetKey}
-                                                label="Mixer preset"
-                                                onChange={(event) =>
-                                                    applyMixerPreset(event.target.value)
-                                                }
-                                                inputProps={{
-                                                    "aria-label": "Choose a safe mixer preset",
-                                                }}
-                                            >
-                                                {activePresetKey === "custom" && (
-                                                    <MenuItem value="custom" disabled>
-                                                        Custom safe mix
-                                                    </MenuItem>
-                                                )}
-
-                                                {MIXER_PRESETS.map((preset) => (
-                                                    <MenuItem key={preset.key} value={preset.key}>
-                                                        {preset.label}
-                                                    </MenuItem>
-                                                ))}
-                                            </Select>
-                                        </FormControl>
-
-                                        <Stack
-                                            direction="row"
-                                            spacing={1}
-                                            flexWrap="wrap"
-                                            useFlexGap
-                                            aria-label="Preset safety limits"
-                                        >
-                                            <Chip
-                                                size="small"
-                                                label="Min speed 0.80x"
-                                                sx={{
-                                                    color: "#67e8f9",
-                                                    borderColor: "rgba(103,232,249,0.35)",
-                                                    fontWeight: 900,
-                                                }}
-                                                variant="outlined"
-                                            />
-                                            <Chip
-                                                size="small"
-                                                label="High EQ max +6 dB"
-                                                sx={{
-                                                    color: "#a78bfa",
-                                                    borderColor: "rgba(167,139,250,0.35)",
-                                                    fontWeight: 900,
-                                                }}
-                                                variant="outlined"
-                                            />
-                                            <Chip
-                                                size="small"
-                                                label="Output max +6 dB"
-                                                sx={{
-                                                    color: "#fff",
-                                                    borderColor: "rgba(255,255,255,0.22)",
-                                                    fontWeight: 900,
-                                                }}
-                                                variant="outlined"
-                                            />
-                                        </Stack>
-                                    </Stack>
-
-                                    <Typography
-                                        variant="body2"
-                                        sx={{ color: "rgba(255,255,255,0.68)", lineHeight: 1.65 }}
-                                    >
-                                        {selectedPresetDescription}
-                                    </Typography>
-
-                                    <Box
-                                        role="list"
-                                        aria-label="Quick mixer preset buttons"
-                                        sx={{
-                                            display: "grid",
-                                            gridTemplateColumns: {
-                                                xs: "1fr",
-                                                sm: "1fr 1fr",
-                                                lg: "repeat(4, 1fr)",
-                                            },
-                                            gap: 1,
-                                        }}
-                                    >
-                                        {MIXER_PRESETS.map((preset) => {
-                                            const selected = activePresetKey === preset.key;
-
-                                            return (
-                                                <Box key={preset.key} role="listitem">
-                                                    <Button
-                                                        type="button"
-                                                        variant={selected ? "contained" : "outlined"}
-                                                        aria-pressed={selected}
-                                                        onClick={() => applyMixerPreset(preset.key)}
-                                                        disabled={isRendering || isLoading}
-                                                        fullWidth
-                                                        sx={{
-                                                            justifyContent: "flex-start",
-                                                            borderRadius: 3,
-                                                            px: 1.4,
-                                                            py: 1,
-                                                            color: selected ? "#06111e" : "#fff",
-                                                            borderColor: "rgba(255,255,255,0.16)",
-                                                            fontWeight: 950,
-                                                            background: selected
-                                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                                : "rgba(255,255,255,0.03)",
-                                                            textAlign: "left",
-                                                        }}
-                                                    >
-                                                        {preset.shortLabel || preset.label}
-                                                    </Button>
-                                                </Box>
-                                            );
-                                        })}
-                                    </Box>
-                                </Stack>
-                            </Box>
-
-                            <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
-
-                            <Box
-                                sx={{
-                                    display: "grid",
-                                    gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
-                                    gap: 2.5,
-                                }}
-                            >
-                                <ControlSlider
-                                    label="Stereo pan"
-                                    value={settingsView.pan}
-                                    min={-1}
-                                    max={1}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("pan", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Convolution reverb"
-                                    value={settingsView.reverbMix}
-                                    min={HUMAN_SAFE_LIMITS.reverbMix.min}
-                                    max={HUMAN_SAFE_LIMITS.reverbMix.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("reverbMix", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Reverb size"
-                                    value={settingsView.reverbSeconds}
-                                    min={HUMAN_SAFE_LIMITS.reverbSeconds.min}
-                                    max={HUMAN_SAFE_LIMITS.reverbSeconds.max}
-                                    step={0.05}
-                                    unit=" sec"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("reverbSeconds", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Delay mix"
-                                    value={settingsView.delayMix}
-                                    min={HUMAN_SAFE_LIMITS.delayMix.min}
-                                    max={HUMAN_SAFE_LIMITS.delayMix.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("delayMix", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Delay time"
-                                    value={settingsView.delayTime}
-                                    min={HUMAN_SAFE_LIMITS.delayTime.min}
-                                    max={HUMAN_SAFE_LIMITS.delayTime.max}
-                                    step={0.01}
-                                    unit=" sec"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("delayTime", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Delay feedback"
-                                    value={settingsView.delayFeedback}
-                                    min={HUMAN_SAFE_LIMITS.delayFeedback.min}
-                                    max={HUMAN_SAFE_LIMITS.delayFeedback.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("delayFeedback", value)}
-                                />
-
-                                <ControlSlider
-                                    label="ClarityChain"
-                                    value={settingsView.clarityAmount}
-                                    min={HUMAN_SAFE_LIMITS.clarityAmount.min}
-                                    max={HUMAN_SAFE_LIMITS.clarityAmount.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("clarityAmount", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Demudder"
-                                    value={settingsView.demudAmount}
-                                    min={HUMAN_SAFE_LIMITS.demudAmount.min}
-                                    max={HUMAN_SAFE_LIMITS.demudAmount.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("demudAmount", value)}
-                                />
-
-                                <ControlSlider
-                                    label="De-esser"
-                                    value={settingsView.deEssAmount}
-                                    min={HUMAN_SAFE_LIMITS.deEssAmount.min}
-                                    max={HUMAN_SAFE_LIMITS.deEssAmount.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("deEssAmount", value)}
-                                />
-
-                                <ControlSlider
-                                    label="De-ess frequency"
-                                    value={settingsView.deEssFrequency}
-                                    min={4000}
-                                    max={11000}
-                                    step={100}
-                                    unit=" Hz"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("deEssFrequency", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Low EQ"
-                                    value={settingsView.lowGain}
-                                    min={HUMAN_SAFE_LIMITS.lowGain.min}
-                                    max={HUMAN_SAFE_LIMITS.lowGain.max}
-                                    step={0.5}
-                                    unit=" dB"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("lowGain", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Mid EQ"
-                                    value={settingsView.midGain}
-                                    min={HUMAN_SAFE_LIMITS.midGain.min}
-                                    max={HUMAN_SAFE_LIMITS.midGain.max}
-                                    step={0.5}
-                                    unit=" dB"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("midGain", value)}
-                                />
-
-                                <ControlSlider
-                                    label="High EQ"
-                                    value={settingsView.highGain}
-                                    min={HUMAN_SAFE_LIMITS.highGain.min}
-                                    max={HUMAN_SAFE_LIMITS.highGain.max}
-                                    step={0.5}
-                                    unit=" dB"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("highGain", value)}
-                                />
-
-                                <ControlSlider
-                                    label="High-pass filter"
-                                    value={settingsView.highPass}
-                                    min={20}
-                                    max={1000}
-                                    step={5}
-                                    unit=" Hz"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("highPass", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Low-pass filter"
-                                    value={settingsView.lowPass}
-                                    min={2000}
-                                    max={20000}
-                                    step={100}
-                                    unit=" Hz"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("lowPass", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Speed playbackRate"
-                                    value={settingsView.speed}
-                                    min={HUMAN_SAFE_LIMITS.speed.min}
-                                    max={HUMAN_SAFE_LIMITS.speed.max}
-                                    step={0.01}
-                                    unit="x"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("speed", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Pitch detune"
-                                    value={settingsView.pitchSemitones}
-                                    min={HUMAN_SAFE_LIMITS.pitchSemitones.min}
-                                    max={HUMAN_SAFE_LIMITS.pitchSemitones.max}
-                                    step={0.1}
-                                    unit=" st"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("pitchSemitones", value)}
-                                />
-
-                                <ControlSlider
-                                    label="WaveShaper distortion"
-                                    value={settingsView.distortionAmount}
-                                    min={HUMAN_SAFE_LIMITS.distortionAmount.min}
-                                    max={HUMAN_SAFE_LIMITS.distortionAmount.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("distortionAmount", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Warm bitcrusher"
-                                    value={settingsView.bitcrusherWarmth}
-                                    min={HUMAN_SAFE_LIMITS.bitcrusherWarmth.min}
-                                    max={HUMAN_SAFE_LIMITS.bitcrusherWarmth.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("bitcrusherWarmth", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Bitcrusher variance"
-                                    value={settingsView.bitcrusherVariance}
-                                    min={HUMAN_SAFE_LIMITS.bitcrusherVariance.min}
-                                    max={HUMAN_SAFE_LIMITS.bitcrusherVariance.max}
-                                    step={0.01}
-                                    unit=""
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) =>
-                                        updateSetting("bitcrusherVariance", value)
-                                    }
-                                />
-
-                                <ControlSlider
-                                    label="Compressor threshold"
-                                    value={settingsView.compressorThreshold}
-                                    min={HUMAN_SAFE_LIMITS.compressorThreshold.min}
-                                    max={HUMAN_SAFE_LIMITS.compressorThreshold.max}
-                                    step={1}
-                                    unit=" dB"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) =>
-                                        updateSetting("compressorThreshold", value)
-                                    }
-                                />
-
-                                <ControlSlider
-                                    label="Compressor ratio"
-                                    value={settingsView.compressorRatio}
-                                    min={HUMAN_SAFE_LIMITS.compressorRatio.min}
-                                    max={HUMAN_SAFE_LIMITS.compressorRatio.max}
-                                    step={0.5}
-                                    unit=":1"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("compressorRatio", value)}
-                                />
-
-                                <ControlSlider
-                                    label="Output gain"
-                                    value={settingsView.outputGain}
-                                    min={HUMAN_SAFE_LIMITS.outputGain.min}
-                                    max={HUMAN_SAFE_LIMITS.outputGain.max}
-                                    step={0.5}
-                                    unit=" dB"
-                                    disabled={isRendering || isLoading}
-                                    onChange={(value) => updateSetting("outputGain", value)}
-                                />
-                            </Box>
-
-                            <Divider sx={{ borderColor: "rgba(255,255,255,0.1)" }} />
-
-                            <RenderButton
-                                onClick={renderMixedFile}
-                                disabled={!hasMedia || isRendering || isLoading}
-                                rendering={isRendering}
-                            />
-
-                            <Button
-                                variant="outlined"
-                                onClick={resetMixer}
-                                disabled={isRendering || isLoading}
-                                sx={{
-                                    borderRadius: 4,
-                                    py: 1.2,
-                                    color: "#fff",
-                                    borderColor: "rgba(255,255,255,0.18)",
-                                    fontWeight: 950,
-                                }}
-                            >
-                                Reset mixer settings
-                            </Button>
-
-                            <Typography
-                                variant="caption"
-                                sx={{ color: "rgba(255,255,255,0.52)", lineHeight: 1.6 }}
-                            >
-                                Best support: MP3, WAV, OGG/Opus, WebM audio/video,
-                                M4A, MP4, MOV, AAC, CAF, and browser-supported containers.
-                                Mixer knobs are clamped to human-safe ranges: speed cannot go
-                                below 0.80x, high EQ cannot exceed +6 dB, and output gain cannot
-                                exceed +6 dB. iPhone files from iCloud Drive, Google Drive, Proton
-                                Drive, Dropbox, and other providers may need to be downloaded
-                                locally first. HLS/DASH manifests, DRM streams, and normal
-                                streaming pages are not direct decodable files.
-                            </Typography>
-
-                            {mixerEnabled && (
+            {expandedArtwork && (
+                <Box
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label={`Expanded artwork for ${expandedArtwork.title}`}
+                    onClick={closeArtworkPreview}
+                    sx={{
+                        position: "fixed",
+                        inset: 0,
+                        zIndex: 2400,
+                        display: "grid",
+                        placeItems: "center",
+                        p: { xs: 0.75, sm: 1.5, md: 2 },
+                        background:
+                            "radial-gradient(circle at 50% 35%, rgba(103,232,249,0.12), transparent 34%), rgba(2,6,23,0.82)",
+                        backdropFilter: "blur(18px)",
+                    }}
+                >
+                    <Box
+                        onClick={(event) => event.stopPropagation()}
+                        sx={{
+                            width: "min(1280px, 98.5vw)",
+                            maxHeight: "96vh",
+                            overflow: "hidden",
+                            borderRadius: { xs: 4, sm: 5 },
+                            border: "1px solid rgba(255,255,255,0.18)",
+                            background:
+                                "linear-gradient(145deg, rgba(15,23,42,0.96), rgba(3,7,18,0.94))",
+                            boxShadow:
+                                "0 30px 90px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.08)",
+                        }}
+                    >
+                        <Box
+                            sx={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 1.5,
+                                px: { xs: 1.5, sm: 2.25, md: 2.75 },
+                                py: { xs: 1.1, sm: 1.35, md: 1.55 },
+                                borderBottom: "1px solid rgba(255,255,255,0.1)",
+                                background:
+                                    "linear-gradient(135deg, rgba(103,232,249,0.1), rgba(167,139,250,0.08))",
+                            }}
+                        >
+                            <Box sx={{ minWidth: 0 }}>
                                 <Typography
                                     variant="caption"
-                                    sx={{ color: "#67e8f9", fontWeight: 800 }}
+                                    sx={{
+                                        color: "#67e8f9",
+                                        fontWeight: 950,
+                                        textTransform: "uppercase",
+                                        letterSpacing: 0.9,
+                                    }}
                                 >
-                                    Live buffer mixer active. The visualizer is reading from the
-                                    processed AnalyserNode.
+                                    Artwork preview
                                 </Typography>
-                            )}
-                        </Stack>
-                    </GlassCard>
+
+                                <Typography
+                                    sx={{
+                                        color: "#fff",
+                                        fontWeight: 950,
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap",
+                                    }}
+                                    title={expandedArtwork.title}
+                                >
+                                    {expandedArtwork.title}
+                                </Typography>
+
+                                {expandedArtwork.subtitle && (
+                                    <Typography
+                                        variant="caption"
+                                        sx={{ color: "rgba(255,255,255,0.56)" }}
+                                    >
+                                        {expandedArtwork.subtitle}
+                                    </Typography>
+                                )}
+                            </Box>
+
+                            <Button
+                                onClick={closeArtworkPreview}
+                                aria-label="Close expanded artwork"
+                                sx={{
+                                    minWidth: 42,
+                                    width: 42,
+                                    height: 42,
+                                    borderRadius: 999,
+                                    color: "#fff",
+                                    fontSize: 26,
+                                    lineHeight: 1,
+                                    border: "1px solid rgba(255,255,255,0.14)",
+                                    background: "rgba(255,255,255,0.06)",
+                                    "&:hover": {
+                                        background: "rgba(255,255,255,0.12)",
+                                        borderColor: "rgba(103,232,249,0.35)",
+                                    },
+                                }}
+                            >
+                                ×
+                            </Button>
+                        </Box>
+
+                        <Box
+                            sx={{
+                                p: { xs: 0.9, sm: 1.35, md: 1.75 },
+                                display: "grid",
+                                placeItems: "center",
+                                background:
+                                    "linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.015))",
+                            }}
+                        >
+                            <Box
+                                component="img"
+                                src={expandedArtwork.src}
+                                alt={`${expandedArtwork.title} large artwork`}
+                                sx={{
+                                    display: "block",
+                                    width: "100%",
+                                    maxWidth: "100%",
+                                    maxHeight: { xs: "78vh", sm: "82vh", md: "86vh" },
+                                    objectFit: "contain",
+                                    borderRadius: { xs: 3, sm: 4 },
+                                    border: "1px solid rgba(255,255,255,0.14)",
+                                    background: "rgba(255,255,255,0.05)",
+                                    boxShadow:
+                                        "0 24px 70px rgba(0,0,0,0.45), 0 0 0 1px rgba(103,232,249,0.08)",
+                                }}
+                            />
+                        </Box>
+                    </Box>
                 </Box>
-            </Stack>
-        </PageShell>
+            )}
+        </>
     );
 }
