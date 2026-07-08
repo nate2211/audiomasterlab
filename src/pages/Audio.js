@@ -533,6 +533,9 @@ const PLAYLIST_DRAG_MIME = "application/x-audiomasterlab-playlist-index";
 // from getting stranded when Safari throttles timers while the phone is locked.
 const BROWSER_SCRUB_AUTO_COMMIT_MS = 360;
 const LOCKSCREEN_SCRUB_RECOVERY_COMMIT_MS = 140;
+const SESSION_SAVE_THROTTLE_MS = 650;
+const SESSION_RESTORE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const SESSION_RESTORE_END_GUARD_SECONDS = 0.75;
 
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const COMMUNITY_FEED_POST_URL = "https://scrapewebsite.pages.dev/api/community/posts";
@@ -1600,23 +1603,98 @@ function persistSessionToBrowser({
                                      playlistLength,
                                      hasMedia,
                                      sourceKind,
+                                     currentPosition = 0,
+                                     duration = 0,
+                                     isPlaying = false,
+                                     activePlaylistItemId = "",
+                                     activePlaylistTitle = "",
+                                     mediaTitle = "",
+                                     sourceUrl = "",
+                                     reason = "session update",
                                  }) {
+    const positionValue = Math.max(0, numberOrDefault(currentPosition, 0));
+    const durationValue = Math.max(0, numberOrDefault(duration, 0));
+    const safePlaylistLength = Math.max(0, Number(playlistLength || 0));
+    const safeActivePlaylistIndex = Number(activePlaylistIndex ?? -1);
+
     writeStorageValue(STORAGE_KEYS.repeatEnabled, repeatEnabled ? "true" : "false");
-    writeStorageValue(STORAGE_KEYS.activePlaylistIndex, String(activePlaylistIndex ?? -1));
+    writeStorageValue(STORAGE_KEYS.activePlaylistIndex, String(Number.isFinite(safeActivePlaylistIndex) ? safeActivePlaylistIndex : -1));
     writeStorageValue(STORAGE_KEYS.directLink, directLink || "");
     writeStorageValue(STORAGE_KEYS.playlistLinkDraft, playlistLink || "");
 
     const summary = {
         repeatEnabled: Boolean(repeatEnabled),
-        activePlaylistIndex: Number(activePlaylistIndex ?? -1),
-        playlistLength: Number(playlistLength || 0),
+        activePlaylistIndex: Number.isFinite(safeActivePlaylistIndex)
+            ? safeActivePlaylistIndex
+            : -1,
+        activePlaylistItemId: String(activePlaylistItemId || ""),
+        activePlaylistTitle: String(activePlaylistTitle || ""),
+        playlistLength: safePlaylistLength,
         hasMedia: Boolean(hasMedia),
         sourceKind: sourceKind || "",
+        sourceUrl: sourceUrl || "",
+        mediaTitle: String(mediaTitle || activePlaylistTitle || ""),
+        currentPosition: positionValue,
+        duration: durationValue,
+        positionLabel: formatTime(positionValue),
+        durationLabel: formatTime(durationValue),
+        isPlaying: Boolean(isPlaying),
+        reason,
         updatedAt: new Date().toISOString(),
     };
 
     writeStorageJson(STORAGE_KEYS.lastSession, summary);
-    setCookieJson(COOKIE_NAMES.sessionSummary, summary);
+    setCookieJson(COOKIE_NAMES.sessionSummary, {
+        repeatEnabled: summary.repeatEnabled,
+        activePlaylistIndex: summary.activePlaylistIndex,
+        playlistLength: summary.playlistLength,
+        hasMedia: summary.hasMedia,
+        sourceKind: summary.sourceKind,
+        currentPosition: Math.round(positionValue * 10) / 10,
+        duration: Math.round(durationValue * 10) / 10,
+        isPlaying: summary.isPlaying,
+        updatedAt: summary.updatedAt,
+    });
+}
+
+function readPersistedSessionSummary() {
+    return readStorageJson(
+        STORAGE_KEYS.lastSession,
+        getCookieJson(COOKIE_NAMES.sessionSummary, null)
+    );
+}
+
+function isPersistedSessionFresh(session) {
+    if (!session?.updatedAt) {
+        return true;
+    }
+
+    const updatedAt = new Date(session.updatedAt).getTime();
+
+    if (!Number.isFinite(updatedAt)) {
+        return true;
+    }
+
+    return Date.now() - updatedAt <= SESSION_RESTORE_MAX_AGE_MS;
+}
+
+function getRestorableSessionPosition(session, durationValue = 0) {
+    if (!session || !isPersistedSessionFresh(session)) {
+        return 0;
+    }
+
+    const durationNumber = Math.max(0, numberOrDefault(durationValue || session.duration, 0));
+    const positionNumber = Math.max(0, numberOrDefault(session.currentPosition, 0));
+
+    if (!durationNumber) {
+        return positionNumber;
+    }
+
+    if (positionNumber >= Math.max(0, durationNumber - SESSION_RESTORE_END_GUARD_SECONDS)) {
+        return 0;
+    }
+
+    return clamp(positionNumber, 0, durationNumber);
 }
 
 function persistPlaylistToBrowser(playlist) {
@@ -3795,6 +3873,8 @@ export default function Audio() {
     const carPlayRouteDisconnectGuardUntilRef = useRef(0);
     const carPlayRouteDisengagedBySystemRef = useRef(false);
     const lastCarPlayRoutePauseReasonRef = useRef("");
+    const lastSessionSaveAtRef = useRef(0);
+    const pendingRestoreSessionRef = useRef(readPersistedSessionSummary());
 
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceKind, setSourceKind] = useState("");
@@ -3977,15 +4057,7 @@ export default function Audio() {
     }, [playlist]);
 
     useEffect(() => {
-        persistSessionToBrowser({
-            repeatEnabled,
-            directLink,
-            playlistLink,
-            activePlaylistIndex,
-            playlistLength: playlist.length,
-            hasMedia,
-            sourceKind,
-        });
+        persistPlaybackSessionSnapshot("React session state changed", { force: true });
         setStorageInfo(buildPersistenceInfo());
     }, [
         repeatEnabled,
@@ -3995,6 +4067,8 @@ export default function Audio() {
         playlist.length,
         hasMedia,
         sourceKind,
+        duration,
+        mediaTitle,
     ]);
 
     useEffect(() => {
@@ -4056,8 +4130,23 @@ export default function Audio() {
     }, []);
 
     useEffect(() => {
+        const listLength = playlistRef.current.length;
+
+        if (activePlaylistIndex >= listLength && listLength > 0) {
+            const nextIndex = listLength - 1;
+            activePlaylistIndexRef.current = nextIndex;
+            setActivePlaylistIndex(nextIndex);
+            return;
+        }
+
+        if (listLength <= 0 && activePlaylistIndex !== -1) {
+            activePlaylistIndexRef.current = -1;
+            setActivePlaylistIndex(-1);
+            return;
+        }
+
         activePlaylistIndexRef.current = activePlaylistIndex;
-    }, [activePlaylistIndex]);
+    }, [activePlaylistIndex, playlist.length]);
 
     useEffect(() => {
         repeatEnabledRef.current = repeatEnabled;
@@ -4313,6 +4402,11 @@ export default function Audio() {
         } else {
             stopCommunityListeningHeartbeat(true);
         }
+
+        persistPlaybackSessionSnapshot(safeValue ? "playback started" : "playback paused", {
+            force: true,
+            playing: safeValue,
+        });
     }
 
     function syncPlaybackPosition(nextOffset, options = {}) {
@@ -4344,6 +4438,13 @@ export default function Audio() {
 
         if (options.forceMediaSession || options.fromMediaSession) {
             updateMediaSessionPositionState({ forcePosition: true });
+        }
+
+        if (!options.skipSessionPersist) {
+            persistPlaybackSessionSnapshot("position update", {
+                force: Boolean(options.forceSessionPersist),
+                position: safeOffset,
+            });
         }
 
         return safeOffset;
@@ -5713,10 +5814,18 @@ export default function Audio() {
             clearPauseReleaseTimer();
             forceRestoreAudibleWebAudioOutput(context, liveNodesRef.current);
 
-            startedOffsetRef.current = clamp(
+            const safeOffset = clamp(
                 numberOrDefault(held.offset, startedOffsetRef.current),
                 0,
                 audioBufferRef.current?.duration || Number.MAX_SAFE_INTEGER
+            );
+
+            startedOffsetRef.current = safeOffset;
+            mediaPositionRef.current = safeOffset;
+            setPosition((current) =>
+                Math.abs(Number(current || 0) - safeOffset) < 0.01
+                    ? current
+                    : safeOffset
             );
             startedAtContextTimeRef.current = context.currentTime || 0;
             manualStopRef.current = false;
@@ -5729,6 +5838,11 @@ export default function Audio() {
             };
 
             setPlayingState(true);
+            persistPlaybackSessionSnapshot("playback source started", {
+                force: true,
+                position: safeOffset,
+                playing: true,
+            });
             updateMediaSessionMetadata();
             updateMediaSessionState("playing", { forcePosition: true });
             startPositionTimer();
@@ -5839,8 +5953,13 @@ export default function Audio() {
             const mediaPosition = getMediaSessionPosition();
             const shouldRestartFromBeginning =
                 shouldRestartAfterLockScreenStop ||
-                startedOffsetRef.current <= 0.01 ||
+                (mediaPosition <= 0.01 && startedOffsetRef.current <= 0.01) ||
                 (mediaDuration > 0 && mediaPosition >= Math.max(0, mediaDuration - 0.25));
+
+            if (!shouldRestartFromBeginning) {
+                startedOffsetRef.current = mediaPosition;
+                mediaPositionRef.current = mediaPosition;
+            }
 
             return startBufferPlayback(shouldRestartFromBeginning, {
                 fromMediaSession: true,
@@ -6353,6 +6472,131 @@ export default function Audio() {
         setStorageInfo(buildPersistenceInfo());
     }
 
+    function persistPlaybackSessionSnapshot(reason = "runtime snapshot", options = {}) {
+        const now = Date.now();
+
+        if (!options.force && now - (lastSessionSaveAtRef.current || 0) < SESSION_SAVE_THROTTLE_MS) {
+            return;
+        }
+
+        lastSessionSaveAtRef.current = now;
+
+        const list = Array.isArray(playlistRef.current) ? playlistRef.current : [];
+        const activeIndex = activePlaylistIndexRef.current;
+        const activeItem = activeIndex >= 0 ? list[activeIndex] : null;
+        const buffer = audioBufferRef.current;
+        const durationValue =
+            Number(buffer?.duration || mediaDurationRef.current || duration || 0) || 0;
+        const positionValue =
+            options.position !== undefined
+                ? options.position
+                : buffer
+                    ? getCurrentOffset()
+                    : Number(mediaPositionRef.current || position || 0);
+        const playingValue =
+            options.playing !== undefined ? Boolean(options.playing) : Boolean(playingRef.current);
+
+        persistSessionToBrowser({
+            repeatEnabled: repeatEnabledRef.current,
+            directLink,
+            playlistLink,
+            activePlaylistIndex: activeIndex,
+            activePlaylistItemId: activeItem?.id || "",
+            activePlaylistTitle: activeItem?.title || "",
+            playlistLength: list.length,
+            hasMedia: Boolean(buffer || hasMediaRef.current),
+            sourceKind,
+            sourceUrl,
+            mediaTitle: mediaTitleRef.current,
+            currentPosition: positionValue,
+            duration: durationValue,
+            isPlaying: playingValue,
+            reason,
+        });
+    }
+
+    function applyRestoredPlaybackSessionPosition(decodedBuffer, options = {}) {
+        const session = pendingRestoreSessionRef.current || readPersistedSessionSummary();
+
+        if (!session || !decodedBuffer) {
+            return 0;
+        }
+
+        const loadedPlaylistIndex = Number(options.loadedPlaylistIndex ?? activePlaylistIndexRef.current);
+        const sessionPlaylistIndex = Number(session.activePlaylistIndex ?? -1);
+        const shouldUsePlaylistPosition =
+            loadedPlaylistIndex < 0 ||
+            sessionPlaylistIndex < 0 ||
+            loadedPlaylistIndex === sessionPlaylistIndex ||
+            (session.activePlaylistItemId &&
+                playlistRef.current?.[loadedPlaylistIndex]?.id === session.activePlaylistItemId);
+
+        if (!shouldUsePlaylistPosition) {
+            return 0;
+        }
+
+        const restoredOffset = getRestorableSessionPosition(
+            session,
+            Number(decodedBuffer.duration || 0)
+        );
+
+        if (restoredOffset <= 0) {
+            return 0;
+        }
+
+        startedOffsetRef.current = restoredOffset;
+        startedAtContextTimeRef.current = 0;
+        mediaPositionRef.current = restoredOffset;
+        browserScrubLastValueRef.current = restoredOffset;
+        pendingMediaSessionSeekRef.current = null;
+
+        setPosition(restoredOffset);
+        updateMediaSessionMetadata();
+        updateMediaSessionState("paused", { forcePosition: true });
+        persistPlaybackSessionSnapshot("restored saved playback position", {
+            force: true,
+            position: restoredOffset,
+            playing: false,
+        });
+
+        return restoredOffset;
+    }
+
+    function findPlaylistIndexForRestoredUrl(urlValue) {
+        const session = pendingRestoreSessionRef.current || readPersistedSessionSummary();
+        const list = Array.isArray(playlistRef.current) ? playlistRef.current : [];
+        const sessionIndex = Number(session?.activePlaylistIndex ?? -1);
+        const canonicalUrl = getCanonicalArchiveMediaUrl(urlValue);
+
+        if (
+            sessionIndex >= 0 &&
+            sessionIndex < list.length &&
+            list[sessionIndex]?.kind === "url"
+        ) {
+            const sessionItem = list[sessionIndex];
+
+            if (
+                sessionItem.id === session?.activePlaylistItemId ||
+                getCanonicalArchiveMediaUrl(sessionItem.url) === canonicalUrl
+            ) {
+                return sessionIndex;
+            }
+        }
+
+        return list.findIndex(
+            (item) =>
+                item?.kind === "url" &&
+                getCanonicalArchiveMediaUrl(item.url) === canonicalUrl
+        );
+    }
+
+    function setRestoredActivePlaylistIndex(nextIndex) {
+        const safeIndex = Number.isInteger(nextIndex) && nextIndex >= 0 ? nextIndex : -1;
+
+        setActivePlaylistIndex(safeIndex);
+        activePlaylistIndexRef.current = safeIndex;
+    }
+
     function clearSavedBrowserSession() {
         clearPersistedBrowserSession();
         refreshStorageInfo();
@@ -6401,11 +6645,16 @@ export default function Audio() {
                 };
 
                 const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+                const restoredOffset = applyRestoredPlaybackSessionPosition(decodedBuffer);
 
                 setInfo(
                     `Restored saved local audio "${savedMedia.title}" from localStorage. Browser decoded ${formatTime(
                         decodedBuffer.duration
-                    )}.`
+                    )}.${
+                        restoredOffset > 0
+                            ? ` Restored the saved position at ${formatTime(restoredOffset)}. Tap Play to resume from there; browsers usually block automatic playback after reopening.`
+                            : ""
+                    }`
                 );
             } catch (error) {
                 setError(
@@ -6432,16 +6681,20 @@ export default function Audio() {
                 setSourceKind("url");
                 setSourceUrl(cleanLink);
                 setDirectLink(cleanLink);
-                setActivePlaylistIndex(-1);
-                activePlaylistIndexRef.current = -1;
+                setRestoredActivePlaylistIndex(findPlaylistIndexForRestoredUrl(cleanLink));
 
                 const { arrayBuffer, metadata } = await fetchDirectMediaArrayBuffer(cleanLink);
                 const decodedBuffer = await prepareDecodedBuffer(arrayBuffer, metadata);
+                const restoredOffset = applyRestoredPlaybackSessionPosition(decodedBuffer);
 
                 setInfo(
                     `Restored saved direct media link "${savedMedia.title}". Browser decoded ${formatTime(
                         decodedBuffer.duration
-                    )}.`
+                    )}.${
+                        restoredOffset > 0
+                            ? ` Restored the saved position at ${formatTime(restoredOffset)}. Tap Play to resume from there; browsers usually block automatic playback after reopening.`
+                            : ""
+                    }`
                 );
             } catch (error) {
                 setDirectLink(savedMedia.url || "");
@@ -7141,6 +7394,7 @@ export default function Audio() {
             forceMediaSession: true,
             commitStartOffset: true,
             clearPendingMediaSessionSeek: true,
+            forceSessionPersist: true,
         });
         updateMediaSessionState(shouldResume && didSeek ? "playing" : "paused", {
             forcePosition: true,
@@ -7277,7 +7531,11 @@ export default function Audio() {
             });
             startedOffsetRef.current = 0;
             startedAtContextTimeRef.current = 0;
-            setPosition(0);
+            syncPlaybackPosition(0, {
+                commitStartOffset: true,
+                forceMediaSession: true,
+                forceSessionPersist: true,
+            });
 
             if (shouldKeepIPhoneOutputStreamAlive && isIOSAudioDevice()) {
                 iPhoneOutputHeldForLockScreenRestartRef.current = true;
@@ -7464,6 +7722,14 @@ export default function Audio() {
         mediaPositionRef.current = 0;
         lastMediaSessionPositionSnapshotRef.current = {
             duration: decodedBuffer.duration,
+            position: 0,
+            playbackRate: getMediaSessionPlaybackRate(),
+        };
+
+        mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
+        mediaPositionRef.current = 0;
+        lastMediaSessionPositionSnapshotRef.current = {
+            duration: Number(decodedBuffer.duration) || 0,
             position: 0,
             playbackRate: getMediaSessionPlaybackRate(),
         };
@@ -8496,6 +8762,13 @@ export default function Audio() {
             });
             mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
             mediaPositionRef.current = 0;
+
+            const restoredOffset = !autoplay
+                ? applyRestoredPlaybackSessionPosition(decodedBuffer, {
+                    loadedPlaylistIndex: safeIndex,
+                })
+                : 0;
+
             updateMediaSessionMetadata();
             updateMediaSessionState(autoplay ? "playing" : "paused", {
                 forcePosition: true,
@@ -8505,6 +8778,10 @@ export default function Audio() {
             const loadMessage = `Loaded playlist item ${safeIndex + 1} of ${
                 playlistRef.current.length
             }: "${item.title}". Browser decoded ${formatTime(decodedBuffer.duration)}.${
+                restoredOffset > 0
+                    ? ` Restored saved position ${formatTime(restoredOffset)}.`
+                    : ""
+            }${
                 extraInfo ? ` ${extraInfo}` : ""
             }`;
 
@@ -9074,7 +9351,10 @@ export default function Audio() {
 
         const list = playlistRef.current;
         const canContinueAfterEnded = Boolean(
-            repeatEnabledRef.current || (Array.isArray(list) && list.length > 0)
+            repeatEnabledRef.current ||
+            (Array.isArray(list) &&
+                activePlaylistIndexRef.current >= 0 &&
+                activePlaylistIndexRef.current < list.length - 1)
         );
 
         setPosition(0);
@@ -9118,19 +9398,26 @@ export default function Audio() {
 
         const currentIndex = activePlaylistIndexRef.current;
 
-        if (list.length > 0) {
-            const nextIndex = getNextPlaylistIndex(currentIndex, list);
+        if (Array.isArray(list) && list.length > 0) {
+            if (currentIndex >= 0 && currentIndex < list.length - 1) {
+                const nextIndex = currentIndex + 1;
 
-            await loadNextPlayablePlaylistItem(nextIndex, {
-                autoplay: true,
-                fromPlaybackEnded: true,
-                preserveUnlockedOutput: true,
-                outputAlreadyRestarted: isIOSAudioDevice(),
-                forceIPhoneOutputPostStart: isIOSAudioDevice(),
-                reason:
-                    nextIndex === 0 && currentIndex >= list.length - 1
-                        ? "Repeat is off. End reached, wrapping to the first playable playlist track"
-                        : "Repeat is off. Moving to the next playlist track",
+                await loadNextPlayablePlaylistItem(nextIndex, {
+                    autoplay: true,
+                    fromPlaybackEnded: true,
+                    preserveUnlockedOutput: true,
+                    outputAlreadyRestarted: isIOSAudioDevice(),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                    reason: "Repeat is off. Moving to the next playlist track in order",
+                });
+                return;
+            }
+
+            setInfo("Playlist finished in order. Repeat is off, so playback stopped at the end instead of wrapping to the first track.");
+            persistPlaybackSessionSnapshot("playlist finished", {
+                force: true,
+                position: 0,
+                playing: false,
             });
             return;
         }
@@ -9548,6 +9835,7 @@ export default function Audio() {
             fromMediaSession: Boolean(options.fromMediaSession),
             forceMediaSession: true,
             commitStartOffset: true,
+            forceSessionPersist: true,
         });
 
         if (!shouldResumeAfterSeek || !options.keepPlayingUiDuringSeek) {
@@ -9571,6 +9859,7 @@ export default function Audio() {
                 forceMediaSession: true,
                 commitStartOffset: true,
                 clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
             });
             updateMediaSessionState("playing", { forcePosition: true });
             if (!options.fromMediaSession && !options.quietStatus) {
@@ -9583,6 +9872,7 @@ export default function Audio() {
                 forceMediaSession: true,
                 commitStartOffset: true,
                 clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
             });
             updateMediaSessionState("paused", { forcePosition: true });
             if (!options.fromMediaSession && !options.quietStatus) {
@@ -9618,9 +9908,21 @@ export default function Audio() {
             forceMediaSession: true,
         });
 
-        setPlayingState(false);
+        if (!wasPlaying) {
+            setPlayingState(false);
+        } else {
+            playingRef.current = true;
+            isPlayingStateRef.current = true;
+            setIsPlaying(true);
+            persistPlaybackSessionSnapshot("scrub in progress while playing", {
+                force: true,
+                position: currentOffset,
+                playing: true,
+            });
+        }
         setIsScrubbing(true);
-        updateMediaSessionState("paused", { forcePosition: true });
+        updateMediaSessionState(wasPlaying ? "playing" : "paused", { forcePosition: true });
+        scheduleBrowserScrubAutoCommit("browser scrub started");
 
         if (wasPlaying && isIOSAudioDevice()) {
             keepIPhoneOutputElementAliveForLockScreen(
@@ -9650,7 +9952,10 @@ export default function Audio() {
         syncPlaybackPosition(nextOffset, {
             forceMediaSession: true,
         });
-        updateMediaSessionState("paused", { forcePosition: true });
+        updateMediaSessionState(getScrubResumeIntent() ? "playing" : "paused", {
+            forcePosition: true,
+        });
+        scheduleBrowserScrubAutoCommit("browser scrub changed");
     }
 
     async function handleScrubCommit(_, nextValue) {
@@ -9663,6 +9968,8 @@ export default function Audio() {
         const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
         let outputAlreadyRestarted = false;
 
+        clearBrowserScrubAutoCommitTimer();
+        clearPageResumeScrubRecoveryTimer();
         rememberScrubTarget(nextOffset);
 
         // Correct older implementation: determine iOS output status before seekTo()
