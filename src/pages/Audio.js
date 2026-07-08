@@ -498,6 +498,8 @@ const STORAGE_KEYS = {
     lastMedia: "audiomasterlab.audio.lastMedia.v4",
     lastSession: "audiomasterlab.audio.lastSession.v4",
     carPlaySafeMode: "audiomasterlab.audio.carPlaySafeMode.v4",
+    smartCarResumeEnabled: "audiomasterlab.audio.smartCarResumeEnabled.v4",
+    smartCarResumeIntent: "audiomasterlab.audio.smartCarResumeIntent.v4",
 };
 
 const COOKIE_NAMES = {
@@ -523,6 +525,12 @@ const PLAYLIST_RECOVERY_SETTINGS = {
     fetchCacheModes: ["no-store", "reload", "default"],
 };
 
+// Playlist end-loop recovery keeps the queue from stopping on the last item
+// and prevents duplicate WebAudio onended callbacks from starting two copies
+// after a long backgrounded tab, iOS lock-screen wake, or CarPlay route change.
+const PLAYLIST_END_RESTART_GUARD_MS = 1800;
+const PLAYLIST_END_WRAP_DELAY_MS = 90;
+
 const IPHONE_KEEP_ALIVE_GAIN = 0.0000004;
 const STREAM_FINAL_CEILING_GAIN = 0.94;
 const STREAM_EFFECT_SMOOTH_SECONDS = 0.09;
@@ -536,9 +544,23 @@ const LOCKSCREEN_SCRUB_RECOVERY_COMMIT_MS = 140;
 const STUCK_SCRUB_RECOVERY_MS = 1800;
 const LONG_RUNNING_PLAYBACK_WATCHDOG_MS = 1450;
 const LONG_RUNNING_SESSION_FORCE_SAVE_MS = 12000;
+const CONTROL_SELF_HEAL_INTERVAL_MS = 5200;
+const CONTROL_WAKE_REPAIR_DELAY_MS = 90;
+const CONTROL_REPAIR_STATUS_THROTTLE_MS = 15000;
+const CONTROL_VOLUME_SYNC_THROTTLE_MS = 450;
+const ZERO_VOLUME_EPSILON = 0.0005;
+// Browser backgrounding can throttle timers for seconds at a time. These values
+// let the player checkpoint while hidden and perform multiple small repairs when
+// the tab/window regains focus so controls, scrubber, and Media Session stay live.
+const BACKGROUND_CONTROL_CHECKPOINT_MS = 8500;
+const BACKGROUND_TIMER_DRIFT_REPAIR_MS = 2600;
+const FOREGROUND_REPAIR_STEPS_MS = [0, 120, 650, 1800];
 const SESSION_SAVE_THROTTLE_MS = 650;
 const SESSION_RESTORE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const SESSION_RESTORE_END_GUARD_SECONDS = 0.75;
+const SMART_CAR_RESUME_INTENT_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+const SMART_CAR_RESUME_RETRY_DELAYS_MS = [0, 280, 950, 2200];
+const SMART_CAR_RESUME_COOLDOWN_MS = 2200;
 // Keep the old stable behavior: if audio was playing when the scrub started,
 // the final seek resumes automatically even if the browser fires duplicate
 // release/commit events out of order after a long open tab or lock-screen wake.
@@ -929,6 +951,63 @@ function readPersistedCarPlaySafeMode() {
     // Default this on for iPhone/iPad because wired CarPlay and USB audio-route
     // changes are more sensitive to WebAudio graph rebuilds and wet effect jumps.
     return isIOSAudioDevice();
+}
+
+function readPersistedSmartCarResumeEnabled() {
+    const stored = readStorageValue(STORAGE_KEYS.smartCarResumeEnabled, "");
+    if (stored === "true") return true;
+    if (stored === "false") return false;
+    return isIOSAudioDevice();
+}
+
+function persistSmartCarResumeEnabledToBrowser(enabled) {
+    writeStorageValue(STORAGE_KEYS.smartCarResumeEnabled, enabled ? "true" : "false");
+}
+
+function isSmartCarResumeIntentFresh(intent) {
+    if (!intent?.updatedAt) return false;
+    const updatedAt = new Date(intent.updatedAt).getTime();
+    return Number.isFinite(updatedAt) && Date.now() - updatedAt <= SMART_CAR_RESUME_INTENT_MAX_AGE_MS;
+}
+
+function sanitizeSmartCarResumeIntent(intent) {
+    if (!intent || typeof intent !== "object" || !intent.wasPlaying || !isSmartCarResumeIntentFresh(intent)) return null;
+    return {
+        wasPlaying: true,
+        sourceKind: String(intent.sourceKind || ""),
+        sourceUrl: String(intent.sourceUrl || ""),
+        mediaTitle: String(intent.mediaTitle || intent.activePlaylistTitle || ""),
+        activePlaylistIndex: Number.isFinite(Number(intent.activePlaylistIndex)) ? Number(intent.activePlaylistIndex) : -1,
+        activePlaylistItemId: String(intent.activePlaylistItemId || ""),
+        activePlaylistTitle: String(intent.activePlaylistTitle || ""),
+        playlistLength: Math.max(0, Number(intent.playlistLength || 0)),
+        currentPosition: Math.max(0, numberOrDefault(intent.currentPosition, 0)),
+        duration: Math.max(0, numberOrDefault(intent.duration, 0)),
+        reason: String(intent.reason || "smart car resume intent"),
+        updatedAt: intent.updatedAt,
+    };
+}
+
+function readPersistedSmartCarResumeIntent() {
+    return sanitizeSmartCarResumeIntent(readStorageJson(STORAGE_KEYS.smartCarResumeIntent, null));
+}
+
+function persistSmartCarResumeIntentToBrowser(intent) {
+    const sanitized = sanitizeSmartCarResumeIntent({
+        ...(intent || {}),
+        wasPlaying: true,
+        updatedAt: intent?.updatedAt || new Date().toISOString(),
+    });
+    if (!sanitized) {
+        removeStorageValue(STORAGE_KEYS.smartCarResumeIntent);
+        return null;
+    }
+    writeStorageJson(STORAGE_KEYS.smartCarResumeIntent, sanitized);
+    return sanitized;
+}
+
+function clearSmartCarResumeIntentFromBrowser() {
+    removeStorageValue(STORAGE_KEYS.smartCarResumeIntent);
 }
 
 function readPersistedDirectLink() {
@@ -1775,6 +1854,8 @@ function buildPersistenceInfo() {
             : 0,
         hasSavedCurrentAudio: Boolean(lastMedia?.dataUrl || lastMedia?.url),
         carPlaySafeMode: readPersistedCarPlaySafeMode(),
+        smartCarResumeEnabled: readPersistedSmartCarResumeEnabled(),
+        hasSmartCarResumeIntent: Boolean(readPersistedSmartCarResumeIntent()),
         lastMediaKind: lastMedia?.kind || "",
         lastMediaTitle: lastMedia?.title || "",
         storageBytes: getStoredItemSizeEstimate({
@@ -3606,8 +3687,8 @@ function getPlaylistStatusLabel(repeatEnabled, playlistLength, activeIndex) {
 
     if (playlistLength > 0 && activeIndex >= 0) {
         return isIOSAudioDevice()
-            ? "Repeat is OFF. After one Start playlist tap, Safari/iOS auto-next stays on the same unlocked audio session, advances to the next song, skips broken links/files, and wraps back to the first playable track."
-            : "Repeat is OFF. The playlist will advance to the next song, skip broken links/files, and wrap back to the first playable track.";
+            ? "Repeat is OFF. After one Start playlist tap, Safari/iOS auto-next stays on the same unlocked audio session, advances to the next song, skips broken links/files, and restarts from track 1 when the playlist ends."
+            : "Repeat is OFF. The playlist will advance to the next song, skip broken links/files, and restart from track 1 when the playlist ends.";
     }
 
     if (playlistLength > 0) {
@@ -3753,6 +3834,26 @@ function StoragePersistencePanel({ storageInfo, onClearSavedSession }) {
                     />
 
                     <Chip
+                        label={
+                            storageInfo?.smartCarResumeEnabled
+                                ? storageInfo?.hasSmartCarResumeIntent
+                                    ? "smart car resume armed"
+                                    : "smart car resume ready"
+                                : "smart car resume off"
+                        }
+                        sx={{
+                            color: "#fff",
+                            fontWeight: 850,
+                            background: storageInfo?.hasSmartCarResumeIntent
+                                ? "rgba(34,197,94,0.12)"
+                                : "rgba(255,255,255,0.08)",
+                            border: storageInfo?.hasSmartCarResumeIntent
+                                ? "1px solid rgba(34,197,94,0.22)"
+                                : "1px solid rgba(255,255,255,0.08)",
+                        }}
+                    />
+
+                    <Chip
                         label={savedAudioLabel}
                         sx={{
                             color: "#fff",
@@ -3789,6 +3890,12 @@ export default function Audio() {
     const carPlayRecoveryTimerRef = useRef(null);
     const lastCarPlayRecoveryReasonRef = useRef("");
     const carPlaySafeModeRef = useRef(readPersistedCarPlaySafeMode());
+    const smartCarResumeEnabledRef = useRef(readPersistedSmartCarResumeEnabled());
+    const smartCarResumeIntentRef = useRef(readPersistedSmartCarResumeIntent());
+    const smartCarResumeTimersRef = useRef([]);
+    const smartCarResumeInFlightRef = useRef(false);
+    const lastSmartCarResumeAttemptAtRef = useRef(0);
+    const lastSmartCarRouteWakeAtRef = useRef(0);
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -3800,7 +3907,22 @@ export default function Audio() {
 
     const timerRef = useRef(null);
     const playbackWatchdogTimerRef = useRef(null);
+    const controlSelfHealTimerRef = useRef(null);
+    const controlWakeRepairTimerRef = useRef(null);
     const lastPlaybackWatchdogSessionSaveAtRef = useRef(0);
+    const lastControlSelfHealAtRef = useRef(0);
+    const lastControlInteractionAtRef = useRef(Date.now());
+    const lastControlRecoveryStatusAtRef = useRef(0);
+    const lastUnifiedControlVolumeSyncAtRef = useRef(0);
+    const lastUnifiedControlVolumeSyncReasonRef = useRef("");
+    const backgroundControlCheckpointTimerRef = useRef(null);
+    const foregroundRepairTimersRef = useRef([]);
+    const pageBackgroundedAtRef = useRef(0);
+    const lastControlVisibilityStateRef = useRef(
+        typeof document !== "undefined" ? document.visibilityState || "visible" : "visible"
+    );
+    const lastPositionTimerTickAtRef = useRef(0);
+    const lastKnownGoodOffsetRef = useRef(0);
     const playbackEndedHandledRef = useRef(false);
 
     const startedAtContextTimeRef = useRef(0);
@@ -3822,6 +3944,10 @@ export default function Audio() {
     const playlistDragIndexRef = useRef(-1);
     const playlistDragOverIndexRef = useRef(-1);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
+    const playlistEndRestartGuardRef = useRef({
+        key: "",
+        at: 0,
+    });
     const communityListeningSessionIdRef = useRef(
         readPersistedCommunityListeningSessionId()
     );
@@ -3938,6 +4064,9 @@ export default function Audio() {
     const [carPlaySafeMode, setCarPlaySafeMode] = useState(() =>
         readPersistedCarPlaySafeMode()
     );
+    const [smartCarResumeEnabled, setSmartCarResumeEnabled] = useState(() =>
+        readPersistedSmartCarResumeEnabled()
+    );
     const [carPlayOutputStatus, setCarPlayOutputStatus] = useState(() =>
         buildCarPlaySafeModeLabel(readPersistedCarPlaySafeMode())
     );
@@ -3950,6 +4079,7 @@ export default function Audio() {
     const carPlayOutputStatusValueRef = useRef(carPlayOutputStatus);
 
     const settingsView = normalizeSettings(settings);
+    const isOutputSilenced = Boolean(isMuted || settingsView.baseVolume <= ZERO_VOLUME_EPSILON);
     const selectedVisualizer3DMode =
         VISUALIZER_3D_MODE_OPTIONS.find(
             (option) => option.value === visualizer3dSettings.model
@@ -4121,6 +4251,17 @@ export default function Audio() {
     }, [carPlaySafeMode]);
 
     useEffect(() => {
+        smartCarResumeEnabledRef.current = smartCarResumeEnabled;
+        persistSmartCarResumeEnabledToBrowser(smartCarResumeEnabled);
+        if (!smartCarResumeEnabled) {
+            clearSmartCarResumeTimers();
+            clearSmartCarResumeIntent("smart car resume disabled");
+        }
+        setStorageInfo(buildPersistenceInfo());
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [smartCarResumeEnabled]);
+
+    useEffect(() => {
         persistPlaylistToBrowser(playlist);
         setStorageInfo(buildPersistenceInfo());
     }, [playlist]);
@@ -4228,6 +4369,8 @@ export default function Audio() {
             stopPlayback(false);
             stopVisualizer();
             clearPlaybackWatchdogTimer();
+            clearControlSelfHealTimer();
+            clearControlWakeRepairTimer();
             clearCarPlayRecoveryTimer();
             clearPauseReleaseTimer();
             clearPauseUiQuietTimer();
@@ -4372,6 +4515,7 @@ export default function Audio() {
             scheduleCarPlayOutputRecovery(`iOS page/audio route event: ${eventType}`, {
                 allowAutoResume: false,
             });
+            scheduleSmartCarResume(`iOS page/audio route event: ${eventType}`);
         };
 
         window.addEventListener("focus", recoverFromPageEvent);
@@ -4397,6 +4541,93 @@ export default function Audio() {
     }, []);
 
     useEffect(() => {
+        const handleControlWakeEvent = (event) => {
+            const eventType = event?.type || "wake";
+
+            if (eventType === "visibilitychange" && typeof document !== "undefined" && document.visibilityState !== "visible") {
+                persistPlaybackSessionSnapshot("page hidden control checkpoint", {
+                    force: true,
+                    position: getCurrentScrubTarget(),
+                    playing: Boolean(playingRef.current || isPlayingStateRef.current || getScrubResumeIntent()),
+                });
+                return;
+            }
+
+            scheduleControlWakeRepair(eventType);
+        };
+
+        window.addEventListener("focus", handleControlWakeEvent);
+        window.addEventListener("pageshow", handleControlWakeEvent);
+        window.addEventListener("online", handleControlWakeEvent);
+        document.addEventListener("visibilitychange", handleControlWakeEvent);
+
+        return () => {
+            window.removeEventListener("focus", handleControlWakeEvent);
+            window.removeEventListener("pageshow", handleControlWakeEvent);
+            window.removeEventListener("online", handleControlWakeEvent);
+            document.removeEventListener("visibilitychange", handleControlWakeEvent);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        if (hasMedia) {
+            startControlSelfHealWatchdog();
+            repairControlSurface("media ready control watcher");
+        } else {
+            clearControlSelfHealTimer();
+            clearControlWakeRepairTimer();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [hasMedia]);
+
+    useEffect(() => {
+        const handleBackgroundLifecycle = (event) => {
+            const eventType = event?.type || "lifecycle";
+            const isDocumentHidden =
+                typeof document !== "undefined" && document.visibilityState !== "visible";
+            const isGoingBackground =
+                eventType === "blur" ||
+                eventType === "pagehide" ||
+                eventType === "freeze" ||
+                (eventType === "visibilitychange" && isDocumentHidden);
+
+            if (isGoingBackground) {
+                enterBackgroundControlMode(eventType);
+                return;
+            }
+
+            exitBackgroundControlMode(eventType);
+            scheduleSmartCarResume(`background lifecycle ${eventType}`);
+        };
+
+        window.addEventListener("blur", handleBackgroundLifecycle);
+        window.addEventListener("focus", handleBackgroundLifecycle);
+        window.addEventListener("pagehide", handleBackgroundLifecycle);
+        window.addEventListener("pageshow", handleBackgroundLifecycle);
+        document.addEventListener("visibilitychange", handleBackgroundLifecycle);
+
+        // Chrome/Page Lifecycle emits these when a hidden page is frozen or resumed.
+        // Other browsers ignore unknown event names, so these are safe fallbacks.
+        document.addEventListener("freeze", handleBackgroundLifecycle);
+        document.addEventListener("resume", handleBackgroundLifecycle);
+
+        return () => {
+            window.removeEventListener("blur", handleBackgroundLifecycle);
+            window.removeEventListener("focus", handleBackgroundLifecycle);
+            window.removeEventListener("pagehide", handleBackgroundLifecycle);
+            window.removeEventListener("pageshow", handleBackgroundLifecycle);
+            document.removeEventListener("visibilitychange", handleBackgroundLifecycle);
+            document.removeEventListener("freeze", handleBackgroundLifecycle);
+            document.removeEventListener("resume", handleBackgroundLifecycle);
+            clearBackgroundControlCheckpointTimer();
+            clearForegroundRepairTimers();
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+
+    useEffect(() => {
         const element = outputAudioRef.current;
 
         if (!element || !isIOSAudioDevice()) {
@@ -4404,6 +4635,8 @@ export default function Audio() {
         }
 
         const handleOutputPlay = () => {
+            markControlInteraction("hidden output play event");
+            scheduleSmartCarResume("hidden iOS output play event", { immediate: true, fromOutputElement: true });
             const now = Date.now();
 
             if (carPlayRouteDisengagedBySystemRef.current && !playingRef.current) {
@@ -4441,6 +4674,7 @@ export default function Audio() {
         };
 
         const handleOutputPause = () => {
+            markControlInteraction("hidden output pause event");
             if (outputElementActionGuardRef.current || isInsideCleanPauseWindow()) {
                 if (playingRef.current) {
                     updateMediaSessionState("playing", { forcePosition: true });
@@ -4494,6 +4728,7 @@ export default function Audio() {
             scheduleCarPlayOutputRecovery(`hidden iOS output element ${eventType}`, {
                 allowAutoResume: false,
             });
+            scheduleSmartCarResume(`hidden iOS output element ${eventType}`);
         };
 
         element.addEventListener("play", handleOutputPlay);
@@ -4528,8 +4763,11 @@ export default function Audio() {
         setIsPlaying((current) => (current === safeValue ? current : safeValue));
 
         if (safeValue) {
+            markControlInteraction("playback state entered playing");
+            rememberSmartCarResumeIntent("playback is active", { force: true, playing: true });
             startCommunityListeningHeartbeat();
             startPlaybackWatchdog();
+            startControlSelfHealWatchdog();
         } else {
             stopCommunityListeningHeartbeat(true);
             if (!scrubbingRef.current) {
@@ -4551,6 +4789,7 @@ export default function Audio() {
             : Math.max(0, safeNumber);
 
         mediaPositionRef.current = safeOffset;
+        lastKnownGoodOffsetRef.current = safeOffset;
 
         if (options.commitStartOffset) {
             startedOffsetRef.current = safeOffset;
@@ -4860,6 +5099,12 @@ export default function Audio() {
         const context = audioContextRef.current;
         const nextOffset = getCurrentOffset();
 
+        rememberSmartCarResumeIntent(reason, {
+            force: true,
+            position: nextOffset,
+            playing: true,
+        });
+
         try {
             if (context && context.state !== "closed") {
                 await fadeMonitorForPause(context, 0.1);
@@ -4919,6 +5164,185 @@ export default function Audio() {
         );
 
         return true;
+    }
+
+    function clearSmartCarResumeTimers() {
+        smartCarResumeTimersRef.current.forEach((timerId) => {
+            try {
+                window.clearTimeout(timerId);
+            } catch {
+                // Ignore timer cleanup failures.
+            }
+        });
+        smartCarResumeTimersRef.current = [];
+    }
+
+    function getSmartCarResumeSnapshot(reason = "smart car resume checkpoint", options = {}) {
+        const list = Array.isArray(playlistRef.current) ? playlistRef.current : [];
+        const activeIndex = activePlaylistIndexRef.current;
+        const activeItem = activeIndex >= 0 ? list[activeIndex] : null;
+        const buffer = audioBufferRef.current;
+        const durationValue = Math.max(0, numberOrDefault(buffer?.duration || mediaDurationRef.current || duration, 0));
+        const positionValue = Math.max(0, numberOrDefault(
+            options.position !== undefined ? options.position : buffer ? getCurrentOffset() : mediaPositionRef.current || position,
+            0
+        ));
+
+        return {
+            wasPlaying: Boolean(options.playing ?? playingRef.current ?? isPlayingStateRef.current),
+            sourceKind: sourceKind || "",
+            sourceUrl: sourceUrl || "",
+            mediaTitle: mediaTitleRef.current || activeItem?.title || "",
+            activePlaylistIndex: activeIndex,
+            activePlaylistItemId: activeItem?.id || "",
+            activePlaylistTitle: activeItem?.title || "",
+            playlistLength: list.length,
+            currentPosition: durationValue > 0 ? clamp(positionValue, 0, durationValue) : positionValue,
+            duration: durationValue,
+            reason,
+            updatedAt: new Date().toISOString(),
+        };
+    }
+
+    function rememberSmartCarResumeIntent(reason = "smart car resume checkpoint", options = {}) {
+        if (!smartCarResumeEnabledRef.current) return null;
+        if (!options.force && isInsideCleanPauseWindow()) return smartCarResumeIntentRef.current;
+        const snapshot = getSmartCarResumeSnapshot(reason, options);
+        if (!snapshot.wasPlaying && !options.force) return smartCarResumeIntentRef.current;
+        if (!snapshot.duration && !audioBufferRef.current && !hasMediaRef.current) return smartCarResumeIntentRef.current;
+        const saved = persistSmartCarResumeIntentToBrowser({ ...snapshot, wasPlaying: true });
+        smartCarResumeIntentRef.current = saved;
+        refreshStorageInfo();
+        return saved;
+    }
+
+    function clearSmartCarResumeIntent(reason = "smart car resume cleared") {
+        smartCarResumeIntentRef.current = null;
+        clearSmartCarResumeIntentFromBrowser();
+        refreshStorageInfo();
+        if (reason && smartCarResumeEnabledRef.current && carPlaySafeModeRef.current) {
+            setCarPlayOutputStatusIfChanged(`Smart car resume cleared: ${reason}.`);
+        }
+    }
+
+    function hasFreshSmartCarResumeIntent() {
+        const freshIntent = sanitizeSmartCarResumeIntent(smartCarResumeIntentRef.current || readPersistedSmartCarResumeIntent());
+        smartCarResumeIntentRef.current = freshIntent;
+        return Boolean(freshIntent);
+    }
+
+    function shouldAttemptSmartCarResume(reason = "smart car resume") {
+        if (!smartCarResumeEnabledRef.current) return false;
+        if (playingRef.current || activeSourceRef.current) return false;
+        if (pauseActionInFlightRef.current || isInsideCleanPauseWindow()) return false;
+        if (Date.now() - (lastMediaSessionPauseAtRef.current || 0) < 1800) return false;
+        if (!hasFreshSmartCarResumeIntent()) return false;
+
+        const cleanReason = String(reason || "smart car resume").toLowerCase();
+        const routeLikeWake =
+            cleanReason.includes("devicechange") ||
+            cleanReason.includes("carplay") ||
+            cleanReason.includes("bluetooth") ||
+            cleanReason.includes("route") ||
+            cleanReason.includes("media session play") ||
+            cleanReason.includes("output play") ||
+            cleanReason.includes("pageshow") ||
+            cleanReason.includes("focus") ||
+            cleanReason.includes("visibilitychange") ||
+            cleanReason.includes("resume");
+
+        return routeLikeWake || !isIOSAudioDevice();
+    }
+
+    function scheduleSmartCarResume(reason = "smart car resume", options = {}) {
+        if (!shouldAttemptSmartCarResume(reason)) return;
+        const now = Date.now();
+        if (!options.immediate && now - (lastSmartCarResumeAttemptAtRef.current || 0) < SMART_CAR_RESUME_COOLDOWN_MS) return;
+        clearSmartCarResumeTimers();
+        lastSmartCarRouteWakeAtRef.current = now;
+        SMART_CAR_RESUME_RETRY_DELAYS_MS.forEach((delayMs) => {
+            const timerId = window.setTimeout(() => {
+                attemptSmartCarResume(reason, options).catch(() => {});
+            }, options.immediate ? Math.min(delayMs, 120) : delayMs);
+            smartCarResumeTimersRef.current.push(timerId);
+        });
+    }
+
+    async function attemptSmartCarResume(reason = "smart car resume", options = {}) {
+        if (!shouldAttemptSmartCarResume(reason) || smartCarResumeInFlightRef.current) return false;
+        smartCarResumeInFlightRef.current = true;
+        lastSmartCarResumeAttemptAtRef.current = Date.now();
+
+        try {
+            const intent = sanitizeSmartCarResumeIntent(smartCarResumeIntentRef.current || readPersistedSmartCarResumeIntent());
+            if (!intent) return false;
+
+            const buffer = audioBufferRef.current;
+            if (buffer) {
+                const restoredPosition = getRestorableSessionPosition(
+                    { currentPosition: intent.currentPosition, duration: intent.duration || buffer.duration, updatedAt: intent.updatedAt },
+                    Number(buffer.duration || intent.duration || 0)
+                );
+                startedOffsetRef.current = restoredPosition;
+                mediaPositionRef.current = restoredPosition;
+                browserScrubLastValueRef.current = restoredPosition;
+                syncPlaybackPosition(restoredPosition, {
+                    commitStartOffset: true,
+                    forceMediaSession: true,
+                    forceSessionPersist: true,
+                });
+
+                setCarPlayOutputStatusIfChanged(
+                    `Smart car resume is reconnecting ${intent.mediaTitle || "the previous track"} at ${formatTime(restoredPosition)} after ${reason}.`
+                );
+
+                const outputAlreadyRestarted = isIOSAudioDevice()
+                    ? await restartIPhoneOutputStreamForLockScreenPlay("Smart car resume")
+                    : false;
+
+                const started = await startBufferPlayback(false, {
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    outputAlreadyRestarted,
+                    forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                    fromMediaSession: Boolean(options.fromMediaSession || options.fromOutputElement),
+                    quietStatus: true,
+                });
+
+                if (started) {
+                    clearSmartCarResumeIntent("smart car resume started playback");
+                    setInfo(`Smart car resume reconnected ${intent.mediaTitle || "the previous track"} at ${formatTime(restoredPosition)}.`);
+                    return true;
+                }
+                return false;
+            }
+
+            const list = playlistRef.current;
+            const startIndex = Number.isFinite(Number(intent.activePlaylistIndex)) && intent.activePlaylistIndex >= 0
+                ? intent.activePlaylistIndex
+                : activePlaylistIndexRef.current >= 0
+                    ? activePlaylistIndexRef.current
+                    : 0;
+
+            if (Array.isArray(list) && list.length) {
+                setCarPlayOutputStatusIfChanged(
+                    `Smart car resume is reloading ${intent.activePlaylistTitle || "the previous playlist item"} after ${reason}.`
+                );
+                const loaded = await loadNextPlayablePlaylistItem(startIndex, {
+                    autoplay: true,
+                    reason: `Smart car resume after ${reason}`,
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    fromMediaSession: Boolean(options.fromMediaSession || options.fromOutputElement),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                });
+                if (loaded) {
+                    clearSmartCarResumeIntent("smart car resume loaded playlist item");
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            smartCarResumeInFlightRef.current = false;
+        }
     }
 
     function clearCarPlayRecoveryTimer() {
@@ -5493,37 +5917,99 @@ export default function Audio() {
         }
     }
 
+    function getSyncedBaseVolumeTarget(nodes = liveNodesRef.current, rawSettings = latestSettingsRef.current) {
+        const safeSettings = nodes?.carPlaySafeMode
+            ? getCarPlaySafeSettings(rawSettings)
+            : normalizeSettings(rawSettings);
+        const target = nodes?.carPlaySafeMode
+            ? Math.min(safeSettings.baseVolume, 1)
+            : safeSettings.baseVolume;
+
+        return clamp(
+            numberOrDefault(target, DEFAULT_SETTINGS.baseVolume),
+            HUMAN_SAFE_LIMITS.baseVolume.min,
+            HUMAN_SAFE_LIMITS.baseVolume.max
+        );
+    }
+
+
+    function syncUnifiedControlOutputState(reason = "control/output sync", options = {}) {
+        const context = options.context || audioContextRef.current;
+        const nodes = options.nodes || liveNodesRef.current;
+
+        if (!context || context.state === "closed" || !nodes) {
+            return 0;
+        }
+
+        const nowMs = Date.now();
+        lastUnifiedControlVolumeSyncReasonRef.current = String(reason || "control/output sync");
+        const shouldThrottle =
+            !options.force &&
+            nowMs - (lastUnifiedControlVolumeSyncAtRef.current || 0) < CONTROL_VOLUME_SYNC_THROTTLE_MS;
+
+        if (shouldThrottle) {
+            return getSyncedBaseVolumeTarget(nodes);
+        }
+
+        lastUnifiedControlVolumeSyncAtRef.current = nowMs;
+
+        const now = context.currentTime || 0;
+        const rampSeconds = Math.max(0, Number(options.rampSeconds) || 0.025);
+        const baseVolumeTarget = options.forceSilent
+            ? 0
+            : getSyncedBaseVolumeTarget(nodes, latestSettingsRef.current);
+        const monitorTarget =
+            options.forceSilent || isIPhonePauseSquelched()
+                ? 0
+                : mutedRef.current
+                    ? 0
+                    : 1;
+
+        try {
+            if (nodes.baseVolumeGain?.gain) {
+                setAudioParam(nodes.baseVolumeGain.gain, baseVolumeTarget, now, rampSeconds);
+            }
+        } catch {
+            // Best-effort only; the next watchdog tick will retry.
+        }
+
+        try {
+            if (monitorMuteGainRef.current?.gain) {
+                setAudioParam(monitorMuteGainRef.current.gain, monitorTarget, now, rampSeconds);
+            }
+        } catch {
+            // Best-effort only; the next watchdog tick will retry.
+        }
+
+        if (options.syncMutedState) {
+            setIsMuted(Boolean(mutedRef.current));
+        }
+
+        return baseVolumeTarget;
+    }
+
     function forceRestoreAudibleWebAudioOutput(context = audioContextRef.current, nodes = liveNodesRef.current, options = {}) {
         if (!options.allowDuringPause && isIPhonePauseSquelched()) {
             holdIPhonePauseSilence("Blocked output-volume restore during Pause");
             return 0;
         }
 
-        const safeSettings = normalizeSettings(latestSettingsRef.current);
-        const safeBaseVolume = Math.max(
-            0.01,
-            nodes?.carPlaySafeMode ? Math.min(safeSettings.baseVolume, 1) : safeSettings.baseVolume
-        );
+        const safeSettings = nodes?.carPlaySafeMode
+            ? getCarPlaySafeSettings(latestSettingsRef.current)
+            : normalizeSettings(latestSettingsRef.current);
         const now = context?.currentTime || 0;
 
-        mutedRef.current = false;
-        setIsMuted(false);
-
-        try {
-            if (monitorMuteGainRef.current?.gain) {
-                setAudioParam(monitorMuteGainRef.current.gain, 1, now, 0.015);
-            }
-        } catch {
-            // Best-effort lock-screen output recovery.
-        }
-
-        try {
-            if (nodes?.baseVolumeGain?.gain) {
-                setAudioParam(nodes.baseVolumeGain.gain, safeBaseVolume, now, 0.015);
-            }
-        } catch {
-            // Best-effort lock-screen output recovery.
-        }
+        // Route recovery must never override the user's real controls. If the
+        // base-volume slider is 0.00 or the mute button is active, keep WebAudio
+        // silent even while re-arming iOS/CarPlay/Media Session output.
+        applySettingsToNodes(nodes, safeSettings, now);
+        const safeBaseVolume = syncUnifiedControlOutputState("restore output without overriding volume/mute", {
+            context,
+            nodes,
+            force: true,
+            rampSeconds: options.rampSeconds ?? 0.015,
+            syncMutedState: true,
+        });
 
         const element = outputAudioRef.current;
 
@@ -5532,6 +6018,8 @@ export default function Audio() {
                 restoreKeepAliveCarrierAfterPlay();
                 element.muted = false;
                 element.defaultMuted = false;
+                // Keep the hidden MediaStream route alive, but let WebAudio's
+                // baseVolumeGain/mute state decide whether anything is audible.
                 element.volume = 1;
                 element.playsInline = true;
                 element.autoplay = true;
@@ -5544,21 +6032,11 @@ export default function Audio() {
             }
         }
 
-        applySettingsToNodes(nodes, safeSettings, now);
-        applyMonitorMute(false);
-
         return safeBaseVolume;
     }
 
     function getSafeAudibleBaseVolume(nodes = liveNodesRef.current) {
-        const safeSettings = normalizeSettings(latestSettingsRef.current);
-
-        return Math.max(
-            0.01,
-            nodes?.carPlaySafeMode
-                ? Math.min(safeSettings.baseVolume, 1)
-                : safeSettings.baseVolume
-        );
+        return getSyncedBaseVolumeTarget(nodes);
     }
 
     function prepareOutputForGlitchlessSourceStart(context = audioContextRef.current, nodes = liveNodesRef.current) {
@@ -6010,6 +6488,7 @@ export default function Audio() {
     }
 
     async function runMediaSessionAction(actionLabel, action) {
+        markControlInteraction(actionLabel || "media session action");
         const serial = mediaSessionActionSerialRef.current + 1;
         mediaSessionActionSerialRef.current = serial;
         lastMediaSessionActionRef.current = actionLabel || "lock-screen control";
@@ -6058,6 +6537,8 @@ export default function Audio() {
             iPhoneOutputHeldForLockScreenRestartRef.current
         );
         let outputAlreadyRestarted = false;
+
+        scheduleSmartCarResume("Media Session Play", { immediate: true, fromMediaSession: true });
 
         if (isIPhoneLockScreenPlay) {
             const resumedHeldSource = await resumeLiveWebAudioFromLockScreen(
@@ -6498,6 +6979,29 @@ export default function Audio() {
                 });
             }
 
+            return nextValue;
+        });
+    }
+
+    function toggleSmartCarResume() {
+        setSmartCarResumeEnabled((current) => {
+            const nextValue = !current;
+
+            smartCarResumeEnabledRef.current = nextValue;
+
+            if (!nextValue) {
+                clearSmartCarResumeTimers();
+                clearSmartCarResumeIntent("smart car resume manually disabled");
+                setInfo("Smart car resume is off. The player will stay paused after car/Bluetooth route changes until you press Play.");
+                return nextValue;
+            }
+
+            rememberSmartCarResumeIntent("smart car resume manually enabled", {
+                force: Boolean(playingRef.current || isPlayingStateRef.current),
+                playing: Boolean(playingRef.current || isPlayingStateRef.current),
+            });
+            setInfo("Smart car resume is on. If audio was playing when your car route disconnects, AudioMaster Lab will try to reconnect it when CarPlay/Bluetooth wakes again.");
+            scheduleSmartCarResume("smart car resume manually enabled", { immediate: true });
             return nextValue;
         });
     }
@@ -7323,7 +7827,7 @@ export default function Audio() {
     }
 
     function applyMonitorMute(nextMuted) {
-        mutedRef.current = nextMuted;
+        mutedRef.current = Boolean(nextMuted);
 
         const context = audioContextRef.current;
         const monitorGain = monitorMuteGainRef.current;
@@ -7335,7 +7839,13 @@ export default function Audio() {
             return;
         }
 
-        setAudioParam(monitorGain.gain, nextMuted ? 0 : 1, context.currentTime);
+        syncUnifiedControlOutputState("mute/control state changed", {
+            context,
+            nodes: liveNodesRef.current,
+            force: true,
+            rampSeconds: 0.02,
+            syncMutedState: true,
+        });
     }
 
     function toggleMute() {
@@ -7358,6 +7868,163 @@ export default function Audio() {
         }
     }
 
+    function clearBackgroundControlCheckpointTimer() {
+        if (backgroundControlCheckpointTimerRef.current) {
+            window.clearInterval(backgroundControlCheckpointTimerRef.current);
+            backgroundControlCheckpointTimerRef.current = null;
+        }
+    }
+
+    function clearForegroundRepairTimers() {
+        foregroundRepairTimersRef.current.forEach((timerId) => {
+            try {
+                window.clearTimeout(timerId);
+            } catch {
+                // Safe to ignore timer cleanup failures.
+            }
+        });
+        foregroundRepairTimersRef.current = [];
+    }
+
+    function startBackgroundControlCheckpointTimer(reason = "background checkpoint") {
+        if (backgroundControlCheckpointTimerRef.current || typeof window === "undefined") {
+            return;
+        }
+
+        backgroundControlCheckpointTimerRef.current = window.setInterval(() => {
+            const positionValue = getCurrentScrubTarget();
+            const shouldBePlaying = Boolean(
+                playingRef.current || isPlayingStateRef.current || getScrubResumeIntent()
+            );
+
+            persistPlaybackSessionSnapshot(`${reason}: hidden durable checkpoint`, {
+                force: true,
+                position: positionValue,
+                playing: shouldBePlaying,
+            });
+
+            updateMediaSessionState(shouldBePlaying ? "playing" : "paused", {
+                forcePosition: true,
+                reason,
+            });
+        }, BACKGROUND_CONTROL_CHECKPOINT_MS);
+    }
+
+    function enterBackgroundControlMode(reason = "background") {
+        const now = Date.now();
+
+        pageBackgroundedAtRef.current = now;
+        lastControlVisibilityStateRef.current = "hidden";
+        lastControlInteractionAtRef.current = now;
+
+        const shouldBePlaying = Boolean(
+            playingRef.current || isPlayingStateRef.current || getScrubResumeIntent()
+        );
+
+        persistPlaybackSessionSnapshot(`background/unfocused: ${reason}`, {
+            force: true,
+            position: getCurrentScrubTarget(),
+            playing: shouldBePlaying,
+        });
+
+        updateMediaSessionState(shouldBePlaying ? "playing" : "paused", {
+            forcePosition: true,
+            reason,
+        });
+
+        // Keep the self-heal loop armed. Background browsers may throttle it, but
+        // the next permitted tick still refreshes refs, Media Session, and UI state.
+        if (audioBufferRef.current) {
+            startPlaybackWatchdog();
+            startControlSelfHealWatchdog();
+            startBackgroundControlCheckpointTimer(reason);
+        }
+    }
+
+    function exitBackgroundControlMode(reason = "foreground") {
+        const wasHidden = lastControlVisibilityStateRef.current !== "visible";
+        const hiddenMs = pageBackgroundedAtRef.current
+            ? Date.now() - pageBackgroundedAtRef.current
+            : 0;
+
+        lastControlVisibilityStateRef.current = "visible";
+        pageBackgroundedAtRef.current = 0;
+        clearBackgroundControlCheckpointTimer();
+
+        if (!audioBufferRef.current) {
+            return;
+        }
+
+        startPlaybackWatchdog();
+        startControlSelfHealWatchdog();
+        scheduleProgressiveForegroundRepair(
+            `${reason}${wasHidden || hiddenMs ? ` after ${Math.round(hiddenMs / 1000)}s unfocused` : ""}`
+        );
+    }
+
+    function scheduleProgressiveForegroundRepair(reason = "foreground repair") {
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        clearForegroundRepairTimers();
+
+        foregroundRepairTimersRef.current = FOREGROUND_REPAIR_STEPS_MS.map((delayMs) => {
+            const timerId = window.setTimeout(() => {
+                foregroundRepairTimersRef.current = foregroundRepairTimersRef.current.filter(
+                    (activeTimerId) => activeTimerId !== timerId
+                );
+
+                if (audioContextRef.current?.state === "suspended" && playingRef.current) {
+                    audioContextRef.current.resume().catch(() => {});
+                }
+
+                recoverPendingScrubAfterPageResume(reason);
+                syncVisiblePlaybackUiWithAudioRoute(reason);
+                repairControlSurface(reason);
+            }, delayMs);
+
+            return timerId;
+        });
+    }
+
+    function clearControlWakeRepairTimer() {
+        if (controlWakeRepairTimerRef.current) {
+            window.clearTimeout(controlWakeRepairTimerRef.current);
+            controlWakeRepairTimerRef.current = null;
+        }
+    }
+
+    function clearControlSelfHealTimer() {
+        if (controlSelfHealTimerRef.current) {
+            window.clearInterval(controlSelfHealTimerRef.current);
+            controlSelfHealTimerRef.current = null;
+        }
+    }
+
+    function markControlInteraction(reason = "control interaction") {
+        lastControlInteractionAtRef.current = Date.now();
+
+        if (audioBufferRef.current) {
+            startControlSelfHealWatchdog();
+        }
+
+        return reason;
+    }
+
+    function scheduleControlWakeRepair(reason = "control wake") {
+        if (typeof window === "undefined") {
+            return;
+        }
+
+        clearControlWakeRepairTimer();
+
+        controlWakeRepairTimerRef.current = window.setTimeout(() => {
+            controlWakeRepairTimerRef.current = null;
+            repairControlSurface(`page/control wake: ${reason}`);
+        }, CONTROL_WAKE_REPAIR_DELAY_MS);
+    }
+
     function clearPlaybackWatchdogTimer() {
         if (playbackWatchdogTimerRef.current) {
             window.clearInterval(playbackWatchdogTimerRef.current);
@@ -7375,12 +8042,107 @@ export default function Audio() {
         }, LONG_RUNNING_PLAYBACK_WATCHDOG_MS);
     }
 
+    function startControlSelfHealWatchdog() {
+        if (controlSelfHealTimerRef.current || typeof window === "undefined") {
+            return;
+        }
+
+        controlSelfHealTimerRef.current = window.setInterval(() => {
+            repairControlSurface("long-session control self-heal");
+        }, CONTROL_SELF_HEAL_INTERVAL_MS);
+    }
+
+    function repairControlSurface(reason = "control repair") {
+        const buffer = audioBufferRef.current;
+
+        if (!buffer) {
+            clearControlSelfHealTimer();
+            clearControlWakeRepairTimer();
+            return false;
+        }
+
+        const now = Date.now();
+        lastControlSelfHealAtRef.current = now;
+        hasMediaRef.current = true;
+        syncUnifiedControlOutputState(`${reason}: volume/mute controls verified`, {
+            force: true,
+            rampSeconds: 0.02,
+            syncMutedState: true,
+        });
+
+        try {
+            installMediaSessionHandlers();
+            updateMediaSessionMetadata();
+        } catch {
+            // Media Session may be temporarily unavailable while a mobile browser wakes.
+        }
+
+        if (scrubbingRef.current) {
+            const msSinceLastScrubMove = now - (lastBrowserScrubChangeAtRef.current || 0);
+
+            if (msSinceLastScrubMove > STUCK_SCRUB_RECOVERY_MS) {
+                commitCurrentScrubTarget(`${reason}: committed stale scrub`, {
+                    quietStatus: true,
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
+                    keepPlayingUiDuringSeek: getScrubResumeIntent(),
+                }).catch(() => {
+                    scrubbingRef.current = false;
+                    wasPlayingBeforeScrubRef.current = false;
+                    browserScrubResumeIntentRef.current = false;
+                    setIsScrubbing(false);
+                    syncVisiblePlaybackUiWithAudioRoute(`${reason}: stale scrub fallback`);
+                });
+            }
+
+            updateMediaSessionState(getScrubResumeIntent() ? "playing" : "paused", {
+                forcePosition: true,
+                reason,
+            });
+            return true;
+        }
+
+        repairLongRunningPlaybackState(reason);
+
+        const shouldBePlaying = Boolean(playingRef.current || isPlayingStateRef.current);
+
+        if (shouldBePlaying && !timerRef.current && activeSourceRef.current) {
+            startPositionTimer();
+        }
+
+        if (!shouldBePlaying && scrubbingRef.current) {
+            setIsScrubbing(false);
+        }
+
+        if (!playingRef.current && !isPlayingStateRef.current && !activeSourceRef.current) {
+            updateMediaSessionState("paused", {
+                forcePosition: true,
+                reason,
+            });
+        }
+
+        if (now - (lastControlRecoveryStatusAtRef.current || 0) > CONTROL_REPAIR_STATUS_THROTTLE_MS) {
+            lastControlRecoveryStatusAtRef.current = now;
+            persistPlaybackSessionSnapshot(`${reason}: controls verified`, {
+                force: true,
+                position: getCurrentScrubTarget(),
+                playing: shouldBePlaying,
+            });
+        }
+
+        return true;
+    }
+
     function repairLongRunningPlaybackState(reason = "long-running playback repair") {
         const buffer = audioBufferRef.current;
 
         if (!buffer) {
             hasMediaRef.current = false;
             clearPlaybackWatchdogTimer();
+            clearControlSelfHealTimer();
+            clearControlWakeRepairTimer();
+            clearBackgroundControlCheckpointTimer();
+            clearForegroundRepairTimers();
             return false;
         }
 
@@ -7390,6 +8152,10 @@ export default function Audio() {
         }
 
         const now = Date.now();
+        syncUnifiedControlOutputState(`${reason}: long-session volume/mute resync`, {
+            rampSeconds: 0.02,
+            syncMutedState: true,
+        });
 
         if (scrubbingRef.current) {
             const msSinceLastScrubMove = now - (lastBrowserScrubChangeAtRef.current || 0);
@@ -7787,7 +8553,19 @@ export default function Audio() {
         const playbackSeconds = elapsedContextSeconds * currentEffectiveRateRef.current;
         const nextOffset = startedOffsetRef.current + playbackSeconds;
 
-        return clamp(nextOffset, 0, buffer.duration);
+        if (!Number.isFinite(nextOffset)) {
+            return clamp(
+                Number.isFinite(lastKnownGoodOffsetRef.current)
+                    ? lastKnownGoodOffsetRef.current
+                    : startedOffsetRef.current,
+                0,
+                buffer.duration
+            );
+        }
+
+        const safeOffset = clamp(nextOffset, 0, buffer.duration);
+        lastKnownGoodOffsetRef.current = safeOffset;
+        return safeOffset;
     }
 
     function startPositionTimer() {
@@ -7799,6 +8577,31 @@ export default function Audio() {
 
             if (!buffer || scrubbingRef.current) {
                 return;
+            }
+
+            const now = Date.now();
+            const driftMs = lastPositionTimerTickAtRef.current
+                ? now - lastPositionTimerTickAtRef.current
+                : 0;
+
+            lastPositionTimerTickAtRef.current = now;
+
+            if (driftMs > BACKGROUND_TIMER_DRIFT_REPAIR_MS) {
+                // When a tab is unfocused, browsers can delay this timer. The audio
+                // clock is still authoritative, so immediately realign the UI and
+                // lock-screen state when the delayed tick finally runs.
+                syncVisiblePlaybackUiWithAudioRoute(
+                    `position timer recovered after ${Math.round(driftMs)}ms drift`
+                );
+                syncUnifiedControlOutputState("position timer drift volume/mute repair", {
+                    force: true,
+                    rampSeconds: 0.02,
+                    syncMutedState: true,
+                });
+                updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                    forcePosition: true,
+                    reason: "position timer drift repair",
+                });
             }
 
             const nextOffset = getCurrentOffset();
@@ -7854,6 +8657,10 @@ export default function Audio() {
     }
 
     function stopPlayback(resetToBeginning = true, options = {}) {
+        if (!options.preserveSmartCarResumeIntent && !options.keepIPhoneLockScreenRestart) {
+            clearSmartCarResumeIntent(options.reason || "playback stopped");
+        }
+
         manualStopRef.current = true;
         clearBrowserScrubAutoCommitTimer();
         clearPageResumeScrubRecoveryTimer();
@@ -7963,12 +8770,15 @@ export default function Audio() {
         setIsScrubbing(false);
         mediaDurationRef.current = 0;
         mediaPositionRef.current = 0;
+        lastKnownGoodOffsetRef.current = 0;
         lastMediaSessionPositionSnapshotRef.current = {
             duration: 0,
             position: 0,
             playbackRate: 1,
         };
         setBufferReady(false);
+        clearControlSelfHealTimer();
+        clearControlWakeRepairTimer();
         setPosition(0);
         setDuration(0);
         setMixerEnabled(false);
@@ -8047,6 +8857,8 @@ export default function Audio() {
 
         setIsScrubbing(false);
         setBufferReady(false);
+        clearControlSelfHealTimer();
+        clearControlWakeRepairTimer();
         setPosition(0);
         setDuration(0);
         setMixerEnabled(false);
@@ -8102,6 +8914,7 @@ export default function Audio() {
         };
 
         setBufferReady(true);
+        startControlSelfHealWatchdog();
         setPosition(0);
         setDuration(decodedBuffer.duration);
         setMixerEnabled(false);
@@ -8808,6 +9621,7 @@ export default function Audio() {
         );
 
         setBufferReady(true);
+        startControlSelfHealWatchdog();
         setPosition(0);
         setDuration(decodedBuffer.duration);
         setMixerEnabled(false);
@@ -9585,7 +10399,7 @@ export default function Audio() {
             setInfo(
                 nextValue
                     ? "Repeat turned on. The current song will restart automatically when it ends."
-                    : "Repeat turned off. The player will advance to the next playlist item and skip broken tracks."
+                    : "Repeat turned off. The playlist will advance, skip broken tracks, and restart from track 1 when it reaches the end."
             );
 
             return nextValue;
@@ -9722,11 +10536,15 @@ export default function Audio() {
         startedAtContextTimeRef.current = 0;
 
         const list = playlistRef.current;
+        const currentIndex = activePlaylistIndexRef.current;
+        const hasActivePlaylist = Boolean(
+            Array.isArray(list) &&
+            list.length > 0 &&
+            currentIndex >= 0 &&
+            currentIndex < list.length
+        );
         const canContinueAfterEnded = Boolean(
-            repeatEnabledRef.current ||
-            (Array.isArray(list) &&
-                activePlaylistIndexRef.current >= 0 &&
-                activePlaylistIndexRef.current < list.length - 1)
+            repeatEnabledRef.current || hasActivePlaylist
         );
 
         setPosition(0);
@@ -9768,33 +10586,57 @@ export default function Audio() {
             return;
         }
 
-        const currentIndex = activePlaylistIndexRef.current;
+        if (hasActivePlaylist) {
+            const nextIndex = normalizePlaylistIndex(currentIndex + 1, list);
+            const wrappedToStart = nextIndex <= currentIndex || currentIndex >= list.length - 1;
+            const guardKey = `${list.length}:${currentIndex}:${nextIndex}:${mediaTitleRef.current}`;
+            const now = Date.now();
+            const previousGuard = playlistEndRestartGuardRef.current || { key: "", at: 0 };
 
-        if (Array.isArray(list) && list.length > 0) {
-            if (currentIndex >= 0 && currentIndex < list.length - 1) {
-                const nextIndex = currentIndex + 1;
+            if (
+                previousGuard.key === guardKey &&
+                now - Number(previousGuard.at || 0) < PLAYLIST_END_RESTART_GUARD_MS
+            ) {
+                return;
+            }
 
-                await loadNextPlayablePlaylistItem(nextIndex, {
+            playlistEndRestartGuardRef.current = {
+                key: guardKey,
+                at: now,
+            };
+
+            const restartReason = wrappedToStart
+                ? "Playlist reached the end. Restarting from track 1"
+                : "Repeat is off. Moving to the next playlist track in order";
+
+            setInfo(
+                wrappedToStart
+                    ? "Playlist reached the end. Restarting from track 1 and keeping controls, scrubber, lock-screen state, and volume synced."
+                    : "Track finished. Advancing to the next playlist item and keeping controls synced."
+            );
+
+            window.setTimeout(() => {
+                loadNextPlayablePlaylistItem(nextIndex, {
                     autoplay: true,
                     fromPlaybackEnded: true,
                     preserveUnlockedOutput: true,
                     outputAlreadyRestarted: isIOSAudioDevice(),
                     forceIPhoneOutputPostStart: isIOSAudioDevice(),
-                    reason: "Repeat is off. Moving to the next playlist track in order",
+                    reason: restartReason,
+                }).then((started) => {
+                    if (!started) {
+                        persistPlaybackSessionSnapshot("playlist end restart failed", {
+                            force: true,
+                            position: 0,
+                            playing: false,
+                        });
+                    }
                 });
-                return;
-            }
-
-            setInfo("Playlist finished in order. Repeat is off, so playback stopped at the end instead of wrapping to the first track.");
-            persistPlaybackSessionSnapshot("playlist finished", {
-                force: true,
-                position: 0,
-                playing: false,
-            });
+            }, isIOSAudioDevice() ? 0 : PLAYLIST_END_WRAP_DELAY_MS);
             return;
         }
 
-        setInfo("Playback ended. Repeat is off and there are no playlist tracks to continue with.");
+        setInfo("Playback ended. Repeat is off and there are no active playlist tracks to continue with.");
     }
 
 
@@ -10098,6 +10940,10 @@ export default function Audio() {
     async function pausePlayback(options = {}) {
         if (!playingRef.current) return false;
 
+        if (!options.preserveSmartCarResumeIntent) {
+            clearSmartCarResumeIntent(options.reason || "playback paused by user");
+        }
+
         const context = audioContextRef.current;
         const isIPhone = isIOSAudioDevice();
 
@@ -10164,6 +11010,7 @@ export default function Audio() {
     }
 
     async function handlePlayPause() {
+        markControlInteraction("main play/pause button");
         if (isPauseUiSettlingRef.current) {
             return;
         }
@@ -10277,6 +11124,7 @@ export default function Audio() {
     }
 
     function handleScrubRelease(reason = "browser scrub released") {
+        markControlInteraction(reason);
         if (!scrubbingRef.current || !audioBufferRef.current) {
             repairLongRunningPlaybackState(reason);
             return;
@@ -10297,6 +11145,7 @@ export default function Audio() {
     }
 
     function handleScrubStart() {
+        markControlInteraction("browser scrub started");
         if (audioBufferRef.current && !hasMediaRef.current) {
             hasMediaRef.current = true;
             setBufferReady(true);
@@ -10355,6 +11204,7 @@ export default function Audio() {
     }
 
     function handleScrubChange(_, nextValue) {
+        markControlInteraction("browser scrub changed");
         const buffer = audioBufferRef.current;
 
         if (!buffer) return;
@@ -10381,6 +11231,7 @@ export default function Audio() {
     }
 
     async function handleScrubCommit(_, nextValue) {
+        markControlInteraction("browser scrub committed");
         const buffer = audioBufferRef.current;
 
         if (!buffer) return;
@@ -10529,6 +11380,14 @@ export default function Audio() {
                     nextSettings,
                     audioContextRef.current.currentTime
                 );
+
+                if (key === "baseVolume") {
+                    syncUnifiedControlOutputState("base volume slider changed", {
+                        force: true,
+                        rampSeconds: 0.015,
+                        syncMutedState: true,
+                    });
+                }
             }
 
             if (isSourceRateControl) {
@@ -11313,7 +12172,7 @@ export default function Audio() {
                                                         variant="caption"
                                                         sx={{ color: "rgba(255,255,255,0.62)", lineHeight: 1.55 }}
                                                     >
-                                                        Best for wired iPhone CarPlay where effects or route output can jump.
+                                                        Best for wired iPhone CarPlay where effects or route output can jump. Smart resume reconnects only when audio was playing before the car/Bluetooth route changed.
                                                     </Typography>
                                                 </Box>
 
@@ -11333,6 +12192,24 @@ export default function Audio() {
                                                     }}
                                                 >
                                                     {carPlaySafeMode ? "Safe mode ON" : "Safe mode OFF"}
+                                                </Button>
+
+                                                <Button
+                                                    variant={smartCarResumeEnabled ? "contained" : "outlined"}
+                                                    onClick={toggleSmartCarResume}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: smartCarResumeEnabled ? "#06111e" : "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 950,
+                                                        background: smartCarResumeEnabled
+                                                            ? "linear-gradient(135deg, #bbf7d0, #67e8f9)"
+                                                            : "transparent",
+                                                        whiteSpace: "nowrap",
+                                                    }}
+                                                >
+                                                    {smartCarResumeEnabled ? "Smart resume ON" : "Smart resume OFF"}
                                                 </Button>
                                             </Stack>
 
@@ -12102,12 +12979,21 @@ export default function Audio() {
                                                                     alignItems="center"
                                                                     spacing={0.8}
                                                                 >
-                                                                    <VolumeUpRoundedIcon
-                                                                        sx={{
-                                                                            fontSize: 19,
-                                                                            color: "#67e8f9",
-                                                                        }}
-                                                                    />
+                                                                    {settingsView.baseVolume <= ZERO_VOLUME_EPSILON ? (
+                                                                        <VolumeOffRoundedIcon
+                                                                            sx={{
+                                                                                fontSize: 19,
+                                                                                color: "#67e8f9",
+                                                                            }}
+                                                                        />
+                                                                    ) : (
+                                                                        <VolumeUpRoundedIcon
+                                                                            sx={{
+                                                                                fontSize: 19,
+                                                                                color: "#67e8f9",
+                                                                            }}
+                                                                        />
+                                                                    )}
                                                                     <Typography
                                                                         variant="caption"
                                                                         sx={{
@@ -12351,9 +13237,9 @@ export default function Audio() {
                                         <Button
                                             fullWidth
                                             size="large"
-                                            variant={isMuted ? "contained" : "outlined"}
+                                            variant={isOutputSilenced ? "contained" : "outlined"}
                                             startIcon={
-                                                isMuted ? (
+                                                isOutputSilenced ? (
                                                     <VolumeUpRoundedIcon />
                                                 ) : (
                                                     <VolumeOffRoundedIcon />
@@ -12364,7 +13250,7 @@ export default function Audio() {
                                             sx={{
                                                 borderRadius: 4,
                                                 py: 1.25,
-                                                color: isMuted ? "#06111e" : "#fff",
+                                                color: isOutputSilenced ? "#06111e" : "#fff",
                                                 borderColor: "rgba(255,255,255,0.18)",
                                                 fontWeight: 950,
                                                 background: isMuted
