@@ -735,6 +735,86 @@ function getMetadataText(item = {}, metadata = {}) {
         .join(" ");
 }
 
+const MIXTAPE_DJ_TAPE_RULES = [
+    {
+        label: "VA tape prefix",
+        pattern: /(^|[\s/_.-])va\s*[-_]/i,
+    },
+    {
+        label: "Mixtape wording",
+        pattern: /\bmixtapes?\b/i,
+    },
+    {
+        label: "Hosted-by-DJ title",
+        pattern: /\bhosted\s+by\s+dj\b/i,
+    },
+    {
+        label: "Chopped Not Slopped / Chopstars",
+        pattern: /\b(?:chopped\s+not\s+slopped|chopstars?)\b/i,
+    },
+    {
+        label: "Presents DJ tape title",
+        pattern: /\bpresents\s+dj\b/i,
+    },
+    {
+        label: "Known DJ tape names",
+        pattern: /\b(?:superstar\s+jay|dj\s*s\.?\s*r\.?|dj\s+drama|og\s+ron\s+c|dj\s+slim\s+k)\b/i,
+    },
+    {
+        label: "Mixtape series title",
+        pattern: /\b(?:i\s+am\s+mixtapes?|arrogant\s+music|investments)\s*\d+\b/i,
+    },
+    {
+        label: "DJ-prefixed release name",
+        pattern: /(^|[\s(_.-])dj\s+[a-z0-9][a-z0-9.'’&-]*/i,
+    },
+];
+
+function getArchiveMixtapeDetectionText(item = {}) {
+    const files = Array.isArray(item.files) ? item.files : [];
+
+    return [
+        item.identifier,
+        item.title,
+        item.creator,
+        item.date,
+        item.description,
+        item.collection,
+        item.license,
+        ...files.map((file) => file?.name || ""),
+        ...files.map((file) => file?.format || ""),
+        ...files.map((file) => file?.source || ""),
+    ]
+        .flat()
+        .map(String)
+        .join(" ")
+        .replace(/[\u2010-\u2015]/g, "-")
+        .replace(/_/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getMixtapeDjTapeMatch(item = {}) {
+    const haystack = getArchiveMixtapeDetectionText(item);
+
+    if (!haystack) return null;
+
+    return (
+        MIXTAPE_DJ_TAPE_RULES.find((rule) => rule.pattern.test(haystack)) || null
+    );
+}
+
+function isMixtapeDjTapeResult(item = {}) {
+    return Boolean(getMixtapeDjTapeMatch(item));
+}
+
+function countMixtapeDjTapeResultsForSignature(items = [], searchSignature = "") {
+    return (Array.isArray(items) ? items : []).filter((item) => {
+        if (searchSignature && item.searchSignature !== searchSignature) return false;
+        return isMixtapeDjTapeResult(item);
+    }).length;
+}
+
 function looksRightsSafer(item = {}, metadata = {}, selectedCollections = []) {
     const combined = getMetadataText(item, metadata);
     if (hasBlockedTerm(combined)) return false;
@@ -1711,9 +1791,14 @@ function mergeArchiveResults(current = [], incoming = []) {
     return dedupeArchiveResults([...current, ...incoming]);
 }
 
-function countMatchingArchiveResultsForSignature(items = [], searchSignature = "") {
+function countMatchingArchiveResultsForSignature(
+    items = [],
+    searchSignature = "",
+    { includeMixtapeDjTapes = true } = {}
+) {
     return (Array.isArray(items) ? items : []).filter((item) => {
         if (searchSignature && item.searchSignature !== searchSignature) return false;
+        if (!includeMixtapeDjTapes && isMixtapeDjTapeResult(item)) return false;
         return item.queryMatched !== false;
     }).length;
 }
@@ -1846,6 +1931,8 @@ const ArchiveResultCard = React.memo(function ArchiveResultCard({
                                                                     item,
                                                                     visibleFileLimit,
                                                                     offQuery = false,
+                                                                    categoryLabel = "",
+                                                                    categoryReason = "",
                                                                     onShowMoreFiles,
                                                                     onShowAllFiles,
                                                                     onCollapseFiles,
@@ -1902,6 +1989,17 @@ const ArchiveResultCard = React.memo(function ArchiveResultCard({
                                 >
                                     This item did not strongly match the current query in title,
                                     creator, identifier, subject, or file names.
+                                </Typography>
+                            )}
+
+                            {categoryLabel && (
+                                <Typography
+                                    variant="caption"
+                                    color="info.main"
+                                    sx={{ display: "block", mt: 0.5 }}
+                                >
+                                    Grouped as {categoryLabel}
+                                    {categoryReason ? ` - ${categoryReason}` : ""}.
                                 </Typography>
                             )}
                         </Box>
@@ -2108,6 +2206,7 @@ export default function ArchiveAudioBrowser() {
     );
     const [expandedFileLimits, setExpandedFileLimits] = useState({});
     const [showOffQueryResults, setShowOffQueryResults] = useState(false);
+    const [showMixtapeDjTapeResults, setShowMixtapeDjTapeResults] = useState(false);
     const [lastSearchSignature, setLastSearchSignature] = useState(
         restoredSession.lastSearchSignature || ""
     );
@@ -2165,12 +2264,20 @@ export default function ArchiveAudioBrowser() {
         return results.filter((item) => item.searchSignature === lastSearchSignature);
     }, [results, lastSearchSignature]);
 
+    const mixtapeDjTapeResults = useMemo(() => {
+        return activeResults.filter((item) => isMixtapeDjTapeResult(item));
+    }, [activeResults]);
+
     const matchingResults = useMemo(() => {
-        return activeResults.filter((item) => item.queryMatched !== false);
+        return activeResults.filter(
+            (item) => item.queryMatched !== false && !isMixtapeDjTapeResult(item)
+        );
     }, [activeResults]);
 
     const offQueryResults = useMemo(() => {
-        return activeResults.filter((item) => item.queryMatched === false);
+        return activeResults.filter(
+            (item) => item.queryMatched === false && !isMixtapeDjTapeResult(item)
+        );
     }, [activeResults]);
 
     const visibleMatchingResults = useMemo(() => {
@@ -2321,6 +2428,7 @@ export default function ArchiveAudioBrowser() {
         setVisibleResultLimit(ARCHIVE_VISIBLE_RESULT_BATCH_SIZE);
         setExpandedFileLimits({});
         setShowOffQueryResults(false);
+        setShowMixtapeDjTapeResults(false);
     }
 
     function getVisibleFileLimit(item) {
@@ -2566,6 +2674,14 @@ export default function ArchiveAudioBrowser() {
         );
 
         addArchiveFilesToAudioPlaylist(files, "matching Archive file(s)");
+    }
+
+    function addAllMixtapeDjTapeFilesToPlaylist() {
+        const files = mixtapeDjTapeResults.flatMap((item) =>
+            Array.isArray(item.files) ? item.files : []
+        );
+
+        addArchiveFilesToAudioPlaylist(files, "Mixtapes / DJ Tapes file(s)");
     }
 
     async function copyText(value) {
@@ -2838,9 +2954,15 @@ export default function ArchiveAudioBrowser() {
                 if (isLoadMore && incomingResults.length) {
                     const nextMatchingCount = countMatchingArchiveResultsForSignature(
                         nextResults,
-                        requestSignature
+                        requestSignature,
+                        { includeMixtapeDjTapes: false }
                     );
                     const incomingMatchingCount = countMatchingArchiveResultsForSignature(
+                        incomingResults,
+                        requestSignature,
+                        { includeMixtapeDjTapes: false }
+                    );
+                    const incomingMixtapeDjTapeCount = countMixtapeDjTapeResultsForSignature(
                         incomingResults,
                         requestSignature
                     );
@@ -2849,6 +2971,8 @@ export default function ArchiveAudioBrowser() {
                         setVisibleResultLimit((currentLimit) =>
                             Math.max(currentLimit, nextMatchingCount)
                         );
+                    } else if (incomingMixtapeDjTapeCount > 0) {
+                        setShowMixtapeDjTapeResults(true);
                     } else {
                         setShowOffQueryResults(true);
                     }
@@ -3302,6 +3426,10 @@ export default function ArchiveAudioBrowser() {
                     <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
                         <Chip label={`${matchingResults.length} matching item(s)`} color="primary" />
                         <Chip
+                            label={`${mixtapeDjTapeResults.length} Mixtape / DJ Tape item(s)`}
+                            color={mixtapeDjTapeResults.length ? "info" : "default"}
+                        />
+                        <Chip
                             label={`${offQueryResults.length} hidden off-query item(s)`}
                             color={offQueryResults.length ? "warning" : "default"}
                         />
@@ -3359,6 +3487,99 @@ export default function ArchiveAudioBrowser() {
                         )}{" "}
                         more matching results
                     </Button>
+                )}
+
+                {!!mixtapeDjTapeResults.length && (
+                    <Card
+                        variant="outlined"
+                        sx={{ borderRadius: 4, borderColor: "info.main" }}
+                    >
+                        <CardContent>
+                            <Stack spacing={1.5}>
+                                <Stack
+                                    direction={{ xs: "column", sm: "row" }}
+                                    spacing={1}
+                                    justifyContent="space-between"
+                                    alignItems={{ xs: "flex-start", sm: "center" }}
+                                >
+                                    <Box>
+                                        <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                                            Mixtapes / DJ Tapes
+                                        </Typography>
+
+                                        <Typography variant="body2" color="text.secondary">
+                                            Hidden from the main result feed when a result looks like a
+                                            VA tape, DJ-hosted mixtape, chopped-not-slopped release,
+                                            DJ series, or tape-style upload. This catches examples like
+                                            VA-Superstar Jay, DJ S.R., Yung Bleu hosted by DJ Drama,
+                                            OG Ron C, The Chopstars, and DJ Slim K.
+                                        </Typography>
+                                    </Box>
+
+                                    <Stack
+                                        direction={{ xs: "column", sm: "row" }}
+                                        spacing={1}
+                                        alignItems={{ xs: "stretch", sm: "center" }}
+                                    >
+                                        <Button
+                                            type="button"
+                                            size="small"
+                                            variant="outlined"
+                                            startIcon={<PlaylistAddRoundedIcon />}
+                                            disabled={!mixtapeDjTapeResults.length}
+                                            onClick={addAllMixtapeDjTapeFilesToPlaylist}
+                                        >
+                                            Add tape files to playlist
+                                        </Button>
+
+                                        <Button
+                                            type="button"
+                                            variant={
+                                                showMixtapeDjTapeResults ? "contained" : "outlined"
+                                            }
+                                            color="info"
+                                            onClick={() =>
+                                                setShowMixtapeDjTapeResults((value) => !value)
+                                            }
+                                        >
+                                            {showMixtapeDjTapeResults
+                                                ? "Hide Mixtapes / DJ Tapes"
+                                                : `View ${mixtapeDjTapeResults.length} Mixtape / DJ Tape item(s)`}
+                                        </Button>
+                                    </Stack>
+                                </Stack>
+
+                                <Collapse
+                                    in={showMixtapeDjTapeResults}
+                                    timeout="auto"
+                                    unmountOnExit
+                                >
+                                    <Stack spacing={2} sx={{ mt: 1.5 }}>
+                                        {mixtapeDjTapeResults.map((item) => {
+                                            const tapeMatch = getMixtapeDjTapeMatch(item);
+
+                                            return (
+                                                <ArchiveResultCard
+                                                    key={item.identifier}
+                                                    item={item}
+                                                    categoryLabel="Mixtape / DJ Tape"
+                                                    categoryReason={tapeMatch?.label || "Tape-style naming"}
+                                                    visibleFileLimit={getVisibleFileLimit(item)}
+                                                    onShowMoreFiles={showMoreFilesForItem}
+                                                    onShowAllFiles={showAllFilesForItem}
+                                                    onCollapseFiles={collapseFilesForItem}
+                                                    onAddFilesToPlaylist={addArchiveFilesToAudioPlaylist}
+                                                    onCopyText={copyText}
+                                                    onSendToAudioPage={sendArchiveFileToAudioPage}
+                                                    onAddFileToPlaylist={addArchiveFileToAudioPlaylist}
+                                                />
+                                            );
+                                        })}
+                                    </Stack>
+                                </Collapse>
+                            </Stack>
+                        </CardContent>
+                    </Card>
                 )}
 
                 {!!offQueryResults.length && (
