@@ -561,6 +561,12 @@ const SESSION_RESTORE_END_GUARD_SECONDS = 0.75;
 const SMART_CAR_RESUME_INTENT_MAX_AGE_MS = 8 * 60 * 60 * 1000;
 const SMART_CAR_RESUME_RETRY_DELAYS_MS = [0, 280, 950, 2200];
 const SMART_CAR_RESUME_COOLDOWN_MS = 2200;
+const SMART_CAR_RESUME_ROUTE_STABILITY_MS = 650;
+const SMART_CAR_RESUME_MAX_ATTEMPTS_PER_WAKE = 3;
+const SMART_CAR_RESUME_SUPPRESS_AFTER_MANUAL_PAUSE_MS = 9000;
+const SMART_CAR_RESUME_START_GUARD_MS = 4200;
+const SMART_CAR_RESUME_LIFECYCLE_WAKE_WINDOW_MS = 12000;
+const BACKGROUND_DROPPED_SOURCE_RECOVERY_GUARD_SECONDS = 1.2;
 // Keep the old stable behavior: if audio was playing when the scrub started,
 // the final seek resumes automatically even if the browser fires duplicate
 // release/commit events out of order after a long open tab or lock-screen wake.
@@ -3896,6 +3902,20 @@ export default function Audio() {
     const smartCarResumeInFlightRef = useRef(false);
     const lastSmartCarResumeAttemptAtRef = useRef(0);
     const lastSmartCarRouteWakeAtRef = useRef(0);
+    const smartCarResumeWakeIdRef = useRef(0);
+    const smartCarResumeAttemptCountRef = useRef(0);
+    const suppressSmartCarResumeUntilRef = useRef(0);
+    const lastSuccessfulSourceStartAtRef = useRef(0);
+    const backgroundPlaybackStateRef = useRef({
+        wasPlaying: false,
+        position: 0,
+        duration: 0,
+        at: 0,
+        hiddenMs: 0,
+        sourceKind: "",
+        sourceUrl: "",
+        title: "",
+    });
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -4515,7 +4535,9 @@ export default function Audio() {
             scheduleCarPlayOutputRecovery(`iOS page/audio route event: ${eventType}`, {
                 allowAutoResume: false,
             });
-            scheduleSmartCarResume(`iOS page/audio route event: ${eventType}`);
+            scheduleSmartCarResume(`iOS page/audio route event: ${eventType}`, {
+                allowLifecycleResume: eventType === "pageshow" || eventType === "resume",
+            });
         };
 
         window.addEventListener("focus", recoverFromPageEvent);
@@ -4558,12 +4580,14 @@ export default function Audio() {
 
         window.addEventListener("focus", handleControlWakeEvent);
         window.addEventListener("pageshow", handleControlWakeEvent);
+        window.addEventListener("pagehide", handleControlWakeEvent);
         window.addEventListener("online", handleControlWakeEvent);
         document.addEventListener("visibilitychange", handleControlWakeEvent);
 
         return () => {
             window.removeEventListener("focus", handleControlWakeEvent);
             window.removeEventListener("pageshow", handleControlWakeEvent);
+            window.removeEventListener("pagehide", handleControlWakeEvent);
             window.removeEventListener("online", handleControlWakeEvent);
             document.removeEventListener("visibilitychange", handleControlWakeEvent);
         };
@@ -4598,7 +4622,9 @@ export default function Audio() {
             }
 
             exitBackgroundControlMode(eventType);
-            scheduleSmartCarResume(`background lifecycle ${eventType}`);
+            scheduleSmartCarResume(`background lifecycle ${eventType}`, {
+                allowLifecycleResume: eventType === "pageshow" || eventType === "resume",
+            });
         };
 
         window.addEventListener("blur", handleBackgroundLifecycle);
@@ -4636,7 +4662,6 @@ export default function Audio() {
 
         const handleOutputPlay = () => {
             markControlInteraction("hidden output play event");
-            scheduleSmartCarResume("hidden iOS output play event", { immediate: true, fromOutputElement: true });
             const now = Date.now();
 
             if (carPlayRouteDisengagedBySystemRef.current && !playingRef.current) {
@@ -4669,6 +4694,8 @@ export default function Audio() {
             }
 
             lastOutputElementPlayEventAtRef.current = now;
+            clearSmartCarResumeTimers();
+            lastSmartCarRouteWakeAtRef.current = now;
             iPhoneOutputHeldForLockScreenRestartRef.current = false;
             runMediaSessionAction("iOS lock-screen Play", playFromMediaSession);
         };
@@ -4728,7 +4755,9 @@ export default function Audio() {
             scheduleCarPlayOutputRecovery(`hidden iOS output element ${eventType}`, {
                 allowAutoResume: false,
             });
-            scheduleSmartCarResume(`hidden iOS output element ${eventType}`);
+            scheduleSmartCarResume(`hidden iOS output element ${eventType}`, {
+                fromOutputElement: eventType === "error" || eventType === "stalled",
+            });
         };
 
         element.addEventListener("play", handleOutputPlay);
@@ -5217,9 +5246,25 @@ export default function Audio() {
     }
 
     function clearSmartCarResumeIntent(reason = "smart car resume cleared") {
+        const cleanReason = String(reason || "smart car resume cleared").toLowerCase();
+        const shouldSuppressAutoResume = !(
+            cleanReason.includes("started playback") ||
+            cleanReason.includes("loaded playlist item") ||
+            cleanReason.includes("checkpoint")
+        );
+
+        if (shouldSuppressAutoResume) {
+            suppressSmartCarResumeUntilRef.current = Math.max(
+                suppressSmartCarResumeUntilRef.current || 0,
+                Date.now() + SMART_CAR_RESUME_SUPPRESS_AFTER_MANUAL_PAUSE_MS
+            );
+        }
+
         smartCarResumeIntentRef.current = null;
         clearSmartCarResumeIntentFromBrowser();
+        clearSmartCarResumeTimers();
         refreshStorageInfo();
+
         if (reason && smartCarResumeEnabledRef.current && carPlaySafeModeRef.current) {
             setCarPlayOutputStatusIfChanged(`Smart car resume cleared: ${reason}.`);
         }
@@ -5231,74 +5276,150 @@ export default function Audio() {
         return Boolean(freshIntent);
     }
 
-    function shouldAttemptSmartCarResume(reason = "smart car resume") {
+    function shouldAttemptSmartCarResume(reason = "smart car resume", options = {}) {
+        const now = Date.now();
+
         if (!smartCarResumeEnabledRef.current) return false;
+        if (now < (suppressSmartCarResumeUntilRef.current || 0)) return false;
+        if (smartCarResumeInFlightRef.current) return false;
         if (playingRef.current || activeSourceRef.current) return false;
         if (pauseActionInFlightRef.current || isInsideCleanPauseWindow()) return false;
-        if (Date.now() - (lastMediaSessionPauseAtRef.current || 0) < 1800) return false;
+        if (now - (lastMediaSessionPauseAtRef.current || 0) < 1800) return false;
+        if (now - (lastSuccessfulSourceStartAtRef.current || 0) < SMART_CAR_RESUME_START_GUARD_MS) return false;
         if (!hasFreshSmartCarResumeIntent()) return false;
 
         const cleanReason = String(reason || "smart car resume").toLowerCase();
-        const routeLikeWake =
+        const explicitUserOrSystemPlay = Boolean(
+            options.fromMediaSession ||
+            options.fromOutputElement ||
+            cleanReason.includes("media session play") ||
+            cleanReason.includes("output play") ||
+            cleanReason.includes("lock-screen play")
+        );
+        const routeLikeWake = Boolean(
             cleanReason.includes("devicechange") ||
             cleanReason.includes("carplay") ||
             cleanReason.includes("bluetooth") ||
+            cleanReason.includes("usb") ||
             cleanReason.includes("route") ||
-            cleanReason.includes("media session play") ||
-            cleanReason.includes("output play") ||
+            cleanReason.includes("hidden ios output element error") ||
+            cleanReason.includes("hidden ios output element stalled")
+        );
+        const lifecycleWake = Boolean(
             cleanReason.includes("pageshow") ||
+            cleanReason.includes("resume") ||
             cleanReason.includes("focus") ||
             cleanReason.includes("visibilitychange") ||
-            cleanReason.includes("resume");
+            cleanReason.includes("background lifecycle")
+        );
 
-        return routeLikeWake || !isIOSAudioDevice();
+        if (explicitUserOrSystemPlay || routeLikeWake) {
+            return true;
+        }
+
+        // Do not treat an ordinary browser focus/visibility wake as a car resume.
+        // It may only recover if the page had just been hidden while audio was
+        // playing and the caller explicitly permits a lifecycle resume.
+        if (options.allowLifecycleResume && lifecycleWake && isIOSAudioDevice()) {
+            const backgroundSnapshot = backgroundPlaybackStateRef.current || {};
+            const wasRecentlyPlayingBeforeHide = Boolean(
+                backgroundSnapshot.wasPlaying &&
+                backgroundSnapshot.at &&
+                now - Number(backgroundSnapshot.at || 0) <= SMART_CAR_RESUME_LIFECYCLE_WAKE_WINDOW_MS
+            );
+            const wasActuallyHidden = Number(backgroundSnapshot.hiddenMs || 0) > 900;
+
+            return wasRecentlyPlayingBeforeHide && wasActuallyHidden;
+        }
+
+        return false;
     }
 
     function scheduleSmartCarResume(reason = "smart car resume", options = {}) {
-        if (!shouldAttemptSmartCarResume(reason)) return;
+        if (!shouldAttemptSmartCarResume(reason, options)) return;
+
         const now = Date.now();
-        if (!options.immediate && now - (lastSmartCarResumeAttemptAtRef.current || 0) < SMART_CAR_RESUME_COOLDOWN_MS) return;
+
+        if (!options.immediate && now - (lastSmartCarResumeAttemptAtRef.current || 0) < SMART_CAR_RESUME_COOLDOWN_MS) {
+            return;
+        }
+
         clearSmartCarResumeTimers();
         lastSmartCarRouteWakeAtRef.current = now;
+        smartCarResumeAttemptCountRef.current = 0;
+        const wakeId = smartCarResumeWakeIdRef.current + 1;
+        smartCarResumeWakeIdRef.current = wakeId;
+        const stabilityDelay = options.immediate ? 0 : SMART_CAR_RESUME_ROUTE_STABILITY_MS;
+
         SMART_CAR_RESUME_RETRY_DELAYS_MS.forEach((delayMs) => {
             const timerId = window.setTimeout(() => {
-                attemptSmartCarResume(reason, options).catch(() => {});
-            }, options.immediate ? Math.min(delayMs, 120) : delayMs);
+                if (wakeId !== smartCarResumeWakeIdRef.current) return;
+                if (smartCarResumeAttemptCountRef.current >= SMART_CAR_RESUME_MAX_ATTEMPTS_PER_WAKE) return;
+                if (!shouldAttemptSmartCarResume(reason, options)) return;
+
+                smartCarResumeAttemptCountRef.current += 1;
+                attemptSmartCarResume(reason, {
+                    ...options,
+                    wakeId,
+                }).catch(() => {});
+            }, stabilityDelay + (options.immediate ? Math.min(delayMs, 120) : delayMs));
+
             smartCarResumeTimersRef.current.push(timerId);
         });
     }
 
     async function attemptSmartCarResume(reason = "smart car resume", options = {}) {
-        if (!shouldAttemptSmartCarResume(reason) || smartCarResumeInFlightRef.current) return false;
+        if (options.wakeId && options.wakeId !== smartCarResumeWakeIdRef.current) return false;
+        if (!shouldAttemptSmartCarResume(reason, options)) return false;
+        if (smartCarResumeInFlightRef.current) return false;
+
         smartCarResumeInFlightRef.current = true;
         lastSmartCarResumeAttemptAtRef.current = Date.now();
 
         try {
-            const intent = sanitizeSmartCarResumeIntent(smartCarResumeIntentRef.current || readPersistedSmartCarResumeIntent());
+            const intent = sanitizeSmartCarResumeIntent(
+                smartCarResumeIntentRef.current || readPersistedSmartCarResumeIntent()
+            );
+
             if (!intent) return false;
+            if (playingRef.current || activeSourceRef.current) return true;
 
             const buffer = audioBufferRef.current;
+
             if (buffer) {
                 const restoredPosition = getRestorableSessionPosition(
-                    { currentPosition: intent.currentPosition, duration: intent.duration || buffer.duration, updatedAt: intent.updatedAt },
+                    {
+                        currentPosition: intent.currentPosition,
+                        duration: intent.duration || buffer.duration,
+                        updatedAt: intent.updatedAt,
+                    },
                     Number(buffer.duration || intent.duration || 0)
                 );
-                startedOffsetRef.current = restoredPosition;
-                mediaPositionRef.current = restoredPosition;
-                browserScrubLastValueRef.current = restoredPosition;
-                syncPlaybackPosition(restoredPosition, {
+                const safeRestoredPosition = clamp(
+                    restoredPosition,
+                    0,
+                    Math.max(0, Number(buffer.duration || 0) - BACKGROUND_DROPPED_SOURCE_RECOVERY_GUARD_SECONDS)
+                );
+
+                manualStopRef.current = false;
+                startedOffsetRef.current = safeRestoredPosition;
+                mediaPositionRef.current = safeRestoredPosition;
+                browserScrubLastValueRef.current = safeRestoredPosition;
+                syncPlaybackPosition(safeRestoredPosition, {
                     commitStartOffset: true,
                     forceMediaSession: true,
                     forceSessionPersist: true,
                 });
 
                 setCarPlayOutputStatusIfChanged(
-                    `Smart car resume is reconnecting ${intent.mediaTitle || "the previous track"} at ${formatTime(restoredPosition)} after ${reason}.`
+                    `Smart car resume is reconnecting ${intent.mediaTitle || "the previous track"} at ${formatTime(safeRestoredPosition)} after ${reason}.`
                 );
 
                 const outputAlreadyRestarted = isIOSAudioDevice()
                     ? await restartIPhoneOutputStreamForLockScreenPlay("Smart car resume")
                     : false;
+
+                if (playingRef.current || activeSourceRef.current) return true;
 
                 const started = await startBufferPlayback(false, {
                     preserveUnlockedOutput: isIOSAudioDevice(),
@@ -5306,13 +5427,15 @@ export default function Audio() {
                     forceIPhoneOutputPostStart: isIOSAudioDevice(),
                     fromMediaSession: Boolean(options.fromMediaSession || options.fromOutputElement),
                     quietStatus: true,
+                    fromSmartCarResume: true,
                 });
 
                 if (started) {
                     clearSmartCarResumeIntent("smart car resume started playback");
-                    setInfo(`Smart car resume reconnected ${intent.mediaTitle || "the previous track"} at ${formatTime(restoredPosition)}.`);
+                    setInfo(`Smart car resume reconnected ${intent.mediaTitle || "the previous track"} at ${formatTime(safeRestoredPosition)}.`);
                     return true;
                 }
+
                 return false;
             }
 
@@ -5327,18 +5450,23 @@ export default function Audio() {
                 setCarPlayOutputStatusIfChanged(
                     `Smart car resume is reloading ${intent.activePlaylistTitle || "the previous playlist item"} after ${reason}.`
                 );
+
                 const loaded = await loadNextPlayablePlaylistItem(startIndex, {
                     autoplay: true,
                     reason: `Smart car resume after ${reason}`,
                     preserveUnlockedOutput: isIOSAudioDevice(),
                     fromMediaSession: Boolean(options.fromMediaSession || options.fromOutputElement),
                     forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                    restorePosition: intent.currentPosition,
+                    fromSmartCarResume: true,
                 });
+
                 if (loaded) {
                     clearSmartCarResumeIntent("smart car resume loaded playlist item");
                     return true;
                 }
             }
+
             return false;
         } finally {
             smartCarResumeInFlightRef.current = false;
@@ -6538,7 +6666,8 @@ export default function Audio() {
         );
         let outputAlreadyRestarted = false;
 
-        scheduleSmartCarResume("Media Session Play", { immediate: true, fromMediaSession: true });
+        clearSmartCarResumeTimers();
+        lastSmartCarRouteWakeAtRef.current = Date.now();
 
         if (isIPhoneLockScreenPlay) {
             const resumedHeldSource = await resumeLiveWebAudioFromLockScreen(
@@ -7001,7 +7130,9 @@ export default function Audio() {
                 playing: Boolean(playingRef.current || isPlayingStateRef.current),
             });
             setInfo("Smart car resume is on. If audio was playing when your car route disconnects, AudioMaster Lab will try to reconnect it when CarPlay/Bluetooth wakes again.");
-            scheduleSmartCarResume("smart car resume manually enabled", { immediate: true });
+            // Do not auto-start merely because the setting was toggled on. The next
+            // real route wake, hidden-output play, or Media Session Play will resume.
+            clearSmartCarResumeTimers();
             return nextValue;
         });
     }
@@ -7896,6 +8027,18 @@ export default function Audio() {
             const shouldBePlaying = Boolean(
                 playingRef.current || isPlayingStateRef.current || getScrubResumeIntent()
             );
+            const durationValue = getMediaSessionDuration();
+
+            backgroundPlaybackStateRef.current = {
+                ...(backgroundPlaybackStateRef.current || {}),
+                wasPlaying: shouldBePlaying,
+                position: positionValue,
+                duration: durationValue,
+                at: Date.now(),
+                sourceKind: sourceKind || "",
+                sourceUrl: sourceUrl || "",
+                title: mediaTitleRef.current || "",
+            };
 
             persistPlaybackSessionSnapshot(`${reason}: hidden durable checkpoint`, {
                 force: true,
@@ -7912,18 +8055,37 @@ export default function Audio() {
 
     function enterBackgroundControlMode(reason = "background") {
         const now = Date.now();
-
-        pageBackgroundedAtRef.current = now;
-        lastControlVisibilityStateRef.current = "hidden";
-        lastControlInteractionAtRef.current = now;
-
+        const positionValue = getCurrentScrubTarget();
+        const durationValue = getMediaSessionDuration();
         const shouldBePlaying = Boolean(
             playingRef.current || isPlayingStateRef.current || getScrubResumeIntent()
         );
 
+        pageBackgroundedAtRef.current = now;
+        lastControlVisibilityStateRef.current = "hidden";
+        lastControlInteractionAtRef.current = now;
+        backgroundPlaybackStateRef.current = {
+            wasPlaying: shouldBePlaying,
+            position: positionValue,
+            duration: durationValue,
+            at: now,
+            hiddenMs: 0,
+            sourceKind: sourceKind || "",
+            sourceUrl: sourceUrl || "",
+            title: mediaTitleRef.current || "",
+        };
+
+        if (shouldBePlaying) {
+            rememberSmartCarResumeIntent(`background/unfocused: ${reason}`, {
+                force: true,
+                playing: true,
+                position: positionValue,
+            });
+        }
+
         persistPlaybackSessionSnapshot(`background/unfocused: ${reason}`, {
             force: true,
-            position: getCurrentScrubTarget(),
+            position: positionValue,
             playing: shouldBePlaying,
         });
 
@@ -7947,6 +8109,10 @@ export default function Audio() {
             ? Date.now() - pageBackgroundedAtRef.current
             : 0;
 
+        backgroundPlaybackStateRef.current = {
+            ...(backgroundPlaybackStateRef.current || {}),
+            hiddenMs,
+        };
         lastControlVisibilityStateRef.current = "visible";
         pageBackgroundedAtRef.current = 0;
         clearBackgroundControlCheckpointTimer();
@@ -7975,13 +8141,17 @@ export default function Audio() {
                     (activeTimerId) => activeTimerId !== timerId
                 );
 
-                if (audioContextRef.current?.state === "suspended" && playingRef.current) {
+                if (audioContextRef.current?.state === "suspended" && playingRef.current && !isInsideCleanPauseWindow()) {
                     audioContextRef.current.resume().catch(() => {});
                 }
 
                 recoverPendingScrubAfterPageResume(reason);
                 syncVisiblePlaybackUiWithAudioRoute(reason);
                 repairControlSurface(reason);
+
+                if (playingRef.current && !activeSourceRef.current && audioBufferRef.current && !pauseActionInFlightRef.current) {
+                    repairLongRunningPlaybackState(`${reason}: foreground source check`);
+                }
             }, delayMs);
 
             return timerId;
@@ -8181,11 +8351,13 @@ export default function Audio() {
         const hasLiveSource = Boolean(activeSourceRef.current);
         const shouldBePlaying = Boolean(playingRef.current || isPlayingStateRef.current);
         const safeOffset = getCurrentOffset();
+        const durationValue = Number(buffer.duration || getMediaSessionDuration() || 0);
         const seekOrControlActionInFlight = Boolean(
             pendingMediaSessionSeekRef.current !== null ||
             mediaSessionFastSeekCommitTimerRef.current ||
             Date.now() - (lastScrubCommitAtRef.current || 0) < 2400 ||
-            pauseActionInFlightRef.current
+            pauseActionInFlightRef.current ||
+            scrubCommitInFlightRef.current
         );
 
         syncPlaybackPosition(safeOffset, {
@@ -8217,6 +8389,52 @@ export default function Audio() {
 
             updateMediaSessionState("playing", { forcePosition: true, reason });
         } else if (shouldBePlaying && !hasLiveSource) {
+            const backgroundSnapshot = backgroundPlaybackStateRef.current || {};
+            const recoveryOffset = clamp(
+                Number.isFinite(Number(safeOffset)) && safeOffset > 0
+                    ? safeOffset
+                    : Number(backgroundSnapshot.position || mediaPositionRef.current || startedOffsetRef.current || 0),
+                0,
+                durationValue > 0
+                    ? Math.max(0, durationValue - BACKGROUND_DROPPED_SOURCE_RECOVERY_GUARD_SECONDS)
+                    : Number.MAX_SAFE_INTEGER
+            );
+            const canRecoverDroppedSource = Boolean(
+                !manualStopRef.current &&
+                !playbackEndedHandledRef.current &&
+                !isInsideCleanPauseWindow() &&
+                durationValue > 0 &&
+                recoveryOffset < Math.max(0, durationValue - BACKGROUND_DROPPED_SOURCE_RECOVERY_GUARD_SECONDS)
+            );
+
+            if (canRecoverDroppedSource) {
+                manualStopRef.current = false;
+                startedOffsetRef.current = recoveryOffset;
+                startedAtContextTimeRef.current = 0;
+                mediaPositionRef.current = recoveryOffset;
+                browserScrubLastValueRef.current = recoveryOffset;
+                syncPlaybackPosition(recoveryOffset, {
+                    forceMediaSession: true,
+                    commitStartOffset: true,
+                    forceSessionPersist: true,
+                });
+                updateMediaSessionState("playing", { forcePosition: true, reason });
+
+                startBufferPlayback(false, {
+                    preserveUnlockedOutput: isIOSAudioDevice(),
+                    forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                    quietStatus: true,
+                    recoveredAfterBackground: true,
+                }).then((started) => {
+                    if (!started) {
+                        setPlayingState(false);
+                        updateMediaSessionState("paused", { forcePosition: true, reason });
+                    }
+                });
+
+                return true;
+            }
+
             setPlayingState(false);
             syncPlaybackPosition(safeOffset, {
                 forceMediaSession: true,
@@ -9816,6 +10034,8 @@ export default function Audio() {
             fromMediaSession = false,
             outputAlreadyRestarted = false,
             forceIPhoneOutputPostStart = false,
+            restorePosition = 0,
+            fromSmartCarResume = false,
         } = {}
     ) {
         const list = playlistRef.current;
@@ -9863,6 +10083,9 @@ export default function Audio() {
                 fromMediaSession,
                 outputAlreadyRestarted,
                 forceIPhoneOutputPostStart,
+                restorePosition: step === 0 ? restorePosition : 0,
+                fromSmartCarResume,
+                quietStatus: Boolean(fromSmartCarResume),
                 attemptNumber: step + 1,
                 maxAttempts: list.length,
             });
@@ -9944,11 +10167,31 @@ export default function Audio() {
             mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
             mediaPositionRef.current = 0;
 
-            const restoredOffset = !autoplay
-                ? applyRestoredPlaybackSessionPosition(decodedBuffer, {
-                    loadedPlaylistIndex: safeIndex,
-                })
-                : 0;
+            const requestedRestorePosition = Number(options.restorePosition);
+            const hasRequestedRestorePosition = Number.isFinite(requestedRestorePosition) && requestedRestorePosition > 0;
+            const restoredOffset = hasRequestedRestorePosition
+                ? clamp(
+                    requestedRestorePosition,
+                    0,
+                    Math.max(0, Number(decodedBuffer.duration || 0) - SESSION_RESTORE_END_GUARD_SECONDS)
+                )
+                : !autoplay
+                    ? applyRestoredPlaybackSessionPosition(decodedBuffer, {
+                        loadedPlaylistIndex: safeIndex,
+                    })
+                    : 0;
+
+            if (hasRequestedRestorePosition && restoredOffset > 0) {
+                startedOffsetRef.current = restoredOffset;
+                startedAtContextTimeRef.current = 0;
+                mediaPositionRef.current = restoredOffset;
+                browserScrubLastValueRef.current = restoredOffset;
+                syncPlaybackPosition(restoredOffset, {
+                    forceMediaSession: true,
+                    commitStartOffset: true,
+                    forceSessionPersist: true,
+                });
+            }
 
             updateMediaSessionMetadata();
             updateMediaSessionState(autoplay ? "playing" : "paused", {
@@ -9985,13 +10228,14 @@ export default function Audio() {
 
                 window.setTimeout(() => {
                     if (playlistLoadTokenRef.current === loadToken) {
-                        startBufferPlayback(true, {
+                        startBufferPlayback(!hasRequestedRestorePosition, {
                             fromAutoAdvance: Boolean(options.fromAutoAdvance),
                             fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
                             fromMediaSession: Boolean(options.fromMediaSession),
                             preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                             outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                             forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
+                            quietStatus: Boolean(options.quietStatus || options.fromSmartCarResume),
                         }).then((started) => {
                             if (!started && playlistLoadTokenRef.current === loadToken) {
                                 markPlaylistItemFailed(
@@ -10902,6 +11146,17 @@ export default function Audio() {
             }
 
             setMixerEnabled(true);
+            lastSuccessfulSourceStartAtRef.current = Date.now();
+            backgroundPlaybackStateRef.current = {
+                ...(backgroundPlaybackStateRef.current || {}),
+                wasPlaying: true,
+                position: safeOffset,
+                duration: Number(buffer.duration || 0),
+                at: Date.now(),
+                sourceKind: sourceKind || "",
+                sourceUrl: sourceUrl || "",
+                title: mediaTitleRef.current || "",
+            };
             setPlayingState(true);
             updateMediaSessionMetadata();
             updateMediaSessionState("playing", { forcePosition: true });
