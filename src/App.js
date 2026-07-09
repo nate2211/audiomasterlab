@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useMemo } from "react";
+import React, { Suspense, lazy, useEffect, useMemo } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -9,6 +9,11 @@ import {
 import { Box, CssBaseline } from "@mui/material";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import { Helmet, HelmetProvider } from "react-helmet-async";
+import { Provider } from "react-redux";
+
+import { audioStore } from "./store/audioStore.js";
+import { audioPlayerActions } from "./store/audioPlayerSlice.js";
+import { registerAudioServiceWorker } from "./pwa/registerAudioServiceWorker.js";
 
 import YoutubePage from "./pages/Youtube.js";
 import { NavBar } from "./components/Components.js";
@@ -358,19 +363,99 @@ const theme = createTheme({
 });
 
 export default function App() {
+  useEffect(() => {
+    const registrationController = registerAudioServiceWorker({
+      onRegistered: () => {
+        audioStore.dispatch(
+            audioPlayerActions.setPwaStatus({
+              serviceWorkerSupported: true,
+              serviceWorkerRegistered: true,
+              serviceWorkerReady: false,
+              offlineReady: false,
+              updateAvailable: false,
+              lastMessage: "AudioMaster Lab service worker registered.",
+            })
+        );
+      },
+      onReady: () => {
+        audioStore.dispatch(
+            audioPlayerActions.setPwaStatus({
+              serviceWorkerSupported: true,
+              serviceWorkerRegistered: true,
+              serviceWorkerReady: true,
+              offlineReady: false,
+              updateAvailable: false,
+              lastMessage: "AudioMaster Lab is ready for app-shell caching.",
+            })
+        );
+      },
+      onOfflineReady: () => {
+        audioStore.dispatch(
+            audioPlayerActions.setPwaStatus({
+              serviceWorkerSupported: true,
+              serviceWorkerRegistered: true,
+              serviceWorkerReady: true,
+              offlineReady: true,
+              updateAvailable: false,
+              lastMessage: "AudioMaster Lab app shell is ready offline.",
+            })
+        );
+      },
+      onNeedRefresh: ({ updateServiceWorker } = {}) => {
+        audioStore.dispatch(
+            audioPlayerActions.markPwaUpdateReady({
+              updateServiceWorkerAvailable: Boolean(updateServiceWorker),
+              lastMessage: "A fresh AudioMaster Lab version is ready.",
+            })
+        );
+      },
+      onControlling: () => {
+        audioStore.dispatch(
+            audioPlayerActions.setPwaStatus({
+              serviceWorkerSupported: true,
+              serviceWorkerRegistered: true,
+              serviceWorkerReady: true,
+              offlineReady: true,
+              updateAvailable: false,
+              lastMessage: "AudioMaster Lab is now controlled by the updated service worker.",
+            })
+        );
+      },
+      onError: (error) => {
+        audioStore.dispatch(
+            audioPlayerActions.setPwaStatus({
+              serviceWorkerSupported: "serviceWorker" in navigator,
+              serviceWorkerRegistered: false,
+              serviceWorkerReady: false,
+              offlineReady: false,
+              updateAvailable: false,
+              lastMessage: error?.message || "Service worker registration failed.",
+            })
+        );
+      },
+    });
+
+    return () => {
+      if (registrationController?.destroy) {
+        registrationController.destroy();
+      }
+    };
+  }, []);
+
   return (
-      <HelmetProvider>
-        <ThemeProvider theme={theme}>
-          <CssBaseline />
+      <Provider store={audioStore}>
+        <HelmetProvider>
+          <ThemeProvider theme={theme}>
+            <CssBaseline />
 
-          <BrowserRouter>
-            <RouteSeo />
+            <BrowserRouter>
+              <RouteSeo />
 
-            <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
-              <NavBar />
+              <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
+                <NavBar />
 
-              <Suspense fallback={<PageLoadingFallback />}>
-                <Routes>
+                <Suspense fallback={<PageLoadingFallback />}>
+                  <Routes>
                   <Route path="/" element={<Home />} />
                   <Route path="/audio" element={<Audio />} />
                   <Route path="/recorder" element={<Recorder />} />
@@ -389,11 +474,12 @@ export default function App() {
                   <Route path="/copyright" element={<Copyright />} />
 
                   <Route path="*" element={<Navigate to="/" replace />} />
-                </Routes>
-              </Suspense>
-            </Box>
-          </BrowserRouter>
-        </ThemeProvider>
-      </HelmetProvider>
+                  </Routes>
+                </Suspense>
+              </Box>
+            </BrowserRouter>
+          </ThemeProvider>
+        </HelmetProvider>
+      </Provider>
   );
 }

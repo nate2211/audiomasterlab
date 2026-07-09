@@ -43,6 +43,14 @@ import {
     ControlSlider,
 } from "../components/Components.js";
 
+import { useDispatch } from "react-redux";
+import { audioPlayerActions } from "../store/audioPlayerSlice.js";
+import { useAudioReduxDexieControls } from "../hooks/useAudioReduxDexieControls.js";
+import {
+    getCachedPlayableUrlForItem,
+    releaseCachedPlayableUrl,
+} from "../storage/AudioDexie.js";
+
 const DEFAULT_SETTINGS = {
     baseVolume: 1,
 
@@ -541,6 +549,13 @@ const PLAYLIST_DRAG_MIME = "application/x-audiomasterlab-playlist-index";
 // from getting stranded when Safari throttles timers while the phone is locked.
 const BROWSER_SCRUB_AUTO_COMMIT_MS = 360;
 const LOCKSCREEN_SCRUB_RECOVERY_COMMIT_MS = 140;
+const BACKGROUND_SCRUB_COMMIT_FALLBACK_MS = 45;
+const FOCUS_RETURN_SCRUB_UNLOCK_MS = 180;
+const FOCUS_RETURN_SCRUB_STALE_COMMIT_MS = 1200;
+const SCRUB_ZERO_RESTART_EPSILON_SECONDS = 0.18;
+const ZERO_SCRUB_RESTART_NO_RELOAD_GUARD_MS = 1600;
+const SCRUB_BACKWARD_FORCE_DELTA_SECONDS = 0.08;
+const FOCUS_RETURN_FORCE_NEW_SCRUB_MS = 900;
 const STUCK_SCRUB_RECOVERY_MS = 1800;
 const LONG_RUNNING_PLAYBACK_WATCHDOG_MS = 1450;
 const LONG_RUNNING_SESSION_FORCE_SAVE_MS = 12000;
@@ -548,6 +563,9 @@ const CONTROL_SELF_HEAL_INTERVAL_MS = 5200;
 const CONTROL_WAKE_REPAIR_DELAY_MS = 90;
 const CONTROL_REPAIR_STATUS_THROTTLE_MS = 15000;
 const CONTROL_VOLUME_SYNC_THROTTLE_MS = 450;
+const CONTROL_ACTION_LIMIT_MS = 260;
+const PLAY_CONTROL_ACTION_LIMIT_MS = 620;
+const MEDIA_SESSION_CONTROL_ACTION_LIMIT_MS = 220;
 const ZERO_VOLUME_EPSILON = 0.0005;
 // Browser backgrounding can throttle timers for seconds at a time. These values
 // let the player checkpoint while hidden and perform multiple small repairs when
@@ -3906,6 +3924,11 @@ export default function Audio() {
     const smartCarResumeAttemptCountRef = useRef(0);
     const suppressSmartCarResumeUntilRef = useRef(0);
     const lastSuccessfulSourceStartAtRef = useRef(0);
+    const playbackStartInFlightRef = useRef(false);
+    const controlActionLimiterRef = useRef(new Map());
+    const backgroundSourceRecoveryInFlightRef = useRef(false);
+    const backgroundSourceRecoverySerialRef = useRef(0);
+    const lastForegroundRepairAtRef = useRef(0);
     const backgroundPlaybackStateRef = useRef({
         wasPlaying: false,
         position: 0,
@@ -3944,6 +3967,7 @@ export default function Audio() {
     const lastPositionTimerTickAtRef = useRef(0);
     const lastKnownGoodOffsetRef = useRef(0);
     const playbackEndedHandledRef = useRef(false);
+    const zeroScrubRestartNoReloadGuardRef = useRef({ at: 0, reason: "" });
 
     const startedAtContextTimeRef = useRef(0);
     const startedOffsetRef = useRef(0);
@@ -3984,6 +4008,9 @@ export default function Audio() {
     const pendingMediaSessionSeekRef = useRef(null);
     const browserScrubResumeIntentRef = useRef(false);
     const scrubCommitInFlightRef = useRef(false);
+    const scrubGestureActiveRef = useRef(false);
+    const focusReturnScrubUnlockTimerRef = useRef(null);
+    const lastFocusReturnScrubResetAtRef = useRef(0);
     const recentScrubResumeIntentRef = useRef({
         at: 0,
         resume: false,
@@ -3996,6 +4023,7 @@ export default function Audio() {
     });
     const lastBrowserScrubChangeAtRef = useRef(0);
     const browserScrubAutoCommitTimerRef = useRef(null);
+    const backgroundScrubCommitTimerRef = useRef(null);
     const browserScrubLastValueRef = useRef(0);
     const browserScrubSerialRef = useRef(0);
     const lastScrubCommitAtRef = useRef(0);
@@ -4092,6 +4120,10 @@ export default function Audio() {
     );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
     const [expandedArtwork, setExpandedArtwork] = useState(null);
+    const [offlinePlaylistNotice, setOfflinePlaylistNotice] = useState("");
+
+    const dispatch = useDispatch();
+    const offlineCacheObjectUrlRef = useRef("");
 
     const isPlayingStateRef = useRef(isPlaying);
     const statusMessageRef = useRef(status);
@@ -4127,6 +4159,72 @@ export default function Audio() {
         () => getPlayerDisplayArtworkSource(mediaTitle, activePlaylistItem),
         [mediaTitle, activePlaylistItem]
     );
+
+    const playlistPrimaryControlLabel =
+        showPauseForPlaylistControls
+            ? "Pause playlist"
+            : activePlaylistIndex >= 0 && activePlaylistItem
+                ? "Resume playlist"
+                : "Start playlist";
+
+    useAudioReduxDexieControls({
+        isPlaying,
+        isLoading,
+        isScrubbing,
+        bufferReady,
+        sourceKind,
+        sourceUrl,
+        mediaTitle,
+        activePlaylistIndex,
+        activePlaylistItem,
+        playlist,
+        position,
+        duration,
+        repeatEnabled,
+        settings: settingsView,
+        activePresetKey,
+        onHydratePlaylist: ({ items, activePlaylistIndex: restoredIndex, repeatEnabled: restoredRepeat } = {}) => {
+            if (Array.isArray(items) && items.length) {
+                setPlaylist(items);
+                playlistRef.current = items;
+            }
+
+            if (Number.isFinite(Number(restoredIndex))) {
+                const cleanIndex = Number(restoredIndex);
+                setActivePlaylistIndex(cleanIndex);
+                activePlaylistIndexRef.current = cleanIndex;
+            }
+
+            if (typeof restoredRepeat === "boolean") {
+                setRepeatEnabled(restoredRepeat);
+                repeatEnabledRef.current = restoredRepeat;
+            }
+        },
+        onHydrateSession: (session) => {
+            if (!session || !isPersistedSessionFresh(session)) {
+                return;
+            }
+
+            const restoredPosition = getRestorableSessionPosition(session, session.duration);
+
+            if (restoredPosition > 0) {
+                mediaPositionRef.current = restoredPosition;
+                lastKnownGoodOffsetRef.current = restoredPosition;
+                browserScrubLastValueRef.current = restoredPosition;
+                setPosition(restoredPosition);
+            }
+
+            if (session.sourceKind === "url" && session.sourceUrl) {
+                setSourceKind("url");
+                setSourceUrl(session.sourceUrl);
+                setDirectLink(session.sourceUrl);
+                setStatus(
+                    `Recovered player UI after refresh at ${formatTime(restoredPosition)}. Press Play to resume when ready.`
+                );
+                setStatusTone("info");
+            }
+        },
+    });
 
     function openArtworkPreview(src, title = "Artwork", subtitle = "") {
         const cleanSrc = String(src || "").trim();
@@ -4178,6 +4276,15 @@ export default function Audio() {
         };
     }, [expandedArtwork]);
 
+    useEffect(() => {
+        return () => {
+            if (offlineCacheObjectUrlRef.current) {
+                releaseCachedPlayableUrl(offlineCacheObjectUrlRef.current);
+                offlineCacheObjectUrlRef.current = "";
+            }
+        };
+    }, []);
+
     // Do not let a stale React render overwrite the newest lock-screen scrub
     // position. Media Session seekto actions can arrive while the page is
     // backgrounded/locked, so the ref is the source of truth until React catches
@@ -4201,10 +4308,11 @@ export default function Audio() {
 
     hasMediaRef.current = Boolean(hasMedia);
 
-    const progressValue =
-        duration > 0 ? clamp((position / duration) * 100, 0, 100) : 0;
-
     const effectiveRate = getEffectivePlaybackRate(settingsView);
+    const visibleDuration = getEffectiveTimelineDuration(settingsView);
+    const visiblePosition = bufferOffsetToTimelineSeconds(position, settingsView);
+    const progressValue =
+        visibleDuration > 0 ? clamp((visiblePosition / visibleDuration) * 100, 0, 100) : 0;
     const pitchCents = semitonesToCents(settingsView.pitchSemitones);
     const playlistStatusLabel = getPlaylistStatusLabel(
         repeatEnabled,
@@ -4395,6 +4503,7 @@ export default function Audio() {
             clearPauseReleaseTimer();
             clearPauseUiQuietTimer();
             clearBrowserScrubAutoCommitTimer();
+            clearBackgroundScrubCommitTimer();
             clearPageResumeScrubRecoveryTimer();
             clearMediaSessionFastSeekCommitTimer();
             clearMediaSession();
@@ -4442,14 +4551,47 @@ export default function Audio() {
     useEffect(() => {
         const finishScrubFromGlobalRelease = (event) => {
             const eventType = event?.type || "global-release";
+            const hiddenNow = Boolean(
+                eventType === "pagehide" ||
+                eventType === "blur" ||
+                (
+                    eventType === "visibilitychange" &&
+                    typeof document !== "undefined" &&
+                    document.visibilityState !== "visible"
+                )
+            );
+            const wakeNow = Boolean(
+                eventType === "focus" ||
+                eventType === "pageshow" ||
+                (
+                    eventType === "visibilitychange" &&
+                    typeof document !== "undefined" &&
+                    document.visibilityState === "visible"
+                )
+            );
 
-            if (eventType === "visibilitychange" && typeof document !== "undefined" && document.visibilityState !== "visible") {
-                persistPlaybackSessionSnapshot("page hidden during playback", {
-                    force: true,
-                    position: getCurrentScrubTarget(),
-                    playing: getScrubResumeIntent(),
+            if (hiddenNow) {
+                const committed = commitPendingScrubForBackgroundControl(
+                    `Background-safe scrub commit: ${eventType}`
+                );
+
+                if (!committed) {
+                    persistPlaybackSessionSnapshot("page hidden during playback", {
+                        force: true,
+                        position: getCurrentScrubTarget(),
+                        playing: getScrubResumeIntent(),
+                    });
+                }
+
+                updateMediaSessionState(getScrubResumeIntent() ? "playing" : "paused", {
+                    forcePosition: true,
                 });
                 return;
+            }
+
+            if (wakeNow) {
+                recoverPendingScrubAfterPageResume(eventType);
+                unlockScrubControlsAfterFocusReturn(eventType);
             }
 
             if (scrubbingRef.current) {
@@ -4459,6 +4601,7 @@ export default function Audio() {
                     forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
                     keepPlayingUiDuringSeek: getScrubResumeIntent(),
                 }).catch(() => {
+                    scrubGestureActiveRef.current = false;
                     scrubbingRef.current = false;
                     wasPlayingBeforeScrubRef.current = false;
                     browserScrubResumeIntentRef.current = false;
@@ -4473,28 +4616,34 @@ export default function Audio() {
 
         window.addEventListener("pointerup", finishScrubFromGlobalRelease, true);
         window.addEventListener("pointercancel", finishScrubFromGlobalRelease, true);
+        window.addEventListener("lostpointercapture", finishScrubFromGlobalRelease, true);
         window.addEventListener("mouseup", finishScrubFromGlobalRelease, true);
         window.addEventListener("touchend", finishScrubFromGlobalRelease, true);
         window.addEventListener("touchcancel", finishScrubFromGlobalRelease, true);
+        window.addEventListener("dragend", finishScrubFromGlobalRelease, true);
         window.addEventListener("keyup", finishScrubFromGlobalRelease, true);
-        window.addEventListener("blur", finishScrubFromGlobalRelease);
-        window.addEventListener("focus", finishScrubFromGlobalRelease);
-        window.addEventListener("pagehide", finishScrubFromGlobalRelease);
-        window.addEventListener("pageshow", finishScrubFromGlobalRelease);
-        document.addEventListener("visibilitychange", finishScrubFromGlobalRelease);
+        window.addEventListener("blur", finishScrubFromGlobalRelease, true);
+        window.addEventListener("focus", finishScrubFromGlobalRelease, true);
+        window.addEventListener("pagehide", finishScrubFromGlobalRelease, true);
+        window.addEventListener("pageshow", finishScrubFromGlobalRelease, true);
+        document.addEventListener("visibilitychange", finishScrubFromGlobalRelease, true);
 
         return () => {
             window.removeEventListener("pointerup", finishScrubFromGlobalRelease, true);
             window.removeEventListener("pointercancel", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("lostpointercapture", finishScrubFromGlobalRelease, true);
             window.removeEventListener("mouseup", finishScrubFromGlobalRelease, true);
             window.removeEventListener("touchend", finishScrubFromGlobalRelease, true);
             window.removeEventListener("touchcancel", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("dragend", finishScrubFromGlobalRelease, true);
             window.removeEventListener("keyup", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("blur", finishScrubFromGlobalRelease);
-            window.removeEventListener("focus", finishScrubFromGlobalRelease);
-            window.removeEventListener("pagehide", finishScrubFromGlobalRelease);
-            window.removeEventListener("pageshow", finishScrubFromGlobalRelease);
-            document.removeEventListener("visibilitychange", finishScrubFromGlobalRelease);
+            window.removeEventListener("blur", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("focus", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("pagehide", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("pageshow", finishScrubFromGlobalRelease, true);
+            document.removeEventListener("visibilitychange", finishScrubFromGlobalRelease, true);
+            clearBackgroundScrubCommitTimer();
+            clearFocusReturnScrubUnlockTimer();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
@@ -4516,6 +4665,7 @@ export default function Audio() {
             ) {
                 syncVisiblePlaybackUiWithAudioRoute(eventType);
                 recoverPendingScrubAfterPageResume(eventType);
+                unlockScrubControlsAfterFocusReturn(eventType);
             }
 
             if (
@@ -4790,6 +4940,7 @@ export default function Audio() {
         playingRef.current = safeValue;
         isPlayingStateRef.current = safeValue;
         setIsPlaying((current) => (current === safeValue ? current : safeValue));
+        dispatch(audioPlayerActions.setPlaying(safeValue));
 
         if (safeValue) {
             markControlInteraction("playback state entered playing");
@@ -4813,9 +4964,12 @@ export default function Audio() {
     function syncPlaybackPosition(nextOffset, options = {}) {
         const durationValue = getMediaSessionDuration();
         const safeNumber = numberOrDefault(nextOffset, 0);
-        const safeOffset = durationValue > 0
-            ? clamp(safeNumber, 0, durationValue)
-            : Math.max(0, safeNumber);
+        const safeOffset = normalizeScrubOffsetForSeek(
+            durationValue > 0
+                ? clamp(safeNumber, 0, durationValue)
+                : Math.max(0, safeNumber),
+            audioBufferRef.current
+        );
 
         mediaPositionRef.current = safeOffset;
         lastKnownGoodOffsetRef.current = safeOffset;
@@ -4824,6 +4978,14 @@ export default function Audio() {
             startedOffsetRef.current = safeOffset;
             startedAtContextTimeRef.current = 0;
         }
+
+        dispatch(
+            audioPlayerActions.setPositionSnapshot({
+                currentTime: safeOffset,
+                duration: durationValue,
+                playbackRate: settingsView.speed,
+            })
+        );
 
         if (options.fromMediaSession) {
             lastMediaSessionSeekAtRef.current = Date.now();
@@ -5153,6 +5315,8 @@ export default function Audio() {
         startedAtContextTimeRef.current = 0;
         syncPlaybackPosition(nextOffset, {
             forceMediaSession: true,
+            clearPendingMediaSessionSeek: true,
+            forceSessionPersist: nextOffset === 0,
         });
         setPlayingState(false);
         updateMediaSessionState("paused", { forcePosition: true });
@@ -5775,6 +5939,134 @@ export default function Audio() {
         }
 
         return clamp(getEffectivePlaybackRate(latestSettingsRef.current), 0.0625, 16);
+    }
+
+    function getTimelineRate(settingsValue = latestSettingsRef.current) {
+        const rate = Number(getEffectivePlaybackRate(settingsValue));
+
+        if (Number.isFinite(rate) && rate > 0) {
+            return clamp(rate, 0.0625, 16);
+        }
+
+        return 1;
+    }
+
+    function getRawBufferDuration() {
+        const bufferDuration = Number(audioBufferRef.current?.duration);
+        const stateDuration = Number(duration);
+        const refDuration = Number(mediaDurationRef.current);
+
+        if (Number.isFinite(bufferDuration) && bufferDuration > 0) return bufferDuration;
+        if (Number.isFinite(stateDuration) && stateDuration > 0) return stateDuration;
+        if (Number.isFinite(refDuration) && refDuration > 0) return refDuration;
+        return 0;
+    }
+
+    function getEffectiveTimelineDuration(settingsValue = latestSettingsRef.current) {
+        const rawDuration = getRawBufferDuration();
+        const rate = getTimelineRate(settingsValue);
+
+        if (!rawDuration || !rate) {
+            return rawDuration || 0;
+        }
+
+        return rawDuration / rate;
+    }
+
+    function bufferOffsetToTimelineSeconds(bufferOffset, settingsValue = latestSettingsRef.current) {
+        const rawDuration = getRawBufferDuration();
+        const rate = getTimelineRate(settingsValue);
+        const safeOffset = rawDuration > 0
+            ? clamp(numberOrDefault(bufferOffset, 0), 0, rawDuration)
+            : Math.max(0, numberOrDefault(bufferOffset, 0));
+
+        return rate > 0 ? safeOffset / rate : safeOffset;
+    }
+
+    function timelineSecondsToBufferOffset(timelineSeconds, settingsValue = latestSettingsRef.current) {
+        const rawDuration = getRawBufferDuration();
+        const rate = getTimelineRate(settingsValue);
+        const safeTimeline = Math.max(0, numberOrDefault(timelineSeconds, 0));
+        const rawOffset = safeTimeline * rate;
+
+        return rawDuration > 0 ? clamp(rawOffset, 0, rawDuration) : rawOffset;
+    }
+
+    function formatTimelineOffset(bufferOffset, settingsValue = latestSettingsRef.current) {
+        return formatTime(bufferOffsetToTimelineSeconds(bufferOffset, settingsValue));
+    }
+
+    function normalizeScrubOffsetForSeek(nextOffset, bufferValue = audioBufferRef.current) {
+        const durationValue = Number(bufferValue?.duration || getRawBufferDuration() || getMediaSessionDuration() || 0);
+        const safeOffset = durationValue > 0
+            ? clamp(numberOrDefault(nextOffset, 0), 0, durationValue)
+            : Math.max(0, numberOrDefault(nextOffset, 0));
+
+        if (safeOffset <= SCRUB_ZERO_RESTART_EPSILON_SECONDS) {
+            return 0;
+        }
+
+        if (durationValue > 0 && durationValue - safeOffset <= 0.015) {
+            return durationValue;
+        }
+
+        return safeOffset;
+    }
+
+    function markZeroScrubRestartWithoutReload(reason = "zero scrub restart") {
+        zeroScrubRestartNoReloadGuardRef.current = {
+            at: Date.now(),
+            reason,
+        };
+        playbackEndedHandledRef.current = false;
+        manualStopRef.current = false;
+        return true;
+    }
+
+    function isZeroScrubRestartNoReloadGuardActive() {
+        const guard = zeroScrubRestartNoReloadGuardRef.current || {};
+        return Boolean(
+            guard.at &&
+            Date.now() - Number(guard.at || 0) < ZERO_SCRUB_RESTART_NO_RELOAD_GUARD_MS
+        );
+    }
+
+    function isStrongBackwardScrubTarget(nextOffset) {
+        const currentLiveOffset = numberOrDefault(mediaPositionRef.current || getCurrentOffset(), 0);
+        return numberOrDefault(nextOffset, 0) + SCRUB_BACKWARD_FORCE_DELTA_SECONDS < currentLiveOffset;
+    }
+
+    function forceScrubTargetIntoPlaybackClock(nextOffset, reason = "scrub target") {
+        const buffer = audioBufferRef.current;
+        const safeOffset = normalizeScrubOffsetForSeek(nextOffset, buffer);
+
+        browserScrubLastValueRef.current = safeOffset;
+        mediaPositionRef.current = safeOffset;
+        lastKnownGoodOffsetRef.current = safeOffset;
+        startedOffsetRef.current = safeOffset;
+        startedAtContextTimeRef.current = 0;
+
+        if (safeOffset === 0) {
+            pendingMediaSessionSeekRef.current = 0;
+            markZeroScrubRestartWithoutReload(`${reason}: decoded buffer zero restart`);
+        }
+
+        syncPlaybackPosition(safeOffset, {
+            forceMediaSession: true,
+            commitStartOffset: true,
+            forceSessionPersist: true,
+        });
+
+        dispatch(
+            audioPlayerActions.setPositionSnapshot({
+                currentTime: safeOffset,
+                duration: Number(buffer?.duration || getMediaSessionDuration() || 0),
+                playbackRate: settingsView.speed,
+                source: reason,
+            })
+        );
+
+        return safeOffset;
     }
 
     function updateMediaSessionPositionState(options = {}) {
@@ -6617,6 +6909,17 @@ export default function Audio() {
 
     async function runMediaSessionAction(actionLabel, action) {
         markControlInteraction(actionLabel || "media session action");
+
+        if (
+            !shouldRunLimitedControlAction(
+                `media-session-${actionLabel || "action"}`,
+                MEDIA_SESSION_CONTROL_ACTION_LIMIT_MS
+            )
+        ) {
+            return false;
+        }
+
+        dispatch(audioPlayerActions.markMediaSessionAction({ action: actionLabel || "media session action" }));
         const serial = mediaSessionActionSerialRef.current + 1;
         mediaSessionActionSerialRef.current = serial;
         lastMediaSessionActionRef.current = actionLabel || "lock-screen control";
@@ -6915,10 +7218,13 @@ export default function Audio() {
 
         const requestedSeekTime = Number(details.seekTime);
         const fallbackSeekTime = Number(mediaPositionRef.current || startedOffsetRef.current || 0);
-        const nextSeekTime = clamp(
-            Number.isFinite(requestedSeekTime) ? requestedSeekTime : fallbackSeekTime,
-            0,
-            durationValue
+        const nextSeekTime = normalizeScrubOffsetForSeek(
+            clamp(
+                Number.isFinite(requestedSeekTime) ? requestedSeekTime : fallbackSeekTime,
+                0,
+                durationValue
+            ),
+            audioBufferRef.current
         );
         const pauseRecentlyRequested = Boolean(
             pauseActionInFlightRef.current ||
@@ -6970,6 +7276,12 @@ export default function Audio() {
             startedOffsetRef.current = nextSeekTime;
             startedAtContextTimeRef.current = 0;
             mediaPositionRef.current = nextSeekTime;
+
+            if (nextSeekTime === 0) {
+                browserScrubLastValueRef.current = 0;
+                pendingMediaSessionSeekRef.current = null;
+                markZeroScrubRestartWithoutReload("media-session decoded buffer restart at 0.0");
+            }
             mediaSessionFastSeekCommitTimerRef.current = window.setTimeout(() => {
                 mediaSessionFastSeekCommitTimerRef.current = null;
                 if (pendingMediaSessionSeekRef.current !== null && scrubbingRef.current) {
@@ -8017,6 +8329,12 @@ export default function Audio() {
         foregroundRepairTimersRef.current = [];
     }
 
+    function clearBackgroundSourceRecovery(reason = "background source recovery cleared") {
+        backgroundSourceRecoverySerialRef.current += 1;
+        backgroundSourceRecoveryInFlightRef.current = false;
+        return reason;
+    }
+
     function startBackgroundControlCheckpointTimer(reason = "background checkpoint") {
         if (backgroundControlCheckpointTimerRef.current || typeof window === "undefined") {
             return;
@@ -8133,6 +8451,12 @@ export default function Audio() {
             return;
         }
 
+        const now = Date.now();
+        if (now - (lastForegroundRepairAtRef.current || 0) < 90) {
+            return;
+        }
+        lastForegroundRepairAtRef.current = now;
+
         clearForegroundRepairTimers();
 
         foregroundRepairTimersRef.current = FOREGROUND_REPAIR_STEPS_MS.map((delayMs) => {
@@ -8180,6 +8504,34 @@ export default function Audio() {
         }
 
         return reason;
+    }
+
+    function shouldRunLimitedControlAction(key, limitMs = CONTROL_ACTION_LIMIT_MS) {
+        const now = Date.now();
+        const safeKey = String(key || "control-action");
+        const previousAt = Number(controlActionLimiterRef.current.get(safeKey) || 0);
+
+        if (now - previousAt < limitMs) {
+            dispatch(
+                audioPlayerActions.markSelfHeal({
+                    reason: `Ignored duplicate ${safeKey} control event inside ${limitMs}ms limit.`,
+                })
+            );
+            return false;
+        }
+
+        controlActionLimiterRef.current.set(safeKey, now);
+
+        if (controlActionLimiterRef.current.size > 64) {
+            const cutoff = now - Math.max(5000, limitMs * 8);
+            for (const [storedKey, storedAt] of controlActionLimiterRef.current.entries()) {
+                if (Number(storedAt || 0) < cutoff) {
+                    controlActionLimiterRef.current.delete(storedKey);
+                }
+            }
+        }
+
+        return true;
     }
 
     function scheduleControlWakeRepair(reason = "control wake") {
@@ -8257,6 +8609,7 @@ export default function Audio() {
                     forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
                     keepPlayingUiDuringSeek: getScrubResumeIntent(),
                 }).catch(() => {
+                    scrubGestureActiveRef.current = false;
                     scrubbingRef.current = false;
                     wasPlayingBeforeScrubRef.current = false;
                     browserScrubResumeIntentRef.current = false;
@@ -8337,6 +8690,7 @@ export default function Audio() {
                     forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
                     keepPlayingUiDuringSeek: getScrubResumeIntent(),
                 }).catch(() => {
+                    scrubGestureActiveRef.current = false;
                     scrubbingRef.current = false;
                     wasPlayingBeforeScrubRef.current = false;
                     browserScrubResumeIntentRef.current = false;
@@ -8408,6 +8762,14 @@ export default function Audio() {
             );
 
             if (canRecoverDroppedSource) {
+                if (backgroundSourceRecoveryInFlightRef.current || playbackStartInFlightRef.current) {
+                    updateMediaSessionState("playing", { forcePosition: true, reason });
+                    return true;
+                }
+
+                const recoverySerial = backgroundSourceRecoverySerialRef.current + 1;
+                backgroundSourceRecoverySerialRef.current = recoverySerial;
+                backgroundSourceRecoveryInFlightRef.current = true;
                 manualStopRef.current = false;
                 startedOffsetRef.current = recoveryOffset;
                 startedAtContextTimeRef.current = 0;
@@ -8426,9 +8788,17 @@ export default function Audio() {
                     quietStatus: true,
                     recoveredAfterBackground: true,
                 }).then((started) => {
+                    if (backgroundSourceRecoverySerialRef.current !== recoverySerial) {
+                        return;
+                    }
+
                     if (!started) {
                         setPlayingState(false);
                         updateMediaSessionState("paused", { forcePosition: true, reason });
+                    }
+                }).finally(() => {
+                    if (backgroundSourceRecoverySerialRef.current === recoverySerial) {
+                        backgroundSourceRecoveryInFlightRef.current = false;
                     }
                 });
 
@@ -8471,6 +8841,20 @@ export default function Audio() {
         }
     }
 
+    function clearBackgroundScrubCommitTimer() {
+        if (backgroundScrubCommitTimerRef.current) {
+            window.clearTimeout(backgroundScrubCommitTimerRef.current);
+            backgroundScrubCommitTimerRef.current = null;
+        }
+    }
+
+    function clearFocusReturnScrubUnlockTimer() {
+        if (focusReturnScrubUnlockTimerRef.current) {
+            window.clearTimeout(focusReturnScrubUnlockTimerRef.current);
+            focusReturnScrubUnlockTimerRef.current = null;
+        }
+    }
+
     function clearPageResumeScrubRecoveryTimer() {
         if (pageResumeScrubRecoveryTimerRef.current) {
             window.clearTimeout(pageResumeScrubRecoveryTimerRef.current);
@@ -8496,10 +8880,10 @@ export default function Audio() {
                         : 0;
 
         if (Number.isFinite(durationValue) && durationValue > 0) {
-            return clamp(chosen, 0, durationValue);
+            return normalizeScrubOffsetForSeek(clamp(chosen, 0, durationValue), buffer);
         }
 
-        return Math.max(0, chosen || 0);
+        return normalizeScrubOffsetForSeek(Math.max(0, chosen || 0), buffer);
     }
 
     function markScrubResumeIntent(shouldResume, positionValue = getCurrentScrubTarget()) {
@@ -8547,7 +8931,7 @@ export default function Audio() {
     }
 
     function rememberScrubTarget(nextOffset, options = {}) {
-        const safeOffset = Math.max(0, numberOrDefault(nextOffset, 0));
+        const safeOffset = normalizeScrubOffsetForSeek(nextOffset, audioBufferRef.current);
 
         browserScrubLastValueRef.current = safeOffset;
         lastBrowserScrubChangeAtRef.current = Date.now();
@@ -8555,6 +8939,10 @@ export default function Audio() {
         if (options.fromMediaSession) {
             pendingMediaSessionSeekRef.current = safeOffset;
             lastMediaSessionSeekAtRef.current = Date.now();
+        } else if (options.clearPendingMediaSessionSeek !== false) {
+            // Browser slider movement must win after tab focus returns. A stale
+            // lock-screen/media-session seek target here prevents backward scrubs.
+            pendingMediaSessionSeekRef.current = null;
         }
 
         return safeOffset;
@@ -8594,6 +8982,192 @@ export default function Audio() {
         }, BROWSER_SCRUB_AUTO_COMMIT_MS);
     }
 
+    function commitPendingScrubForBackgroundControl(reason = "background scrub control") {
+        const buffer = audioBufferRef.current;
+
+        if (!scrubbingRef.current || !buffer) {
+            repairLongRunningPlaybackState(reason);
+            return false;
+        }
+
+        const nextOffset = normalizeScrubOffsetForSeek(
+            clamp(getCurrentScrubTarget(), 0, buffer.duration),
+            buffer
+        );
+        const shouldResume = Boolean(getScrubResumeIntent() && nextOffset < buffer.duration);
+
+        rememberScrubTarget(nextOffset);
+        markScrubResumeIntent(shouldResume, nextOffset);
+        syncPlaybackPosition(nextOffset, {
+            forceMediaSession: true,
+            forceSessionPersist: true,
+            skipSessionPersist: false,
+        });
+        updateMediaSessionState(shouldResume ? "playing" : "paused", {
+            forcePosition: true,
+        });
+        persistPlaybackSessionSnapshot(reason, {
+            force: true,
+            position: nextOffset,
+            playing: shouldResume,
+        });
+        dispatch(
+            audioPlayerActions.commitScrub({
+                currentTime: nextOffset,
+                shouldResumeAfterScrub: shouldResume,
+                source: reason,
+            })
+        );
+
+        clearBackgroundScrubCommitTimer();
+
+        backgroundScrubCommitTimerRef.current = window.setTimeout(() => {
+            backgroundScrubCommitTimerRef.current = null;
+
+            scrubGestureActiveRef.current = false;
+
+            if (!scrubbingRef.current || !audioBufferRef.current) {
+                return;
+            }
+
+            commitCurrentScrubTarget(reason, {
+                quietStatus: true,
+                fromBackgroundControl: true,
+                preserveUnlockedOutput: isIOSAudioDevice(),
+                forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
+                keepPlayingUiDuringSeek: shouldResume,
+            }).catch(() => {
+                scrubGestureActiveRef.current = false;
+                scrubbingRef.current = false;
+                wasPlayingBeforeScrubRef.current = false;
+                browserScrubResumeIntentRef.current = false;
+                setIsScrubbing(false);
+                syncVisiblePlaybackUiWithAudioRoute(`${reason} failed`);
+            });
+        }, BACKGROUND_SCRUB_COMMIT_FALLBACK_MS);
+
+        return true;
+    }
+
+    function resetScrubStateForFreshBrowserGesture(reason = "fresh browser scrub") {
+        const buffer = audioBufferRef.current;
+        const liveOffset = buffer ? normalizeScrubOffsetForSeek(getCurrentOffset(), buffer) : 0;
+        const context = audioContextRef.current;
+
+        clearBrowserScrubAutoCommitTimer();
+        clearBackgroundScrubCommitTimer();
+        clearPageResumeScrubRecoveryTimer();
+        clearMediaSessionFastSeekCommitTimer();
+
+        scrubCommitInFlightRef.current = false;
+        scrubGestureActiveRef.current = false;
+        scrubbingRef.current = false;
+        wasPlayingBeforeScrubRef.current = false;
+        browserScrubResumeIntentRef.current = false;
+        pendingMediaSessionSeekRef.current = null;
+        browserScrubLastValueRef.current = liveOffset;
+        mediaPositionRef.current = liveOffset;
+        lastKnownGoodOffsetRef.current = liveOffset;
+        startedOffsetRef.current = liveOffset;
+        startedAtContextTimeRef.current =
+            context && playingRef.current && activeSourceRef.current
+                ? context.currentTime
+                : 0;
+
+        setIsScrubbing(false);
+        syncPlaybackPosition(liveOffset, {
+            forceMediaSession: true,
+            clearPendingMediaSessionSeek: true,
+            forceSessionPersist: true,
+        });
+        updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+            forcePosition: true,
+        });
+
+        dispatch(
+            audioPlayerActions.markSelfHeal({
+                reason: `Fresh scrub state reset after ${reason}; browser slider can scrub backward now.`,
+            })
+        );
+
+        return liveOffset;
+    }
+
+    function unlockScrubControlsAfterFocusReturn(reason = "focus returned") {
+        clearFocusReturnScrubUnlockTimer();
+
+        focusReturnScrubUnlockTimerRef.current = window.setTimeout(() => {
+            focusReturnScrubUnlockTimerRef.current = null;
+            lastFocusReturnScrubResetAtRef.current = Date.now();
+
+            const resetLiveOffset = resetScrubStateForFreshBrowserGesture(reason);
+            const buffer = audioBufferRef.current;
+
+            if (!buffer) {
+                scrubGestureActiveRef.current = false;
+                scrubCommitInFlightRef.current = false;
+                scrubbingRef.current = false;
+                setIsScrubbing(false);
+                return;
+            }
+
+            const now = Date.now();
+            const msSinceLastMove = now - Number(lastBrowserScrubChangeAtRef.current || 0);
+            const hasStaleScrub = Boolean(
+                scrubbingRef.current &&
+                !scrubGestureActiveRef.current &&
+                msSinceLastMove >= FOCUS_RETURN_SCRUB_STALE_COMMIT_MS
+            );
+
+            if (hasStaleScrub) {
+                const nextOffset = normalizeScrubOffsetForSeek(
+                    clamp(getCurrentScrubTarget(), 0, buffer.duration),
+                    buffer
+                );
+                rememberScrubTarget(nextOffset);
+                syncPlaybackPosition(nextOffset, {
+                    forceMediaSession: true,
+                    commitStartOffset: true,
+                    clearPendingMediaSessionSeek: true,
+                    forceSessionPersist: true,
+                });
+                scrubGestureActiveRef.current = false;
+                scrubbingRef.current = false;
+                wasPlayingBeforeScrubRef.current = false;
+                browserScrubResumeIntentRef.current = false;
+                pendingMediaSessionSeekRef.current = null;
+                setIsScrubbing(false);
+                dispatch(
+                    audioPlayerActions.commitScrub({
+                        currentTime: nextOffset,
+                        shouldResumeAfterScrub: false,
+                        source: `focus-return-unlock:${reason}`,
+                    })
+                );
+            }
+
+            // Never leave the commit guard stuck after the browser paused timers while hidden.
+            scrubCommitInFlightRef.current = false;
+            scrubGestureActiveRef.current = false;
+
+            const liveOffset = normalizeScrubOffsetForSeek(resetLiveOffset, buffer);
+            syncPlaybackPosition(liveOffset, {
+                forceMediaSession: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+                skipSessionPersist: false,
+            });
+            updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            dispatch(
+                audioPlayerActions.markSelfHeal({
+                    reason: `Scrub controls unlocked after ${reason}; slider can scrub backward or forward again.`,
+                })
+            );
+        }, FOCUS_RETURN_SCRUB_UNLOCK_MS);
+    }
+
     function recoverPendingScrubAfterPageResume(reason = "page resumed") {
         if (!scrubbingRef.current || !audioBufferRef.current) {
             return;
@@ -8623,6 +9197,7 @@ export default function Audio() {
         const buffer = audioBufferRef.current;
 
         if (!buffer) {
+            scrubGestureActiveRef.current = false;
             scrubbingRef.current = false;
             wasPlayingBeforeScrubRef.current = false;
             browserScrubResumeIntentRef.current = false;
@@ -8630,7 +9205,10 @@ export default function Audio() {
             return false;
         }
 
-        const nextOffset = clamp(getCurrentScrubTarget(), 0, buffer.duration);
+        const nextOffset = normalizeScrubOffsetForSeek(
+            clamp(getCurrentScrubTarget(), 0, buffer.duration),
+            buffer
+        );
 
         // Browsers can fire both a global pointer/touch release and MUI's
         // onChangeCommitted for the same gesture. After long-running playback or
@@ -8678,6 +9256,14 @@ export default function Audio() {
 
             lastScrubCommitAtRef.current = Date.now();
             markScrubResumeIntent(shouldResume, nextOffset);
+
+            if (nextOffset === 0) {
+                browserScrubLastValueRef.current = 0;
+                pendingMediaSessionSeekRef.current = null;
+                markZeroScrubRestartWithoutReload("scrub commit decoded buffer restart at 0.0");
+                startedOffsetRef.current = 0;
+                startedAtContextTimeRef.current = 0;
+            }
 
             // Use the older stable scrub implementation: pre-check the iPhone output
             // route before seekTo() creates the fresh AudioBufferSourceNode. This avoids
@@ -8738,8 +9324,8 @@ export default function Audio() {
             if (!options.quietStatus) {
                 setInfo(
                     actuallyPlaying
-                        ? `Scrubbed to ${formatTime(nextOffset)} and resumed playback.`
-                        : `Scrubbed to ${formatTime(nextOffset)}.`
+                        ? `Scrubbed to ${formatTimelineOffset(nextOffset, settingsView)} and resumed playback.`
+                        : `Scrubbed to ${formatTimelineOffset(nextOffset, settingsView)}.`
                 );
             }
 
@@ -8865,6 +9451,7 @@ export default function Audio() {
         }
 
         activeSourceRef.current = null;
+        clearBackgroundSourceRecovery("active source stopped");
         iPhoneLockScreenLivePauseRef.current = {
             active: false,
             source: null,
@@ -8880,6 +9467,7 @@ export default function Audio() {
         }
 
         manualStopRef.current = true;
+        clearBackgroundSourceRecovery(options.reason || "playback stopped");
         clearBrowserScrubAutoCommitTimer();
         clearPageResumeScrubRecoveryTimer();
         clearMediaSessionFastSeekCommitTimer();
@@ -10166,6 +10754,16 @@ export default function Audio() {
             });
             mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
             mediaPositionRef.current = 0;
+            dispatch(
+                audioPlayerActions.setSourceSnapshot({
+                    sourceKind: item.kind,
+                    sourceUrl: item.kind === "url" ? item.url : "",
+                    mediaTitle: item.title || "",
+                    activePlaylistIndex: safeIndex,
+                    activePlaylistItemId: item.id || "",
+                    activePlaylistTitle: item.title || "",
+                })
+            );
 
             const requestedRestorePosition = Number(options.restorePosition);
             const hasRequestedRestorePosition = Number.isFinite(requestedRestorePosition) && requestedRestorePosition > 0;
@@ -10271,16 +10869,38 @@ export default function Audio() {
             clearObjectUrl();
 
             if (item.kind === "url") {
-                const cleanLink = validateDirectMediaUrl(item.url);
+                let cleanLink = validateDirectMediaUrl(item.url);
+                const cachedPlayableUrl = await getCachedPlayableUrlForItem(item).catch(() => "");
+
+                if (cachedPlayableUrl) {
+                    if (
+                        offlineCacheObjectUrlRef.current &&
+                        offlineCacheObjectUrlRef.current !== cachedPlayableUrl
+                    ) {
+                        releaseCachedPlayableUrl(offlineCacheObjectUrlRef.current);
+                    }
+
+                    offlineCacheObjectUrlRef.current = cachedPlayableUrl;
+                    cleanLink = validateDirectMediaUrl(cachedPlayableUrl);
+                    setOfflinePlaylistNotice(
+                        `Playing "${item.title || "playlist item"}" from Dexie/CacheStorage download.`
+                    );
+                } else {
+                    if (offlineCacheObjectUrlRef.current) {
+                        releaseCachedPlayableUrl(offlineCacheObjectUrlRef.current);
+                        offlineCacheObjectUrlRef.current = "";
+                    }
+                    setOfflinePlaylistNotice("");
+                }
 
                 setInputFile(null);
                 setSourceKind("url");
                 setSourceUrl(cleanLink);
-                setDirectLink(cleanLink);
+                setDirectLink(item.url || cleanLink);
                 setActivePlaylistIndex(safeIndex);
                 activePlaylistIndexRef.current = safeIndex;
 
-                persistCurrentUrlSnapshot(cleanLink, item.title);
+                persistCurrentUrlSnapshot(item.url || cleanLink, item.title);
 
                 const cachedPreload = getCachedPlaylistPreload(item);
 
@@ -10733,6 +11353,54 @@ export default function Audio() {
         });
     }
 
+
+    function canResumeLoadedPlaylistItem(index = activePlaylistIndexRef.current) {
+        const list = playlistRef.current;
+        const safeIndex = normalizePlaylistIndex(index, list);
+        const item = safeIndex >= 0 ? list[safeIndex] : null;
+        const buffer = audioBufferRef.current;
+
+        return Boolean(
+            item &&
+            buffer &&
+            safeIndex === activePlaylistIndexRef.current &&
+            !playingRef.current &&
+            Number(buffer.duration || mediaDurationRef.current || 0) > 0
+        );
+    }
+
+    async function resumeLoadedPlaylistItem(reason = "Resume loaded playlist item") {
+        if (!canResumeLoadedPlaylistItem()) {
+            return false;
+        }
+
+        const primed = await primeIPhonePlaylistOutputFromGesture();
+
+        if (!primed) {
+            return false;
+        }
+
+        const started = await startBufferPlayback(false, {
+            fromPlaylistResume: true,
+            preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice(),
+        });
+
+        if (started) {
+            const list = playlistRef.current;
+            const currentIndex = activePlaylistIndexRef.current;
+            const item = Array.isArray(list) ? list[currentIndex] : null;
+
+            setInfo(
+                `${reason}: resumed "${item?.title || mediaTitleRef.current || "playlist item"}" from ${formatTime(
+                    getCurrentOffset()
+                )} without refetching or re-decoding the playlist item.`
+            );
+        }
+
+        return started;
+    }
+
     async function playPlaylistFromStart() {
         const list = playlistRef.current;
 
@@ -10749,6 +11417,15 @@ export default function Audio() {
     }
 
     async function handlePlaylistPrimaryPlay() {
+        if (
+            !shouldRunLimitedControlAction(
+                "playlist-primary-play-pause",
+                playingRef.current ? CONTROL_ACTION_LIMIT_MS : PLAY_CONTROL_ACTION_LIMIT_MS
+            )
+        ) {
+            return;
+        }
+
         if (isPauseUiSettlingRef.current) {
             return;
         }
@@ -10758,9 +11435,33 @@ export default function Audio() {
             return;
         }
 
+        if (canResumeLoadedPlaylistItem(activePlaylistIndexRef.current)) {
+            const resumed = await resumeLoadedPlaylistItem("Resume playlist");
+            if (resumed) {
+                return;
+            }
+        }
+
+        const list = playlistRef.current;
+        const currentIndex = activePlaylistIndexRef.current;
+        const shouldLoadCurrentPlaylistItem = Boolean(
+            Array.isArray(list) &&
+            list.length > 0 &&
+            currentIndex >= 0 &&
+            currentIndex < list.length
+        );
+
         const primed = await primeIPhonePlaylistOutputFromGesture();
 
         if (!primed) {
+            return;
+        }
+
+        if (shouldLoadCurrentPlaylistItem) {
+            await loadPlaylistItem(currentIndex, true, {
+                reason: "Resume playlist by loading current item because no decoded buffer is available",
+                preserveUnlockedOutput: isIOSAudioDevice(),
+            });
             return;
         }
 
@@ -10769,6 +11470,14 @@ export default function Audio() {
 
     async function handlePlaybackEnded() {
         if (manualStopRef.current) return;
+
+        if (isZeroScrubRestartNoReloadGuardActive()) {
+            playbackEndedHandledRef.current = false;
+            updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            return;
+        }
 
         playbackEndedHandledRef.current = true;
         clearBrowserScrubAutoCommitTimer();
@@ -10993,6 +11702,21 @@ export default function Audio() {
             return false;
         }
 
+        if (playbackStartInFlightRef.current) {
+            return Boolean(playingRef.current || activeSourceRef.current || isPlayingStateRef.current);
+        }
+
+        if (!resetToBeginning && playingRef.current && activeSourceRef.current) {
+            dispatch(
+                audioPlayerActions.markSelfHeal({
+                    reason: "Ignored duplicate active source play request before creating another stream.",
+                })
+            );
+            return true;
+        }
+
+        playbackStartInFlightRef.current = true;
+
         try {
             const { context, nodes } = ensureLiveGraph();
             if (isIOSAudioDevice()) {
@@ -11189,6 +11913,8 @@ export default function Audio() {
                 } ${buildMobileAudioHint()}`
             );
             return false;
+        } finally {
+            playbackStartInFlightRef.current = false;
         }
     }
 
@@ -11266,6 +11992,16 @@ export default function Audio() {
 
     async function handlePlayPause() {
         markControlInteraction("main play/pause button");
+
+        if (
+            !shouldRunLimitedControlAction(
+                "main-play-pause",
+                playingRef.current ? CONTROL_ACTION_LIMIT_MS : PLAY_CONTROL_ACTION_LIMIT_MS
+            )
+        ) {
+            return;
+        }
+
         if (isPauseUiSettlingRef.current) {
             return;
         }
@@ -11296,7 +12032,11 @@ export default function Audio() {
 
         if (!buffer) return false;
 
-        const nextOffset = clamp(numberOrDefault(seconds, 0), 0, buffer.duration);
+        const nextOffset = normalizeScrubOffsetForSeek(
+            clamp(numberOrDefault(seconds, 0), 0, buffer.duration),
+            buffer
+        );
+        const restartingFromZero = nextOffset === 0;
         const shouldResumeAfterSeek = Boolean(shouldResume && nextOffset < buffer.duration);
 
         if (options.fromMediaSession) {
@@ -11312,6 +12052,12 @@ export default function Audio() {
         startedOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
         mediaPositionRef.current = nextOffset;
+
+        if (restartingFromZero) {
+            browserScrubLastValueRef.current = 0;
+            pendingMediaSessionSeekRef.current = null;
+            markZeroScrubRestartWithoutReload("seekTo decoded buffer restart at 0.0");
+        }
         syncPlaybackPosition(nextOffset, {
             fromMediaSession: Boolean(options.fromMediaSession),
             forceMediaSession: true,
@@ -11328,12 +12074,17 @@ export default function Audio() {
         });
 
         if (shouldResumeAfterSeek) {
+            if (restartingFromZero) {
+                markZeroScrubRestartWithoutReload("starting decoded buffer from 0.0 without reloading");
+            }
+
             const startedAfterSeek = await startBufferPlayback(false, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                 outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                 forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                 quietStatus: Boolean(options.quietStatus),
+                zeroScrubRestartNoReload: restartingFromZero,
             });
 
             if (!startedAfterSeek) {
@@ -11346,6 +12097,12 @@ export default function Audio() {
                     forceSessionPersist: true,
                 });
                 updateMediaSessionState("paused", { forcePosition: true });
+
+                if (restartingFromZero) {
+                    setInfo("Restarted to 0.0 using the decoded buffer. Tap Play to start from the beginning.");
+                    return true;
+                }
+
                 return false;
             }
 
@@ -11358,7 +12115,11 @@ export default function Audio() {
             });
             updateMediaSessionState("playing", { forcePosition: true });
             if (!options.fromMediaSession && !options.quietStatus) {
-                setInfo(`Scrubbed to ${formatTime(nextOffset)} and resumed playback.`);
+                setInfo(
+                    restartingFromZero
+                        ? "Restarted audio from the beginning."
+                        : `Scrubbed to ${formatTimelineOffset(nextOffset, settingsView)} and resumed playback.`
+                );
             }
         } else {
             setPlayingState(false);
@@ -11371,7 +12132,7 @@ export default function Audio() {
             });
             updateMediaSessionState("paused", { forcePosition: true });
             if (!options.fromMediaSession && !options.quietStatus) {
-                setInfo(`Scrubbed to ${formatTime(nextOffset)}.`);
+                setInfo(`Scrubbed to ${formatTimelineOffset(nextOffset, settingsView)}.`);
             }
         }
 
@@ -11379,7 +12140,18 @@ export default function Audio() {
     }
 
     function handleScrubRelease(reason = "browser scrub released") {
+        pendingMediaSessionSeekRef.current = null;
+
+        dispatch(
+            audioPlayerActions.commitScrub({
+                currentTime: mediaPositionRef.current,
+                shouldResumeAfterScrub: wasPlayingBeforeScrubRef.current,
+                source: reason || "scrub-release",
+            })
+        );
+
         markControlInteraction(reason);
+        scrubGestureActiveRef.current = false;
         if (!scrubbingRef.current || !audioBufferRef.current) {
             repairLongRunningPlaybackState(reason);
             return;
@@ -11400,6 +12172,26 @@ export default function Audio() {
     }
 
     function handleScrubStart() {
+        const recentlyReturnedFromFocus = Date.now() - Number(lastFocusReturnScrubResetAtRef.current || 0) < FOCUS_RETURN_FORCE_NEW_SCRUB_MS;
+
+        if (
+            recentlyReturnedFromFocus ||
+            scrubCommitInFlightRef.current ||
+            (scrubbingRef.current && !scrubGestureActiveRef.current)
+        ) {
+            resetScrubStateForFreshBrowserGesture("browser scrub start after focus return");
+        }
+
+        pendingMediaSessionSeekRef.current = null;
+
+        dispatch(
+            audioPlayerActions.startScrub({
+                value: bufferOffsetToTimelineSeconds(mediaPositionRef.current, settingsView),
+                shouldResumeAfterScrub: playingRef.current,
+                source: "browser-slider",
+            })
+        );
+
         markControlInteraction("browser scrub started");
         if (audioBufferRef.current && !hasMediaRef.current) {
             hasMediaRef.current = true;
@@ -11407,7 +12199,7 @@ export default function Audio() {
         }
 
         if (!audioBufferRef.current || isRendering || isLoading) return;
-        if (scrubbingRef.current) return;
+        if (scrubbingRef.current && scrubGestureActiveRef.current) return;
 
         const currentOffset = getCurrentOffset();
         const wasPlaying = Boolean(
@@ -11417,6 +12209,7 @@ export default function Audio() {
         );
 
         browserScrubSerialRef.current += 1;
+        scrubGestureActiveRef.current = true;
         scrubbingRef.current = true;
         rememberScrubTarget(currentOffset);
         markScrubResumeIntent(wasPlaying, currentOffset);
@@ -11459,6 +12252,21 @@ export default function Audio() {
     }
 
     function handleScrubChange(_, nextValue) {
+        pendingMediaSessionSeekRef.current = null;
+
+        if (scrubCommitInFlightRef.current && !scrubGestureActiveRef.current) {
+            resetScrubStateForFreshBrowserGesture("browser scrub changed after focus return");
+        }
+
+        const reduxScrubValue = Array.isArray(arguments[1]) ? arguments[1][0] : arguments[1];
+        if (Number.isFinite(Number(reduxScrubValue))) {
+            dispatch(
+                audioPlayerActions.updateScrubValue(
+                    timelineSecondsToBufferOffset(Number(reduxScrubValue), settingsView)
+                )
+            );
+        }
+
         markControlInteraction("browser scrub changed");
         const buffer = audioBufferRef.current;
 
@@ -11469,10 +12277,22 @@ export default function Audio() {
         }
 
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-        const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        const nextOffset = normalizeScrubOffsetForSeek(
+            timelineSecondsToBufferOffset(cleanValue, settingsView),
+            buffer
+        );
+        const strongBackwardScrub = isStrongBackwardScrubTarget(nextOffset);
 
+        scrubGestureActiveRef.current = true;
         scrubbingRef.current = true;
         rememberScrubTarget(nextOffset);
+
+        if (strongBackwardScrub || nextOffset === 0) {
+            forceScrubTargetIntoPlaybackClock(
+                nextOffset,
+                nextOffset === 0 ? "browser scrub reached zero" : "browser scrub moved backward"
+            );
+        }
         markScrubResumeIntent(getScrubResumeIntent(), nextOffset);
         mediaPositionRef.current = nextOffset;
         setIsScrubbing(true);
@@ -11486,13 +12306,29 @@ export default function Audio() {
     }
 
     async function handleScrubCommit(_, nextValue) {
+        pendingMediaSessionSeekRef.current = null;
+        const reduxCommittedValue = Array.isArray(arguments[1]) ? arguments[1][0] : arguments[1];
+        if (Number.isFinite(Number(reduxCommittedValue))) {
+            dispatch(
+                audioPlayerActions.commitScrub({
+                    currentTime: timelineSecondsToBufferOffset(Number(reduxCommittedValue), settingsView),
+                    shouldResumeAfterScrub: wasPlayingBeforeScrubRef.current,
+                    source: "browser-slider",
+                })
+            );
+        }
+
         markControlInteraction("browser scrub committed");
+        scrubGestureActiveRef.current = false;
         const buffer = audioBufferRef.current;
 
         if (!buffer) return;
 
         const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-        const nextOffset = clamp(numberOrDefault(cleanValue, 0), 0, buffer.duration);
+        const nextOffset = normalizeScrubOffsetForSeek(
+            timelineSecondsToBufferOffset(cleanValue, settingsView),
+            buffer
+        );
         const lastCompleted = lastCompletedScrubCommitRef.current || {};
         const isDuplicateFinalCommit = Boolean(
             !scrubbingRef.current &&
@@ -12320,6 +13156,7 @@ export default function Audio() {
                                             )
                                         }
                                         onClick={handlePlaylistPrimaryPlay}
+                                        aria-label={playlistPrimaryControlLabel}
                                         disabled={!playlist.length || isRendering || isLoading || isPreloadingPlaylist}
                                         sx={{
                                             borderRadius: 5,
@@ -12339,9 +13176,7 @@ export default function Audio() {
                                             },
                                         }}
                                     >
-                                        {showPauseForPlaylistControls
-                                            ? "Pause playlist"
-                                            : "Start playlist"}
+                                        {playlistPrimaryControlLabel}
                                     </Button>
 
                                     <Button
@@ -12750,6 +13585,12 @@ export default function Audio() {
                                                 const itemArtworkSource = buildAbsoluteMediaAssetUrl(
                                                     getPlaylistItemArtworkSource(item)
                                                 );
+                                                const itemIsCurrentlyPlaying = Boolean(active && showPauseForPlaylistControls);
+                                                const itemPlayButtonLabel = itemIsCurrentlyPlaying
+                                                    ? "Pause"
+                                                    : active
+                                                        ? "Resume"
+                                                        : "Play";
 
                                                 return (
                                                     <Box
@@ -12873,21 +13714,53 @@ export default function Audio() {
 
                                                         <Button
                                                             size="small"
-                                                            variant="outlined"
-                                                            onClick={() => loadPlaylistItem(index, true)}
+                                                            variant={itemIsCurrentlyPlaying ? "contained" : "outlined"}
+                                                            startIcon={itemIsCurrentlyPlaying ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />}
+                                                            onClick={async () => {
+                                                                if (
+                                                                    !shouldRunLimitedControlAction(
+                                                                        `playlist-row-${index}-control`,
+                                                                        itemIsCurrentlyPlaying ? CONTROL_ACTION_LIMIT_MS : PLAY_CONTROL_ACTION_LIMIT_MS
+                                                                    )
+                                                                ) {
+                                                                    return;
+                                                                }
+
+                                                                if (itemIsCurrentlyPlaying) {
+                                                                    pausePlayback({ reason: "Playlist row pause button" });
+                                                                    return;
+                                                                }
+
+                                                                if (active && canResumeLoadedPlaylistItem(index)) {
+                                                                    const resumed = await resumeLoadedPlaylistItem("Resume playlist row");
+                                                                    if (resumed) {
+                                                                        return;
+                                                                    }
+                                                                }
+
+                                                                loadPlaylistItem(index, true);
+                                                            }}
                                                             disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                             sx={{
                                                                 borderRadius: 999,
-                                                                color: "#fff",
+                                                                color: itemIsCurrentlyPlaying ? "#06111e" : "#fff",
                                                                 borderColor: "rgba(255,255,255,0.18)",
                                                                 fontWeight: 900,
                                                                 gridColumn: {
                                                                     xs: "1 / span 2",
                                                                     sm: "auto",
                                                                 },
+                                                                background: itemIsCurrentlyPlaying
+                                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                                    : "transparent",
+                                                                "&:hover": {
+                                                                    background: itemIsCurrentlyPlaying
+                                                                        ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                                                        : "rgba(255,255,255,0.08)",
+                                                                },
                                                             }}
                                                         >
-                                                            Play
+                                                            {itemPlayButtonLabel}
                                                         </Button>
 
                                                         <Button
@@ -13191,7 +14064,7 @@ export default function Audio() {
                                                                     fontVariantNumeric: "tabular-nums",
                                                                 }}
                                                             >
-                                                                {formatTime(position)} / {formatTime(duration)}
+                                                                {formatTime(visiblePosition)} / {formatTime(visibleDuration)}
                                                             </Typography>
                                                         </Stack>
 
@@ -13331,17 +14204,20 @@ export default function Audio() {
                                                 </Box>
 
                                                 <Slider
-                                                    value={clamp(position, 0, duration || 0)}
+                                                    value={clamp(visiblePosition, 0, visibleDuration || 0)}
                                                     min={0}
-                                                    max={duration || 0}
+                                                    max={visibleDuration || 0}
                                                     step={0.01}
                                                     disabled={!hasMedia || isRendering || isLoading}
                                                     onPointerDown={handleScrubStart}
+                                                    onPointerDownCapture={handleScrubStart}
                                                     onPointerUp={() => handleScrubRelease("slider pointer release")}
                                                     onPointerCancel={() => handleScrubRelease("slider pointer cancel")}
                                                     onMouseDown={handleScrubStart}
+                                                    onMouseDownCapture={handleScrubStart}
                                                     onMouseUp={() => handleScrubRelease("slider mouse release")}
                                                     onTouchStart={handleScrubStart}
+                                                    onTouchStartCapture={handleScrubStart}
                                                     onTouchEnd={() => handleScrubRelease("slider touch release")}
                                                     onTouchCancel={() => handleScrubRelease("slider touch cancel")}
                                                     onKeyDown={handleScrubKeyDown}
@@ -13385,7 +14261,8 @@ export default function Audio() {
                                                     {settingsView.delayMix.toFixed(2)} | reverb ={" "}
                                                     {settingsView.reverbMix.toFixed(2)} | playbackRate ={" "}
                                                     {settingsView.speed.toFixed(2)}x | detune ={" "}
-                                                    {pitchCents.toFixed(0)} cents | effective rate ={" "}
+                                                    {pitchCents.toFixed(0)} cents | end time ={" "}
+                                                    {formatTime(visibleDuration)} | effective rate ={" "}
                                                     {effectiveRate.toFixed(2)}x
                                                 </Typography>
                                             </Stack>
