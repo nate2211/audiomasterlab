@@ -10,6 +10,10 @@ import {
     CircularProgress,
     Container,
     Divider,
+    ListItemIcon,
+    ListItemText,
+    Menu,
+    MenuItem,
     Paper,
     Slider,
     Stack,
@@ -32,10 +36,20 @@ import SubtitlesRoundedIcon from "@mui/icons-material/SubtitlesRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
 import ThreeDRotationRoundedIcon from "@mui/icons-material/ThreeDRotationRounded";
 import PeopleRoundedIcon from "@mui/icons-material/PeopleRounded";
+import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
+import NewspaperRoundedIcon from "@mui/icons-material/NewspaperRounded";
+import InfoRoundedIcon from "@mui/icons-material/InfoRounded";
+
 export function NavBar() {
     const location = useLocation();
 
-    const navItems = [
+    const [toolsAnchorEl, setToolsAnchorEl] = React.useState(null);
+    const [infoAnchorEl, setInfoAnchorEl] = React.useState(null);
+
+    const toolsOpen = Boolean(toolsAnchorEl);
+    const infoOpen = Boolean(infoAnchorEl);
+
+    const topLevelItems = [
         {
             label: "Home",
             path: "/",
@@ -56,11 +70,9 @@ export function NavBar() {
             path: "/archive",
             icon: <AudioFileRoundedIcon fontSize="small" />,
         },
-        {
-            label: "Community",
-            path: "/community",
-            icon: <PeopleRoundedIcon fontSize="small"/>,
-        },
+    ];
+
+    const toolsItems = [
         {
             label: "Recorder",
             path: "/recorder",
@@ -71,7 +83,6 @@ export function NavBar() {
             path: "/editor",
             icon: <TimelineRoundedIcon fontSize="small" />,
         },
-
         {
             label: "Transcribe",
             path: "/transcribe",
@@ -83,6 +94,102 @@ export function NavBar() {
             icon: <ThreeDRotationRoundedIcon fontSize="small" />,
         },
     ];
+
+    const infoItems = [
+        {
+            label: "News",
+            path: "/news",
+            icon: <NewspaperRoundedIcon fontSize="small" />,
+        },
+        {
+            label: "Community",
+            path: "/community",
+            icon: <PeopleRoundedIcon fontSize="small" />,
+        },
+    ];
+
+    const isActivePath = (path) => {
+        if (path === "/") {
+            return location.pathname === "/";
+        }
+
+        return location.pathname === path || location.pathname.startsWith(`${path}/`);
+    };
+
+    const toolsActive = toolsItems.some((item) => isActivePath(item.path));
+    const infoActive = infoItems.some((item) => isActivePath(item.path));
+
+    const navButtonSx = (active) => ({
+        flex: "0 0 auto",
+        borderRadius: 999,
+        color: active ? "#08111f" : "rgba(255,255,255,0.78)",
+        background: active
+            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+            : "transparent",
+        fontWeight: 900,
+        px: { xs: 1.35, sm: 2.2 },
+        minWidth: { xs: "auto", sm: 64 },
+        "& .MuiButton-startIcon": {
+            mr: { xs: 0, sm: 0.8 },
+        },
+        "& .MuiButton-startIcon + *": {
+            display: { xs: "none", sm: "inline" },
+        },
+        "&:hover": {
+            background: active
+                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                : "rgba(255,255,255,0.08)",
+        },
+    });
+
+    const dropdownButtonSx = (active) => ({
+        ...navButtonSx(active),
+        "& .MuiButton-endIcon": {
+            ml: { xs: 0, sm: 0.7 },
+        },
+    });
+
+    const menuPaperSx = {
+        mt: 1.2,
+        minWidth: 220,
+        borderRadius: 4,
+        overflow: "hidden",
+        color: "#fff",
+        background:
+            "linear-gradient(135deg, rgba(13,18,36,0.98), rgba(18,25,52,0.96))",
+        border: "1px solid rgba(255,255,255,0.12)",
+        boxShadow: "0 22px 70px rgba(0,0,0,0.38)",
+        backdropFilter: "blur(18px)",
+    };
+
+    const menuItemSx = (active) => ({
+        gap: 1,
+        py: 1.2,
+        px: 1.5,
+        borderRadius: 3,
+        color: active ? "#06111e" : "rgba(255,255,255,0.82)",
+        background: active
+            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+            : "transparent",
+        fontWeight: 900,
+        "&:hover": {
+            background: active
+                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                : "rgba(255,255,255,0.08)",
+        },
+        "& .MuiListItemIcon-root": {
+            minWidth: 34,
+            color: active ? "#06111e" : "rgba(255,255,255,0.72)",
+        },
+    });
+
+    const closeToolsMenu = () => {
+        setToolsAnchorEl(null);
+    };
+
+    const closeInfoMenu = () => {
+        setInfoAnchorEl(null);
+    };
 
     return (
         <AppBar
@@ -170,8 +277,8 @@ export function NavBar() {
                             },
                         }}
                     >
-                        {navItems.map((item) => {
-                            const active = location.pathname === item.path;
+                        {topLevelItems.map((item) => {
+                            const active = isActivePath(item.path);
 
                             return (
                                 <Button
@@ -180,33 +287,106 @@ export function NavBar() {
                                     to={item.path}
                                     startIcon={item.icon}
                                     variant={active ? "contained" : "text"}
-                                    sx={{
-                                        flex: "0 0 auto",
-                                        borderRadius: 999,
-                                        color: active ? "#08111f" : "rgba(255,255,255,0.78)",
-                                        background: active
-                                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                            : "transparent",
-                                        fontWeight: 900,
-                                        px: { xs: 1.35, sm: 2.2 },
-                                        minWidth: { xs: "auto", sm: 64 },
-                                        "& .MuiButton-startIcon": {
-                                            mr: { xs: 0, sm: 0.8 },
-                                        },
-                                        "& .MuiButton-startIcon + *": {
-                                            display: { xs: "none", sm: "inline" },
-                                        },
-                                        "&:hover": {
-                                            background: active
-                                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                : "rgba(255,255,255,0.08)",
-                                        },
-                                    }}
+                                    sx={navButtonSx(active)}
                                 >
                                     {item.label}
                                 </Button>
                             );
                         })}
+
+                        <Button
+                            startIcon={<TuneRoundedIcon fontSize="small" />}
+                            endIcon={<KeyboardArrowDownRoundedIcon fontSize="small" />}
+                            variant={toolsActive ? "contained" : "text"}
+                            onClick={(event) => setToolsAnchorEl(event.currentTarget)}
+                            sx={dropdownButtonSx(toolsActive)}
+                        >
+                            Tools
+                        </Button>
+
+                        <Menu
+                            anchorEl={toolsAnchorEl}
+                            open={toolsOpen}
+                            onClose={closeToolsMenu}
+                            MenuListProps={{
+                                dense: false,
+                                sx: {
+                                    p: 0.75,
+                                },
+                            }}
+                            PaperProps={{
+                                sx: menuPaperSx,
+                            }}
+                        >
+                            {toolsItems.map((item) => {
+                                const active = isActivePath(item.path);
+
+                                return (
+                                    <MenuItem
+                                        key={item.path}
+                                        component={RouterLink}
+                                        to={item.path}
+                                        onClick={closeToolsMenu}
+                                        sx={menuItemSx(active)}
+                                    >
+                                        <ListItemIcon>{item.icon}</ListItemIcon>
+                                        <ListItemText
+                                            primary={item.label}
+                                            primaryTypographyProps={{
+                                                fontWeight: 900,
+                                            }}
+                                        />
+                                    </MenuItem>
+                                );
+                            })}
+                        </Menu>
+
+                        <Button
+                            startIcon={<InfoRoundedIcon fontSize="small" />}
+                            endIcon={<KeyboardArrowDownRoundedIcon fontSize="small" />}
+                            variant={infoActive ? "contained" : "text"}
+                            onClick={(event) => setInfoAnchorEl(event.currentTarget)}
+                            sx={dropdownButtonSx(infoActive)}
+                        >
+                            Info
+                        </Button>
+
+                        <Menu
+                            anchorEl={infoAnchorEl}
+                            open={infoOpen}
+                            onClose={closeInfoMenu}
+                            MenuListProps={{
+                                dense: false,
+                                sx: {
+                                    p: 0.75,
+                                },
+                            }}
+                            PaperProps={{
+                                sx: menuPaperSx,
+                            }}
+                        >
+                            {infoItems.map((item) => {
+                                const active = isActivePath(item.path);
+
+                                return (
+                                    <MenuItem
+                                        key={item.path}
+                                        component={RouterLink}
+                                        to={item.path}
+                                        onClick={closeInfoMenu}
+                                        sx={menuItemSx(active)}
+                                    >
+                                        <ListItemIcon>{item.icon}</ListItemIcon>
+                                        <ListItemText
+                                            primary={item.label}
+                                            primaryTypographyProps={{
+                                                fontWeight: 900,
+                                            }}
+                                        />
+                                    </MenuItem>
+                                );
+                            })}
+                        </Menu>
                     </Stack>
                 </Container>
             </Toolbar>

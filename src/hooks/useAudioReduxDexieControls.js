@@ -20,6 +20,45 @@ function positiveNumber(value, fallback = 0) {
     return Number.isFinite(number) ? Math.max(0, number) : fallback;
 }
 
+function finiteNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
+function roundToStep(value, step = 0.25) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return 0;
+    }
+    return Math.round(number / step) * step;
+}
+
+function stableKey(value) {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(Date.now());
+    }
+}
+
+function playlistItemKey(item) {
+    if (!item || typeof item !== "object") {
+        return "";
+    }
+
+    return [
+        item.id || "",
+        item.url || "",
+        item.src || "",
+        item.audioUrl || "",
+        item.title || "",
+        item.artist || "",
+        item.album || "",
+        item.duration || "",
+        item.offlineAvailable ? "offline" : "",
+    ].join("::");
+}
+
 function useLatestRef(value) {
     const ref = useRef(value);
     useEffect(() => {
@@ -84,7 +123,7 @@ export function useAudioReduxDexieControls({
             activePlaylistIndex,
             activePlaylistItem?.id,
             activePlaylistItem?.title,
-            playlist,
+            playlist?.length,
             position,
             duration,
             repeatEnabled,
@@ -231,23 +270,41 @@ export function useAudioReduxDexieControls({
     }, [dispatch, onHydratePlaylistRef, onHydrateSessionRef]);
 
     useEffect(() => {
-        dispatch(audioPlayerActions.setPlaybackSnapshot({
-            isPlaying,
-            isLoading,
-            isReady: bufferReady,
-            isScrubbing,
-        }));
+        const snapshot = {
+            isPlaying: Boolean(isPlaying),
+            isLoading: Boolean(isLoading),
+            isReady: Boolean(bufferReady),
+            isScrubbing: Boolean(isScrubbing),
+        };
+        const key = stableKey(snapshot);
+
+        if (lastPlaybackDispatchKeyRef.current === key) {
+            return;
+        }
+
+        lastPlaybackDispatchKeyRef.current = key;
+        dispatch(audioPlayerActions.setPlaybackSnapshot(snapshot));
     }, [dispatch, isPlaying, isLoading, bufferReady, isScrubbing]);
 
     useEffect(() => {
-        dispatch(audioPlayerActions.setSourceSnapshot({
-            sourceKind,
-            sourceUrl,
-            mediaTitle,
-            activePlaylistIndex,
-            activePlaylistItemId: activePlaylistItem?.id || "",
-            activePlaylistTitle: activePlaylistItem?.title || "",
-        }));
+        const snapshot = {
+            sourceKind: String(sourceKind || ""),
+            sourceUrl: String(sourceUrl || ""),
+            mediaTitle: String(mediaTitle || activePlaylistItem?.title || ""),
+            activePlaylistIndex: Number.isFinite(Number(activePlaylistIndex))
+                ? Number(activePlaylistIndex)
+                : -1,
+            activePlaylistItemId: String(activePlaylistItem?.id || ""),
+            activePlaylistTitle: String(activePlaylistItem?.title || ""),
+        };
+        const key = stableKey(snapshot);
+
+        if (lastSourceDispatchKeyRef.current === key) {
+            return;
+        }
+
+        lastSourceDispatchKeyRef.current = key;
+        dispatch(audioPlayerActions.setSourceSnapshot(snapshot));
     }, [
         dispatch,
         sourceKind,
@@ -259,11 +316,23 @@ export function useAudioReduxDexieControls({
     ]);
 
     useEffect(() => {
-        dispatch(audioPlayerActions.setPositionSnapshot({
-            currentTime: position,
-            duration,
-            playbackRate: Number(settings?.speed || 1),
-        }));
+        const snapshot = {
+            currentTime: positiveNumber(position, 0),
+            duration: positiveNumber(duration, 0),
+            playbackRate: finiteNumber(settings?.speed, 1),
+        };
+
+        const dispatchKey = stableKey({
+            currentTime: roundToStep(snapshot.currentTime, isScrubbing ? 0.05 : 0.25),
+            duration: roundToStep(snapshot.duration, 0.25),
+            playbackRate: snapshot.playbackRate,
+            isScrubbing: Boolean(isScrubbing),
+        });
+
+        if (lastPositionDispatchKeyRef.current !== dispatchKey) {
+            lastPositionDispatchKeyRef.current = dispatchKey;
+            dispatch(audioPlayerActions.setPositionSnapshot(snapshot));
+        }
 
         const now = Date.now();
         if (now - lastSessionSaveAtRef.current < 850) return;
@@ -276,29 +345,35 @@ export function useAudioReduxDexieControls({
                     error?.message || "Could not save audio session to Dexie."
                 ))
             );
-    }, [dispatch, position, duration, settings?.speed, sessionSnapshot]);
+    }, [dispatch, position, duration, settings?.speed, sessionSnapshot, isScrubbing]);
 
     useEffect(() => {
         const safePlaylist = Array.isArray(playlist) ? playlist : [];
-        const key = JSON.stringify({
-            ids: safePlaylist.map((item) => item?.id || item?.url || item?.title || ""),
+        const snapshot = {
+            items: safePlaylist,
+            activePlaylistIndex: Number.isFinite(Number(activePlaylistIndex))
+                ? Number(activePlaylistIndex)
+                : -1,
+            repeatEnabled: Boolean(repeatEnabled),
+        };
+        const key = stableKey({
+            ids: safePlaylist.map(playlistItemKey),
             length: safePlaylist.length,
-            activePlaylistIndex,
-            repeatEnabled,
+            activePlaylistIndex: snapshot.activePlaylistIndex,
+            repeatEnabled: snapshot.repeatEnabled,
         });
 
-        dispatch(audioPlayerActions.setPlaylistSnapshot({
-            items: safePlaylist,
-            activePlaylistIndex,
-            repeatEnabled,
-        }));
+        if (lastPlaylistDispatchKeyRef.current !== key) {
+            lastPlaylistDispatchKeyRef.current = key;
+            dispatch(audioPlayerActions.setPlaylistSnapshot(snapshot));
+        }
 
         if (lastPlaylistSaveKeyRef.current === key) return;
         lastPlaylistSaveKeyRef.current = key;
 
         saveAudioPlaylistSnapshot(safePlaylist, {
-            activePlaylistIndex,
-            repeatEnabled,
+            activePlaylistIndex: snapshot.activePlaylistIndex,
+            repeatEnabled: snapshot.repeatEnabled,
         })
             .then(() => dispatch(audioPlayerActions.markPlaylistSaved()))
             .catch((error) =>
@@ -310,15 +385,18 @@ export function useAudioReduxDexieControls({
 
     useEffect(() => {
         const summary = {
-            activePresetKey: activePresetKey || "flat",
-            baseVolume: Number(settings?.baseVolume ?? 1),
-            speed: Number(settings?.speed ?? 1),
-            pitchSemitones: Number(settings?.pitchSemitones ?? 0),
-            outputGain: Number(settings?.outputGain ?? 0),
+            activePresetKey: String(activePresetKey || "flat"),
+            baseVolume: finiteNumber(settings?.baseVolume, 1),
+            speed: finiteNumber(settings?.speed, 1),
+            pitchSemitones: finiteNumber(settings?.pitchSemitones, 0),
+            outputGain: finiteNumber(settings?.outputGain, 0),
         };
-        const key = JSON.stringify(summary);
+        const key = stableKey(summary);
 
-        dispatch(audioPlayerActions.setSettingsSummary(summary));
+        if (lastSettingsDispatchKeyRef.current !== key) {
+            lastSettingsDispatchKeyRef.current = key;
+            dispatch(audioPlayerActions.setSettingsSummary(summary));
+        }
 
         if (lastSettingsSaveKeyRef.current === key) return;
         lastSettingsSaveKeyRef.current = key;
@@ -328,7 +406,14 @@ export function useAudioReduxDexieControls({
                 error?.message || "Could not save settings to Dexie."
             ))
         );
-    }, [dispatch, settings, activePresetKey]);
+    }, [
+        dispatch,
+        activePresetKey,
+        settings?.baseVolume,
+        settings?.speed,
+        settings?.pitchSemitones,
+        settings?.outputGain,
+    ]);
     useEffect(() => {
         if (typeof window === "undefined" || typeof document === "undefined") {
             return undefined;
