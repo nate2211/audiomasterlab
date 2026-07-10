@@ -5415,7 +5415,18 @@ export default function Audio() {
     }
 
     mediaTitleRef.current = mediaTitle;
-    mediaDurationRef.current = Number.isFinite(duration) ? duration : 0;
+
+    // The decoded AudioBuffer is the authoritative duration during playlist
+    // loading/startup. React state can still contain the previous render's zero
+    // for one render, so never let that stale zero erase a freshly decoded
+    // duration before the playlist source and timer are started.
+    const renderedDuration = Number(duration);
+    if (Number.isFinite(renderedDuration) && renderedDuration > 0) {
+        mediaDurationRef.current = renderedDuration;
+    } else if (!audioBufferRef.current) {
+        mediaDurationRef.current = 0;
+    }
+
     visualizer3dSettingsRef.current = visualizer3dSettings;
 
     useEffect(() => {
@@ -6551,7 +6562,7 @@ export default function Audio() {
             activeContext &&
             activeContext.state !== "closed" &&
             Number.isFinite(Number(startedAtContextTimeRef.current)) &&
-            Number(startedAtContextTimeRef.current) > 0 &&
+            Number(startedAtContextTimeRef.current) >= 0 &&
             activeSourceClockEpochRef.current === playbackClockEpochRef.current
         );
 
@@ -11250,7 +11261,7 @@ export default function Audio() {
         if (
             sourceClockEpoch !== currentClockEpoch ||
             !Number.isFinite(sourceStartedAt) ||
-            sourceStartedAt <= 0 ||
+            sourceStartedAt < 0 ||
             sourceStartedAt > context.currentTime + 0.25
         ) {
             const committedOffset = Number(committedPlaybackOffsetRef.current);
@@ -11608,6 +11619,14 @@ export default function Audio() {
         playbackEndedHandledRef.current = false;
 
         setIsScrubbing(false);
+        mediaDurationRef.current = 0;
+        mediaPositionRef.current = 0;
+        lastKnownGoodOffsetRef.current = 0;
+        lastMediaSessionPositionSnapshotRef.current = {
+            duration: 0,
+            position: 0,
+            playbackRate: getMediaSessionPlaybackRate(),
+        };
         setBufferReady(false);
         clearControlSelfHealTimer();
         clearControlWakeRepairTimer();
@@ -11669,7 +11688,7 @@ export default function Audio() {
         browserScrubLastValueRef.current = decodedStartOffset;
         lastMediaSessionPositionSnapshotRef.current = {
             duration: decodedDuration,
-            position: 0,
+            position: decodedStartOffset,
             playbackRate: getMediaSessionPlaybackRate(),
         };
 
@@ -12589,6 +12608,7 @@ export default function Audio() {
             fromMediaSession = false,
             outputAlreadyRestarted = false,
             forceIPhoneOutputPostStart = false,
+            userInitiatedPlayback = false,
             restorePosition = 0,
             fromSmartCarResume = false,
         } = {}
@@ -12638,6 +12658,7 @@ export default function Audio() {
                 fromMediaSession,
                 outputAlreadyRestarted,
                 forceIPhoneOutputPostStart,
+                userInitiatedPlayback,
                 restorePosition: step === 0 ? restorePosition : 0,
                 fromSmartCarResume,
                 quietStatus: Boolean(fromSmartCarResume),
@@ -12765,26 +12786,52 @@ export default function Audio() {
                         })
                         : 0;
 
-            if (restoredOffset > 0 || pendingStartOffset !== null) {
-                startedOffsetRef.current = restoredOffset;
-                committedPlaybackOffsetRef.current = restoredOffset;
-                lastKnownGoodOffsetRef.current = restoredOffset;
-                startedAtContextTimeRef.current = 0;
-                mediaPositionRef.current = restoredOffset;
-                browserScrubLastValueRef.current = restoredOffset;
-                syncPlaybackPosition(restoredOffset, {
-                    forceMediaSession: true,
-                    commitStartOffset: true,
-                    forceSessionPersist: true,
-                });
-            }
+            // Commit the decoded duration and start position as one timeline
+            // transaction. This runs even when the start position is 0:00 so the
+            // playlist row, main timer, Redux snapshot, Media Session position,
+            // and WebAudio source all begin from the same values.
+            const synchronizedStartOffset = decodedDuration > 0
+                ? clamp(restoredOffset, 0, decodedDuration)
+                : Math.max(0, restoredOffset);
+
+            mediaDurationRef.current = decodedDuration;
+            mediaPositionRef.current = synchronizedStartOffset;
+            startedOffsetRef.current = synchronizedStartOffset;
+            committedPlaybackOffsetRef.current = synchronizedStartOffset;
+            lastKnownGoodOffsetRef.current = synchronizedStartOffset;
+            browserScrubLastValueRef.current = synchronizedStartOffset;
+            startedAtContextTimeRef.current = 0;
+
+            setDuration((current) =>
+                Math.abs(Number(current || 0) - decodedDuration) < 0.001
+                    ? current
+                    : decodedDuration
+            );
+            setPosition((current) =>
+                Math.abs(Number(current || 0) - synchronizedStartOffset) < 0.001
+                    ? current
+                    : synchronizedStartOffset
+            );
+
+            syncPlaybackPosition(synchronizedStartOffset, {
+                forceMediaSession: true,
+                commitStartOffset: true,
+                forceSessionPersist: true,
+                clearPendingMediaSessionSeek: true,
+            });
+
+            lastMediaSessionPositionSnapshotRef.current = {
+                duration: decodedDuration,
+                position: synchronizedStartOffset,
+                playbackRate: getMediaSessionPlaybackRate(),
+            };
 
             if (pendingStartOffset !== null) {
                 clearPendingPlaylistStartSeek();
             }
 
             updateMediaSessionMetadata();
-            updateMediaSessionState(autoplay ? "playing" : "paused", {
+            updateMediaSessionState("paused", {
                 forcePosition: true,
             });
             refreshStorageInfo();
@@ -12811,40 +12858,97 @@ export default function Audio() {
                     options.fromPlaybackEnded ||
                     options.fromMediaSession ||
                     options.fromAutoAdvance ||
-                    options.preserveUnlockedOutput
+                    options.preserveUnlockedOutput ||
+                    options.userInitiatedPlayback
                 )
                     ? 0
                     : PLAYLIST_RECOVERY_SETTINGS.autoplayDelayMs;
 
-                window.setTimeout(() => {
-                    if (playlistLoadTokenRef.current === loadToken) {
-                        startBufferPlayback(!hasRequestedRestorePosition, {
-                            fromAutoAdvance: Boolean(options.fromAutoAdvance),
+                if (startDelayMs > 0) {
+                    await sleep(startDelayMs);
+                }
+
+                if (!ensureStillCurrentLoad()) {
+                    return false;
+                }
+
+                // A queued/restored playlist seek must not be erased by the
+                // normal reset-to-zero behavior used for a brand-new track.
+                const shouldResetToBeginning = Boolean(
+                    pendingStartOffset === null &&
+                    !hasRequestedRestorePosition &&
+                    synchronizedStartOffset <= 0
+                );
+
+                const started = await startBufferPlayback(shouldResetToBeginning, {
+                    fromAutoAdvance: Boolean(options.fromAutoAdvance),
+                    fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
+                    fromMediaSession: Boolean(options.fromMediaSession),
+                    preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
+                    outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
+                    forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
+                    quietStatus: Boolean(options.quietStatus || options.fromSmartCarResume),
+                });
+
+                if (!started || !ensureStillCurrentLoad()) {
+                    if (ensureStillCurrentLoad()) {
+                        markPlaylistItemFailed(
+                            safeIndex,
+                            new Error("Playback could not start after this track loaded.")
+                        );
+                    }
+
+                    if (
+                        ensureStillCurrentLoad() &&
+                        shouldAutoSkip &&
+                        playlistRef.current.length > 1
+                    ) {
+                        return loadNextPlayablePlaylistItem(safeIndex + 1, {
+                            autoplay: true,
+                            reason: "Loaded track could not start, so recovery is moving to the next item",
                             fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
                             fromMediaSession: Boolean(options.fromMediaSession),
                             preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
                             outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
                             forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
-                            quietStatus: Boolean(options.quietStatus || options.fromSmartCarResume),
-                        }).then((started) => {
-                            if (!started && playlistLoadTokenRef.current === loadToken) {
-                                markPlaylistItemFailed(
-                                    safeIndex,
-                                    new Error("Playback could not start after this track loaded.")
-                                );
-                                loadNextPlayablePlaylistItem(safeIndex + 1, {
-                                    autoplay: true,
-                                    reason: "Loaded track could not start, so recovery is moving to the next item",
-                                    fromPlaybackEnded: Boolean(options.fromPlaybackEnded),
-                                    fromMediaSession: Boolean(options.fromMediaSession),
-                                    preserveUnlockedOutput: Boolean(options.preserveUnlockedOutput),
-                                    outputAlreadyRestarted: Boolean(options.outputAlreadyRestarted),
-                                    forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
-                                });
-                            }
                         });
                     }
-                }, startDelayMs);
+
+                    if (ensureStillCurrentLoad()) {
+                        setError(
+                            `Loaded "${item.title}", but the browser did not start its audio source. Press Play again after focusing the page.`
+                        );
+                    }
+
+                    return false;
+                }
+
+                // Confirm the live source, visible timer, duration, Redux state,
+                // and lock-screen position immediately instead of waiting for
+                // the first interval tick.
+                const liveDuration = Math.max(
+                    0,
+                    Number(audioBufferRef.current?.duration || decodedDuration || 0)
+                );
+                const livePosition = liveDuration > 0
+                    ? clamp(getCurrentOffset(), 0, liveDuration)
+                    : Math.max(0, getCurrentOffset());
+
+                mediaDurationRef.current = liveDuration;
+                setDuration((current) =>
+                    Math.abs(Number(current || 0) - liveDuration) < 0.001
+                        ? current
+                        : liveDuration
+                );
+                syncPlaybackPosition(livePosition, {
+                    forceMediaSession: true,
+                    forceSessionPersist: true,
+                });
+                updateMediaSessionState("playing", {
+                    forcePosition: true,
+                });
+
+                return true;
             }
 
             return true;
@@ -13319,6 +13423,8 @@ export default function Audio() {
             autoplay: true,
             reason: "Manual previous-track request",
             preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice(),
+            userInitiatedPlayback: true,
         });
     }
 
@@ -13343,6 +13449,8 @@ export default function Audio() {
             autoplay: true,
             reason: "Manual next-track request",
             preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice(),
+            userInitiatedPlayback: true,
         });
     }
 
@@ -13406,6 +13514,8 @@ export default function Audio() {
             autoplay: true,
             reason: "Starting playlist from track 1",
             preserveUnlockedOutput: isIOSAudioDevice(),
+            forceIPhoneOutputPostStart: isIOSAudioDevice(),
+            userInitiatedPlayback: true,
         });
     }
 
@@ -13454,6 +13564,8 @@ export default function Audio() {
             await loadPlaylistItem(currentIndex, true, {
                 reason: "Resume playlist by loading current item because no decoded buffer is available",
                 preserveUnlockedOutput: isIOSAudioDevice(),
+                forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                userInitiatedPlayback: true,
             });
             return;
         }
@@ -13841,9 +13953,25 @@ export default function Audio() {
             activeSourceRef.current = source;
             startedOffsetRef.current = safeOffset;
             committedPlaybackOffsetRef.current = safeOffset;
-            startedAtContextTimeRef.current = context.currentTime;
+            // AudioContext.currentTime may validly be exactly 0 on the first
+            // playlist start. Zero is therefore a real source-clock timestamp,
+            // not the paused/uninitialized sentinel while a source is active.
+            startedAtContextTimeRef.current = Math.max(
+                0,
+                numberOrDefault(context.currentTime, 0)
+            );
             mediaPositionRef.current = safeOffset;
             mediaDurationRef.current = Number(buffer.duration) || mediaDurationRef.current;
+            setDuration((current) =>
+                Math.abs(Number(current || 0) - Number(buffer.duration || 0)) < 0.001
+                    ? current
+                    : Number(buffer.duration || 0)
+            );
+            setPosition((current) =>
+                Math.abs(Number(current || 0) - safeOffset) < 0.001
+                    ? current
+                    : safeOffset
+            );
             currentEffectiveRateRef.current = getEffectivePlaybackRate(
                 latestSettingsRef.current
             );
@@ -13970,7 +14098,12 @@ export default function Audio() {
             activeSourceClockEpochRef.current = sourceClockEpoch;
             setPlayingState(true);
             updateMediaSessionMetadata();
+            syncPlaybackPosition(safeOffset, {
+                forceMediaSession: true,
+                forceSessionPersist: true,
+            });
             updateMediaSessionState("playing", { forcePosition: true });
+            lastPositionTimerTickAtRef.current = Date.now();
             startPositionTimer();
             startVisualizer();
 
@@ -16278,7 +16411,18 @@ export default function Audio() {
                                                                     }
                                                                 }
 
-                                                                loadPlaylistItem(index, true);
+                                                                const primed = await primeIPhonePlaylistOutputFromGesture();
+
+                                                                if (!primed) {
+                                                                    return;
+                                                                }
+
+                                                                await loadPlaylistItem(index, true, {
+                                                                    reason: "Playlist row Play button",
+                                                                    preserveUnlockedOutput: isIOSAudioDevice(),
+                                                                    forceIPhoneOutputPostStart: isIOSAudioDevice(),
+                                                                    userInitiatedPlayback: true,
+                                                                });
                                                             }}
                                                             disabled={isRendering || isLoading || isPreloadingPlaylist}
                                                             sx={{
