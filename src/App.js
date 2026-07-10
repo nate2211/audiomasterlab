@@ -6,7 +6,6 @@ import {
     Routes,
     useLocation,
 } from "react-router-dom";
-import { StaticRouter } from "react-router";
 import { Box, CssBaseline } from "@mui/material";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import { Helmet, HelmetProvider } from "react-helmet-async";
@@ -548,46 +547,44 @@ const theme = createTheme({
 });
 
 /**
- * SSR-capable application root.
+ * CRA + react-snap application root.
  *
- * Browser:
- *   <App />
+ * react-snap opens the production CRA build in a real headless browser, visits
+ * each configured route, and stores the populated DOM as static HTML.
  *
- * Server:
- *   <App
- *       url={new URL(request.url).pathname + new URL(request.url).search}
- *       helmetContext={helmetContext}
- *       store={requestScopedStore}
- *   />
- *
- * IMPORTANT:
- * For production SSR, pass a newly-created Redux store for every request.
- * Reusing the imported audioStore on the server can leak state between users.
+ * This is build-time prerendering/SSG, not request-time SSR. BrowserRouter is
+ * correct here because both the snap crawl and the deployed application run
+ * in a browser.
  */
+function isReactSnapRun() {
+    return (
+        typeof navigator !== "undefined" &&
+        navigator.userAgent.includes("ReactSnap")
+    );
+}
+
 export default function App({
-                                url = "/",
                                 helmetContext,
                                 store = audioStore,
                             }) {
-    const isBrowser = typeof window !== "undefined";
-
-    const router = isBrowser ? (
-        <BrowserRouter>
-            <AppRoutes />
-        </BrowserRouter>
-    ) : (
-        <StaticRouter location={url}>
-            <AppRoutes />
-        </StaticRouter>
-    );
+    const reactSnapRun = isReactSnapRun();
 
     return (
         <Provider store={store}>
             <HelmetProvider context={helmetContext}>
                 <ThemeProvider theme={theme}>
                     <CssBaseline />
-                    {isBrowser ? <PwaRegistration /> : null}
-                    {router}
+
+                    {/*
+                     * Do not install/control a service worker inside the
+                     * temporary ReactSnap Chromium session. Service-worker
+                     * caching can make later routes snapshot the wrong shell.
+                     */}
+                    {!reactSnapRun ? <PwaRegistration /> : null}
+
+                    <BrowserRouter>
+                        <AppRoutes />
+                    </BrowserRouter>
                 </ThemeProvider>
             </HelmetProvider>
         </Provider>
