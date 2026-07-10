@@ -8,18 +8,30 @@ import reportWebVitals from "./reportWebVitals";
 const rootElement = document.getElementById("root");
 
 if (!rootElement) {
-    throw new Error('AudioMaster Lab could not find the "#root" element.');
+    throw new Error(
+        'AudioMaster Lab could not start because <div id="root"></div> is missing.'
+    );
 }
 
 const application = <App />;
 
 /*
- * During the react-snap build, CRA initially loads an empty root, so createRoot
- * renders the page. After deployment, each generated route already contains
- * React HTML, so hydrateRoot attaches events without replacing that HTML.
+ * During react-snap:
+ *   public/index.html has an empty root, so createRoot renders the page.
+ *
+ * After deployment:
+ *   react-snap has populated the root with static HTML, so hydrateRoot
+ *   preserves that HTML and attaches React functionality to it.
  */
 if (rootElement.hasChildNodes()) {
-    hydrateRoot(rootElement, application);
+    hydrateRoot(rootElement, application, {
+        onRecoverableError(error) {
+            console.warn(
+                "AudioMaster Lab recovered from a hydration mismatch:",
+                error
+            );
+        },
+    });
 } else {
     createRoot(rootElement).render(application);
 }
