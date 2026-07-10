@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useEffect, useMemo } from "react";
+import React, { Suspense, useEffect, useMemo } from "react";
 import {
     BrowserRouter,
     Navigate,
@@ -6,6 +6,7 @@ import {
     Routes,
     useLocation,
 } from "react-router-dom";
+import { StaticRouter } from "react-router";
 import { Box, CssBaseline } from "@mui/material";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 import { Helmet, HelmetProvider } from "react-helmet-async";
@@ -13,7 +14,6 @@ import { Provider } from "react-redux";
 
 import { audioStore } from "./store/audioStore.js";
 import { audioPlayerActions } from "./store/audioPlayerSlice.js";
-import { registerAudioServiceWorker } from "./pwa/registerAudioServiceWorker.js";
 
 import YoutubePage from "./pages/Youtube.js";
 import { NavBar } from "./components/Components.js";
@@ -21,9 +21,11 @@ import Home from "./pages/Home.js";
 import Audio from "./pages/Audio.js";
 import Editor from "./pages/Editor.js";
 import Recorder from "./pages/Recorder.js";
-import ArchiveAudioBrowser from "./pages/Archive";
-import Community from "./pages/Community";
+import ArchiveAudioBrowser from "./pages/Archive.js";
+import Community from "./pages/Community.js";
 import NewsPage from "./pages/News.js";
+import Transcribe from "./pages/Transcribe.js";
+import Visualizer from "./pages/Visualizer.js";
 import {
     Help,
     About,
@@ -32,9 +34,6 @@ import {
     Terms,
     Copyright,
 } from "./pages/PolicyPages.js";
-
-const Transcripe = lazy(() => import("./pages/./Transcribe"));
-const Visualizer = lazy(() => import("./pages/Visualizer.js"));
 
 const SITE_NAME = "AudioMaster Lab";
 const SITE_URL = "https://audiomasterlab.com";
@@ -104,6 +103,13 @@ const ROUTE_SEO = {
         keywords:
             "Archive.org audio browser, public domain audio, Creative Commons audio, direct media links, Archive.org playlist",
     },
+    "/community": {
+        title: "Community",
+        description:
+            "Browse and share AudioMaster Lab community posts, tracks, projects, and browser-audio discoveries.",
+        keywords:
+            "AudioMaster Lab community, music community, shared tracks, browser audio projects",
+    },
     "/help": {
         title: "Help",
         description:
@@ -149,39 +155,33 @@ const ROUTE_SEO = {
 };
 
 function normalizePathname(pathname) {
-    if (!pathname || pathname === "/") return "/";
-
-    const withoutTrailingSlash = pathname.replace(/\/+$/, "");
-
-    if (withoutTrailingSlash === "/transcripe") {
-        return "/transcribe";
+    if (!pathname || pathname === "/") {
+        return "/";
     }
 
-    return withoutTrailingSlash || "/";
+    const normalized = pathname.replace(/\/+$/, "") || "/";
+
+    return normalized === "/transcripe" ? "/transcribe" : normalized;
 }
 
 function canonicalForPath(pathname) {
     const cleanPath = normalizePathname(pathname);
-
-    if (cleanPath === "/") {
-        return `${SITE_URL}/`;
-    }
-
-    return `${SITE_URL}${cleanPath}`;
+    return cleanPath === "/" ? `${SITE_URL}/` : `${SITE_URL}${cleanPath}`;
 }
 
 function getSeoForPath(pathname) {
-    const cleanPath = normalizePathname(pathname);
+    const path = normalizePathname(pathname);
+    const fallback = ROUTE_SEO["/"];
 
     return {
-        path: cleanPath,
-        url: canonicalForPath(cleanPath),
-        ...(ROUTE_SEO[cleanPath] || ROUTE_SEO["/"]),
+        path,
+        url: canonicalForPath(path),
+        ...(ROUTE_SEO[path] || fallback),
     };
 }
 
 function buildBreadcrumbJsonLd(seo) {
-    const items = [
+    const itemListElement = [
         {
             "@type": "ListItem",
             position: 1,
@@ -191,7 +191,7 @@ function buildBreadcrumbJsonLd(seo) {
     ];
 
     if (seo.path !== "/") {
-        items.push({
+        itemListElement.push({
             "@type": "ListItem",
             position: 2,
             name: seo.title,
@@ -202,7 +202,7 @@ function buildBreadcrumbJsonLd(seo) {
     return {
         "@context": "https://schema.org",
         "@type": "BreadcrumbList",
-        itemListElement: items,
+        itemListElement,
     };
 }
 
@@ -244,7 +244,7 @@ function buildSoftwareJsonLd() {
             "3D audio visualization",
             "Music news feeds",
             "New release preview cards",
-            "YouTube, Spotify, and SoundCloud oEmbed previews",
+            "YouTube, Spotify, and SoundCloud previews",
         ],
         sameAs: [
             "https://suiteofficelab.com/",
@@ -277,23 +277,23 @@ function buildWebsiteJsonLd() {
 
 function RouteSeo() {
     const location = useLocation();
-
-    const seo = useMemo(() => getSeoForPath(location.pathname), [location.pathname]);
-
-    const pageTitle =
-        seo.path === "/"
-            ? `${seo.title} | ${SITE_NAME}`
-            : `${seo.title} | ${SITE_NAME}`;
+    const seo = useMemo(
+        () => getSeoForPath(location.pathname),
+        [location.pathname]
+    );
+    const pageTitle = `${seo.title} | ${SITE_NAME}`;
 
     return (
         <Helmet>
             <html lang="en" />
-
             <title>{pageTitle}</title>
 
             <meta name="description" content={seo.description} />
             <meta name="keywords" content={seo.keywords} />
-            <meta name="robots" content="index, follow, max-image-preview:large" />
+            <meta
+                name="robots"
+                content="index, follow, max-image-preview:large"
+            />
             <meta name="theme-color" content="#070a13" />
             <meta name="application-name" content={SITE_NAME} />
 
@@ -318,11 +318,9 @@ function RouteSeo() {
             <script type="application/ld+json">
                 {JSON.stringify(buildWebsiteJsonLd())}
             </script>
-
             <script type="application/ld+json">
                 {JSON.stringify(buildSoftwareJsonLd())}
             </script>
-
             <script type="application/ld+json">
                 {JSON.stringify(buildBreadcrumbJsonLd(seo))}
             </script>
@@ -347,6 +345,179 @@ function PageLoadingFallback() {
             Loading AudioMaster Lab page...
         </Box>
     );
+}
+
+function NotFoundRedirect() {
+    /*
+     * On the server, Navigate cannot perform an HTTP redirect itself.
+     * Your SSR request handler should return a real 404 or 302 before rendering
+     * unknown paths. This remains useful for client-side navigation.
+     */
+    return <Navigate to="/" replace />;
+}
+
+function AppRoutes() {
+    return (
+        <>
+            <RouteSeo />
+
+            <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
+                <NavBar />
+
+                <Suspense fallback={<PageLoadingFallback />}>
+                    <Routes>
+                        <Route path="/" element={<Home />} />
+                        <Route path="/audio" element={<Audio />} />
+                        <Route path="/recorder" element={<Recorder />} />
+                        <Route path="/editor" element={<Editor />} />
+                        <Route path="/youtube" element={<YoutubePage />} />
+                        <Route path="/news" element={<NewsPage />} />
+                        <Route path="/transcribe" element={<Transcribe />} />
+                        <Route path="/transcripe" element={<Navigate to="/transcribe" replace />} />
+                        <Route path="/community" element={<Community />} />
+                        <Route path="/visualizer" element={<Visualizer />} />
+                        <Route path="/archive" element={<ArchiveAudioBrowser />} />
+
+                        <Route path="/help" element={<Help />} />
+                        <Route path="/about" element={<About />} />
+                        <Route path="/contact" element={<Contact />} />
+                        <Route path="/privacy" element={<Privacy />} />
+                        <Route path="/terms" element={<Terms />} />
+                        <Route path="/copyright" element={<Copyright />} />
+
+                        <Route path="*" element={<NotFoundRedirect />} />
+                    </Routes>
+                </Suspense>
+            </Box>
+        </>
+    );
+}
+
+function PwaRegistration() {
+    useEffect(() => {
+        let registrationController;
+        let cancelled = false;
+
+        async function register() {
+            try {
+                const { registerAudioServiceWorker } = await import(
+                    "./pwa/registerAudioServiceWorker.js"
+                    );
+
+                if (cancelled) {
+                    return;
+                }
+
+                registrationController = registerAudioServiceWorker({
+                    onRegistered: () => {
+                        audioStore.dispatch(
+                            audioPlayerActions.setPwaStatus({
+                                serviceWorkerSupported: true,
+                                serviceWorkerRegistered: true,
+                                serviceWorkerReady: false,
+                                offlineReady: false,
+                                updateAvailable: false,
+                                lastMessage:
+                                    "AudioMaster Lab service worker registered.",
+                            })
+                        );
+                    },
+                    onReady: () => {
+                        audioStore.dispatch(
+                            audioPlayerActions.setPwaStatus({
+                                serviceWorkerSupported: true,
+                                serviceWorkerRegistered: true,
+                                serviceWorkerReady: true,
+                                offlineReady: false,
+                                updateAvailable: false,
+                                lastMessage:
+                                    "AudioMaster Lab is ready for app-shell caching.",
+                            })
+                        );
+                    },
+                    onOfflineReady: () => {
+                        audioStore.dispatch(
+                            audioPlayerActions.setPwaStatus({
+                                serviceWorkerSupported: true,
+                                serviceWorkerRegistered: true,
+                                serviceWorkerReady: true,
+                                offlineReady: true,
+                                updateAvailable: false,
+                                lastMessage:
+                                    "AudioMaster Lab app shell is ready offline.",
+                            })
+                        );
+                    },
+                    onNeedRefresh: ({ updateServiceWorker } = {}) => {
+                        audioStore.dispatch(
+                            audioPlayerActions.markPwaUpdateReady({
+                                updateServiceWorkerAvailable:
+                                    Boolean(updateServiceWorker),
+                                lastMessage:
+                                    "A fresh AudioMaster Lab version is ready.",
+                            })
+                        );
+                    },
+                    onControlling: () => {
+                        audioStore.dispatch(
+                            audioPlayerActions.setPwaStatus({
+                                serviceWorkerSupported: true,
+                                serviceWorkerRegistered: true,
+                                serviceWorkerReady: true,
+                                offlineReady: true,
+                                updateAvailable: false,
+                                lastMessage:
+                                    "AudioMaster Lab is now controlled by the updated service worker.",
+                            })
+                        );
+                    },
+                    onError: (error) => {
+                        audioStore.dispatch(
+                            audioPlayerActions.setPwaStatus({
+                                serviceWorkerSupported:
+                                    typeof navigator !== "undefined" &&
+                                    "serviceWorker" in navigator,
+                                serviceWorkerRegistered: false,
+                                serviceWorkerReady: false,
+                                offlineReady: false,
+                                updateAvailable: false,
+                                lastMessage:
+                                    error?.message ||
+                                    "Service worker registration failed.",
+                            })
+                        );
+                    },
+                });
+            } catch (error) {
+                audioStore.dispatch(
+                    audioPlayerActions.setPwaStatus({
+                        serviceWorkerSupported:
+                            typeof navigator !== "undefined" &&
+                            "serviceWorker" in navigator,
+                        serviceWorkerRegistered: false,
+                        serviceWorkerReady: false,
+                        offlineReady: false,
+                        updateAvailable: false,
+                        lastMessage:
+                            error?.message ||
+                            "Service worker module could not be loaded.",
+                    })
+                );
+            }
+        }
+
+        register();
+
+        return () => {
+            cancelled = true;
+
+            if (registrationController?.destroy) {
+                registrationController.destroy();
+            }
+        };
+    }, []);
+
+    return null;
 }
 
 const theme = createTheme({
@@ -376,125 +547,47 @@ const theme = createTheme({
     },
 });
 
-export default function App() {
-    useEffect(() => {
-        const registrationController = registerAudioServiceWorker({
-            onRegistered: () => {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported: true,
-                        serviceWorkerRegistered: true,
-                        serviceWorkerReady: false,
-                        offlineReady: false,
-                        updateAvailable: false,
-                        lastMessage: "AudioMaster Lab service worker registered.",
-                    })
-                );
-            },
-            onReady: () => {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported: true,
-                        serviceWorkerRegistered: true,
-                        serviceWorkerReady: true,
-                        offlineReady: false,
-                        updateAvailable: false,
-                        lastMessage: "AudioMaster Lab is ready for app-shell caching.",
-                    })
-                );
-            },
-            onOfflineReady: () => {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported: true,
-                        serviceWorkerRegistered: true,
-                        serviceWorkerReady: true,
-                        offlineReady: true,
-                        updateAvailable: false,
-                        lastMessage: "AudioMaster Lab app shell is ready offline.",
-                    })
-                );
-            },
-            onNeedRefresh: ({ updateServiceWorker } = {}) => {
-                audioStore.dispatch(
-                    audioPlayerActions.markPwaUpdateReady({
-                        updateServiceWorkerAvailable: Boolean(updateServiceWorker),
-                        lastMessage: "A fresh AudioMaster Lab version is ready.",
-                    })
-                );
-            },
-            onControlling: () => {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported: true,
-                        serviceWorkerRegistered: true,
-                        serviceWorkerReady: true,
-                        offlineReady: true,
-                        updateAvailable: false,
-                        lastMessage:
-                            "AudioMaster Lab is now controlled by the updated service worker.",
-                    })
-                );
-            },
-            onError: (error) => {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported: "serviceWorker" in navigator,
-                        serviceWorkerRegistered: false,
-                        serviceWorkerReady: false,
-                        offlineReady: false,
-                        updateAvailable: false,
-                        lastMessage:
-                            error?.message || "Service worker registration failed.",
-                    })
-                );
-            },
-        });
+/**
+ * SSR-capable application root.
+ *
+ * Browser:
+ *   <App />
+ *
+ * Server:
+ *   <App
+ *       url={new URL(request.url).pathname + new URL(request.url).search}
+ *       helmetContext={helmetContext}
+ *       store={requestScopedStore}
+ *   />
+ *
+ * IMPORTANT:
+ * For production SSR, pass a newly-created Redux store for every request.
+ * Reusing the imported audioStore on the server can leak state between users.
+ */
+export default function App({
+                                url = "/",
+                                helmetContext,
+                                store = audioStore,
+                            }) {
+    const isBrowser = typeof window !== "undefined";
 
-        return () => {
-            if (registrationController?.destroy) {
-                registrationController.destroy();
-            }
-        };
-    }, []);
+    const router = isBrowser ? (
+        <BrowserRouter>
+            <AppRoutes />
+        </BrowserRouter>
+    ) : (
+        <StaticRouter location={url}>
+            <AppRoutes />
+        </StaticRouter>
+    );
 
     return (
-        <Provider store={audioStore}>
-            <HelmetProvider>
+        <Provider store={store}>
+            <HelmetProvider context={helmetContext}>
                 <ThemeProvider theme={theme}>
                     <CssBaseline />
-
-                    <BrowserRouter>
-                        <RouteSeo />
-
-                        <Box sx={{ minHeight: "100vh", background: "#070a13" }}>
-                            <NavBar />
-
-                            <Suspense fallback={<PageLoadingFallback />}>
-                                <Routes>
-                                    <Route path="/" element={<Home />} />
-                                    <Route path="/audio" element={<Audio />} />
-                                    <Route path="/recorder" element={<Recorder />} />
-                                    <Route path="/editor" element={<Editor />} />
-                                    <Route path="/youtube" element={<YoutubePage />} />
-                                    <Route path="/news" element={<NewsPage />} />
-                                    <Route path="/transcribe" element={<Transcripe />} />
-                                    <Route path="/community" element={<Community />} />
-                                    <Route path="/visualizer" element={<Visualizer />} />
-                                    <Route path="/archive" element={<ArchiveAudioBrowser />} />
-
-                                    <Route path="/help" element={<Help />} />
-                                    <Route path="/about" element={<About />} />
-                                    <Route path="/contact" element={<Contact />} />
-                                    <Route path="/privacy" element={<Privacy />} />
-                                    <Route path="/terms" element={<Terms />} />
-                                    <Route path="/copyright" element={<Copyright />} />
-
-                                    <Route path="*" element={<Navigate to="/" replace />} />
-                                </Routes>
-                            </Suspense>
-                        </Box>
-                    </BrowserRouter>
+                    {isBrowser ? <PwaRegistration /> : null}
+                    {router}
                 </ThemeProvider>
             </HelmetProvider>
         </Provider>
