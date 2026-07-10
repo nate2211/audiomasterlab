@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
     Box,
     Button,
@@ -9,7 +9,6 @@ import {
     LinearProgress,
     MenuItem,
     Select,
-    Slider,
     Stack,
     TextField,
     Typography,
@@ -50,6 +49,11 @@ import {
     getCachedPlayableUrlForItem,
     releaseCachedPlayableUrl,
 } from "../storage/AudioDexie.js";
+import {
+    MediaChromeButton,
+    MediaTimeRange,
+    MediaVolumeRange,
+} from "media-chrome/react";
 
 const DEFAULT_SETTINGS = {
     baseVolume: 1,
@@ -599,6 +603,176 @@ const COMMUNITY_LISTENING_SESSION_STORAGE_KEY =
 const COMMUNITY_LISTENING_USER_NAME_STORAGE_KEY =
     "audiomasterlab.community.userName.v1";
 const COMMUNITY_LISTENING_HEARTBEAT_INTERVAL_MS = 45000;
+
+
+// A tab-scoped runtime session is separate from the durable Dexie/localStorage
+// snapshot. It protects the live player from stale blur/focus callbacks, delayed
+// browser timers, and old Media Chrome seek gestures after a tab wakes up.
+const PLAYER_RUNTIME_SESSION_STORAGE_KEY =
+    "audiomasterlab.audio.runtimePlayerSession.v1";
+const PLAYER_RUNTIME_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PLAYER_RUNTIME_SESSION_PERSIST_THROTTLE_MS = 550;
+// Keep the tab-scoped player session fresh while audio is actively advancing.
+// This heartbeat is intentionally separate from the 80 ms visual timer so a
+// throttled or briefly unfocused page still has a recent authoritative offset.
+const PLAYER_RUNTIME_SESSION_HEARTBEAT_MS = 900;
+const PLAYER_RUNTIME_SESSION_HEARTBEAT_STALE_MS = 3200;
+
+function createRuntimePlayerSessionId() {
+    if (
+        typeof crypto !== "undefined" &&
+        typeof crypto.randomUUID === "function"
+    ) {
+        return crypto.randomUUID();
+    }
+
+    return `audio-session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function createDefaultRuntimePlayerSession(existingId = "") {
+    const now = Date.now();
+
+    return {
+        id: existingId || createRuntimePlayerSessionId(),
+        revision: 0,
+        focusEpoch: 0,
+        actionEpoch: 0,
+        playbackClockEpoch: 0,
+        heartbeatAt: now,
+        lastCommittedSeekAt: 0,
+        lastCommittedSeekPosition: 0,
+        lastCommittedSeekDirection: "none",
+        lifecycle: "active",
+        wasPlaying: false,
+        explicitlyPaused: true,
+        position: 0,
+        duration: 0,
+        sourceKind: "",
+        sourceUrl: "",
+        mediaTitle: "",
+        scrub: {
+            active: false,
+            gestureSerial: 0,
+            position: 0,
+            resumeAfterScrub: false,
+            startedAt: 0,
+            updatedAt: 0,
+            mediaChromeSeekId: 0,
+            mediaChromeOwnerSessionId: "",
+        },
+        createdAt: now,
+        updatedAt: now,
+        lastReason: "runtime player session created",
+    };
+}
+
+function readOrCreateRuntimePlayerSession() {
+    if (typeof window === "undefined" || !window.sessionStorage) {
+        return createDefaultRuntimePlayerSession();
+    }
+
+    try {
+        const raw = window.sessionStorage.getItem(
+            PLAYER_RUNTIME_SESSION_STORAGE_KEY
+        );
+        const parsed = raw ? JSON.parse(raw) : null;
+        const now = Date.now();
+        const updatedAt = Number(parsed?.updatedAt || 0);
+        const isFresh =
+            parsed?.id &&
+            updatedAt > 0 &&
+            now - updatedAt <= PLAYER_RUNTIME_SESSION_MAX_AGE_MS;
+
+        if (!isFresh) {
+            const freshSession = createDefaultRuntimePlayerSession();
+            window.sessionStorage.setItem(
+                PLAYER_RUNTIME_SESSION_STORAGE_KEY,
+                JSON.stringify(freshSession)
+            );
+            return freshSession;
+        }
+
+        const session = {
+            ...createDefaultRuntimePlayerSession(String(parsed.id)),
+            ...parsed,
+            id: String(parsed.id),
+            revision: Math.max(0, Number(parsed.revision || 0)),
+            focusEpoch: Math.max(0, Number(parsed.focusEpoch || 0)),
+            actionEpoch: Math.max(0, Number(parsed.actionEpoch || 0)),
+            playbackClockEpoch: Math.max(
+                0,
+                Number(parsed.playbackClockEpoch || 0)
+            ),
+            heartbeatAt: Math.max(
+                0,
+                Number(parsed.heartbeatAt || parsed.updatedAt || now)
+            ),
+            lastCommittedSeekAt: Math.max(
+                0,
+                Number(parsed.lastCommittedSeekAt || 0)
+            ),
+            lastCommittedSeekPosition: Math.max(
+                0,
+                numberOrDefault(
+                    parsed.lastCommittedSeekPosition,
+                    parsed.position || 0
+                )
+            ),
+            lastCommittedSeekDirection: String(
+                parsed.lastCommittedSeekDirection || "none"
+            ),
+            position: Math.max(0, numberOrDefault(parsed.position, 0)),
+            duration: Math.max(0, numberOrDefault(parsed.duration, 0)),
+            scrub: {
+                ...createDefaultRuntimePlayerSession(String(parsed.id)).scrub,
+                ...(parsed.scrub || {}),
+                // A seek gesture cannot safely survive a page reload. The saved
+                // target remains available, but the new page starts unlocked.
+                active: false,
+                position: Math.max(
+                    0,
+                    numberOrDefault(
+                        parsed.scrub?.position,
+                        parsed.position || 0
+                    )
+                ),
+                resumeAfterScrub: false,
+            },
+            lifecycle: "active",
+            explicitlyPaused: !Boolean(parsed.wasPlaying),
+            updatedAt: now,
+            lastReason: "runtime player session restored for this tab",
+        };
+
+        window.sessionStorage.setItem(
+            PLAYER_RUNTIME_SESSION_STORAGE_KEY,
+            JSON.stringify(session)
+        );
+        return session;
+    } catch {
+        return createDefaultRuntimePlayerSession();
+    }
+}
+
+function persistRuntimePlayerSession(session) {
+    if (
+        !session ||
+        typeof window === "undefined" ||
+        !window.sessionStorage
+    ) {
+        return false;
+    }
+
+    try {
+        window.sessionStorage.setItem(
+            PLAYER_RUNTIME_SESSION_STORAGE_KEY,
+            JSON.stringify(session)
+        );
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 function isArchiveMediaHost(hostname = "") {
     const host = String(hostname || "").toLowerCase();
@@ -3898,6 +4072,816 @@ function StoragePersistencePanel({ storageInfo, onClearSavedSession }) {
     );
 }
 
+
+
+function LegacyMediaChromeButton({
+                                     label,
+                                     icon,
+                                     variant = "outlined",
+                                     active = false,
+                                     disabled = false,
+                                     onClick,
+                                     ariaLabel,
+                                     paddingY,
+                                 }) {
+    const resolvedVariant = active ? "contained" : variant;
+    const isContained = resolvedVariant === "contained";
+    const isText = resolvedVariant === "text";
+
+    return (
+        <Button
+            component={MediaChromeButton}
+            fullWidth
+            size={isText ? "medium" : "large"}
+            variant={resolvedVariant}
+            startIcon={icon || undefined}
+            disabled={disabled}
+            aria-label={ariaLabel || label}
+            title={ariaLabel || label}
+            onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!disabled) {
+                    onClick?.(event);
+                }
+            }}
+            sx={
+                isText
+                    ? {
+                        color: "rgba(255,255,255,0.72)",
+                        fontWeight: 900,
+                        textTransform: "none",
+                        "--media-control-background": "transparent",
+                        "--media-control-hover-background": "transparent",
+                        "--media-control-padding": "0px",
+                    }
+                    : {
+                        borderRadius: 4,
+                        py: paddingY ?? 1.35,
+                        color: isContained ? "#06111e" : "#fff",
+                        borderColor: "rgba(255,255,255,0.18)",
+                        fontWeight: 950,
+                        textTransform: "none",
+                        background: isContained
+                            ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                            : "transparent",
+                        "&:hover": {
+                            borderColor: isContained
+                                ? "rgba(255,255,255,0.18)"
+                                : "rgba(255,255,255,0.34)",
+                            background: isContained
+                                ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                                : "rgba(255,255,255,0.07)",
+                        },
+                        "--media-control-background": "transparent",
+                        "--media-control-hover-background": "transparent",
+                        "--media-control-padding": "0px",
+                    }
+            }
+        >
+            {label}
+        </Button>
+    );
+}
+
+function LegacyMediaChromeTimeRange({
+                                        currentTime,
+                                        duration,
+                                        playbackRate = 1,
+                                        isPlaying,
+                                        disabled,
+                                        sessionId,
+                                        onSeekStart,
+                                        onSeekChange,
+                                        onSeekCommit,
+                                    }) {
+    const rangeRef = useRef(null);
+    const latestRef = useRef(null);
+    const optimisticTimeRef = useRef(0);
+    const awaitingParentSyncRef = useRef(null);
+    const parentSyncTimerRef = useRef(null);
+    const lastOwnerSessionIdRef = useRef(String(sessionId || ""));
+    const [optimisticTime, setOptimisticTimeState] = useState(0);
+    const [seeking, setSeeking] = useState(false);
+    const seekSessionRef = useRef({
+        id: 0,
+        ownerSessionId: "",
+        active: false,
+        committed: false,
+        pointerId: null,
+        latestValue: 0,
+        resumeAfterSeek: false,
+        startedAt: 0,
+        lastRequestAt: 0,
+    });
+    const queuedValueRef = useRef(null);
+    const changeFrameRef = useRef(null);
+    const commitTimerRef = useRef(null);
+
+    const safeDuration = Math.max(0, numberOrDefault(duration, 0));
+    const safeCurrentTime = safeDuration > 0
+        ? clamp(numberOrDefault(currentTime, 0), 0, safeDuration)
+        : 0;
+
+    function setOptimisticTime(nextValue) {
+        // Event listeners are installed once, so read the newest duration from
+        // latestRef instead of closing over the first render's duration.
+        const liveDuration = Math.max(
+            0,
+            numberOrDefault(latestRef.current?.duration, safeDuration)
+        );
+        const next = liveDuration > 0
+            ? clamp(numberOrDefault(nextValue, 0), 0, liveDuration)
+            : 0;
+
+        optimisticTimeRef.current = next;
+        setOptimisticTimeState((current) =>
+            Math.abs(Number(current || 0) - next) < 0.005 ? current : next
+        );
+        return next;
+    }
+
+    latestRef.current = {
+        disabled: Boolean(disabled),
+        duration: safeDuration,
+        currentTime: safeCurrentTime,
+        isPlaying: Boolean(isPlaying),
+        playbackRate: Math.max(0.0625, numberOrDefault(playbackRate, 1)),
+        sessionId: String(sessionId || ""),
+        onSeekStart,
+        onSeekChange,
+        onSeekCommit,
+    };
+
+    useEffect(() => {
+        const ownerSessionId = String(sessionId || "");
+        const ownerChanged = lastOwnerSessionIdRef.current !== ownerSessionId;
+
+        if (ownerChanged) {
+            lastOwnerSessionIdRef.current = ownerSessionId;
+            seekSessionRef.current.active = false;
+            seekSessionRef.current.committed = false;
+            seekSessionRef.current.ownerSessionId = ownerSessionId;
+            awaitingParentSyncRef.current = null;
+            setSeeking(false);
+        }
+
+        if (safeDuration <= 0) {
+            awaitingParentSyncRef.current = null;
+            setOptimisticTime(0);
+            return;
+        }
+
+        if (seekSessionRef.current.active) {
+            return;
+        }
+
+        const pendingSync = awaitingParentSyncRef.current;
+        if (pendingSync) {
+            const parentCaughtUp =
+                Math.abs(safeCurrentTime - pendingSync.value) <= 0.08;
+            const expired = Date.now() >= pendingSync.expiresAt;
+
+            if (!parentCaughtUp && !expired) {
+                setOptimisticTime(pendingSync.value);
+                return;
+            }
+
+            awaitingParentSyncRef.current = null;
+        }
+
+        setOptimisticTime(safeCurrentTime);
+    }, [safeCurrentTime, safeDuration, sessionId]);
+
+    useEffect(() => {
+        const range = rangeRef.current;
+        if (!range) return undefined;
+
+        function clearCommitTimer() {
+            if (commitTimerRef.current) {
+                window.clearTimeout(commitTimerRef.current);
+                commitTimerRef.current = null;
+            }
+        }
+
+        function clearParentSyncTimer() {
+            if (parentSyncTimerRef.current) {
+                window.clearTimeout(parentSyncTimerRef.current);
+                parentSyncTimerRef.current = null;
+            }
+        }
+
+        function clearChangeFrame() {
+            if (changeFrameRef.current) {
+                window.cancelAnimationFrame(changeFrameRef.current);
+                changeFrameRef.current = null;
+            }
+        }
+
+        function readRequestedTime(event) {
+            const detail = event?.detail;
+            const candidates = [
+                detail,
+                detail?.seekTime,
+                detail?.currentTime,
+                detail?.value,
+                event?.target?.mediaCurrentTime,
+                event?.target?.value,
+            ];
+
+            for (const candidate of candidates) {
+                const numeric = Number(candidate);
+                if (Number.isFinite(numeric)) {
+                    return numeric;
+                }
+            }
+
+            return NaN;
+        }
+
+        function readPointerTime(event) {
+            const latest = latestRef.current;
+            const clientX = Number(event?.clientX);
+
+            if (
+                !latest ||
+                latest.disabled ||
+                !latest.duration ||
+                !Number.isFinite(clientX)
+            ) {
+                return NaN;
+            }
+
+            const bounds = range.getBoundingClientRect();
+
+            if (!bounds || !Number.isFinite(bounds.width) || bounds.width <= 0) {
+                return NaN;
+            }
+
+            const ratio = clamp((clientX - bounds.left) / bounds.width, 0, 1);
+            return ratio * latest.duration;
+        }
+
+        function beginSeek(reason, event) {
+            const latest = latestRef.current;
+            if (!latest || latest.disabled || !latest.duration) return null;
+
+            clearParentSyncTimer();
+            awaitingParentSyncRef.current = null;
+
+            const currentSession = seekSessionRef.current;
+            const ownerChanged =
+                currentSession.ownerSessionId !== latest.sessionId;
+
+            if (!currentSession.active || ownerChanged) {
+                currentSession.id += 1;
+                currentSession.ownerSessionId = latest.sessionId;
+                currentSession.active = true;
+                currentSession.committed = false;
+                currentSession.pointerId = Number.isFinite(event?.pointerId)
+                    ? event.pointerId
+                    : null;
+                currentSession.latestValue = setOptimisticTime(
+                    clamp(
+                        numberOrDefault(latest.currentTime, 0),
+                        0,
+                        latest.duration
+                    )
+                );
+                currentSession.resumeAfterSeek = latest.isPlaying;
+                currentSession.startedAt = Date.now();
+                currentSession.lastRequestAt = Date.now();
+                setSeeking(true);
+
+                if (
+                    Number.isFinite(event?.pointerId) &&
+                    typeof range.setPointerCapture === "function"
+                ) {
+                    try {
+                        range.setPointerCapture(event.pointerId);
+                    } catch {
+                        // Pointer capture is optional and can fail on Safari.
+                    }
+                }
+
+                latest.onSeekStart?.({
+                    id: currentSession.id,
+                    ownerSessionId: currentSession.ownerSessionId,
+                    reason,
+                    resumeAfterSeek: currentSession.resumeAfterSeek,
+                    startedAt: currentSession.startedAt,
+                    initialTime: currentSession.latestValue,
+                    duration: latest.duration,
+                });
+            }
+
+            return currentSession;
+        }
+
+        function flushQueuedChange() {
+            changeFrameRef.current = null;
+            const latest = latestRef.current;
+            const currentSession = seekSessionRef.current;
+            const queuedValue = Number(queuedValueRef.current);
+            queuedValueRef.current = null;
+
+            if (
+                !latest ||
+                latest.disabled ||
+                !currentSession.active ||
+                !Number.isFinite(queuedValue)
+            ) {
+                return;
+            }
+
+            const nextValue = setOptimisticTime(
+                clamp(queuedValue, 0, latest.duration || 0)
+            );
+            currentSession.latestValue = nextValue;
+            currentSession.lastRequestAt = Date.now();
+            latest.onSeekChange?.(nextValue, {
+                id: currentSession.id,
+                ownerSessionId: currentSession.ownerSessionId,
+                resumeAfterSeek: currentSession.resumeAfterSeek,
+                duration: latest.duration,
+            });
+        }
+
+        function queueSeekChange(nextValue) {
+            queuedValueRef.current = nextValue;
+            setOptimisticTime(nextValue);
+
+            if (!changeFrameRef.current) {
+                changeFrameRef.current = window.requestAnimationFrame(
+                    flushQueuedChange
+                );
+            }
+        }
+
+        function finishOptimisticParentSync(targetTime) {
+            clearParentSyncTimer();
+            const latest = latestRef.current;
+            const safeTarget = latest?.duration
+                ? clamp(numberOrDefault(targetTime, 0), 0, latest.duration)
+                : 0;
+
+            awaitingParentSyncRef.current = {
+                value: safeTarget,
+                expiresAt: Date.now() + 3000,
+            };
+            setOptimisticTime(safeTarget);
+            setSeeking(false);
+
+            parentSyncTimerRef.current = window.setTimeout(() => {
+                const pending = awaitingParentSyncRef.current;
+                if (!pending) return;
+
+                awaitingParentSyncRef.current = null;
+                const current = latestRef.current;
+                setOptimisticTime(current?.currentTime || 0);
+            }, 3050);
+        }
+
+        function commitSeek(reason) {
+            clearCommitTimer();
+            clearChangeFrame();
+            flushQueuedChange();
+
+            const latest = latestRef.current;
+            const currentSession = seekSessionRef.current;
+
+            if (
+                !latest ||
+                latest.disabled ||
+                !currentSession.active ||
+                currentSession.committed
+            ) {
+                currentSession.active = false;
+                setSeeking(false);
+                return;
+            }
+
+            currentSession.committed = true;
+            currentSession.active = false;
+
+            if (
+                Number.isFinite(currentSession.pointerId) &&
+                typeof range.releasePointerCapture === "function"
+            ) {
+                try {
+                    range.releasePointerCapture(currentSession.pointerId);
+                } catch {
+                    // The pointer may already have been released by the browser.
+                }
+            }
+
+            const committedTime = clamp(
+                numberOrDefault(currentSession.latestValue, 0),
+                0,
+                latest.duration || 0
+            );
+
+            finishOptimisticParentSync(committedTime);
+
+            latest.onSeekCommit?.(
+                committedTime,
+                reason,
+                {
+                    id: currentSession.id,
+                    ownerSessionId: currentSession.ownerSessionId,
+                    resumeAfterSeek: currentSession.resumeAfterSeek,
+                    startedAt: currentSession.startedAt,
+                    committedAt: Date.now(),
+                    duration: latest.duration,
+                }
+            );
+
+            currentSession.pointerId = null;
+        }
+
+        function scheduleCommit(reason, delay = 360) {
+            clearCommitTimer();
+            commitTimerRef.current = window.setTimeout(
+                () => commitSeek(reason),
+                delay
+            );
+        }
+
+        function handleSeekRequest(event) {
+            event.preventDefault?.();
+            event.stopPropagation();
+            const latest = latestRef.current;
+            const requested = readRequestedTime(event);
+
+            if (
+                !latest ||
+                latest.disabled ||
+                !latest.duration ||
+                !Number.isFinite(requested)
+            ) {
+                return;
+            }
+
+            const currentSession = beginSeek(
+                "Media Chrome seek request",
+                event
+            );
+            if (!currentSession) return;
+
+            const next = setOptimisticTime(
+                clamp(requested, 0, latest.duration)
+            );
+            currentSession.latestValue = next;
+            currentSession.lastRequestAt = Date.now();
+            queueSeekChange(next);
+            scheduleCommit("Media Chrome seek inactivity commit");
+        }
+
+        function handlePointerDown(event) {
+            const currentSession = beginSeek(
+                "Media Chrome pointer seek started",
+                event
+            );
+            const pointerTime = readPointerTime(event);
+
+            if (currentSession && Number.isFinite(pointerTime)) {
+                currentSession.latestValue = pointerTime;
+                currentSession.lastRequestAt = Date.now();
+                queueSeekChange(pointerTime);
+            }
+        }
+
+        function handlePointerMove(event) {
+            const currentSession = seekSessionRef.current;
+
+            if (!currentSession.active) {
+                return;
+            }
+
+            if (
+                Number.isFinite(currentSession.pointerId) &&
+                Number.isFinite(event?.pointerId) &&
+                currentSession.pointerId !== event.pointerId
+            ) {
+                return;
+            }
+
+            const pointerTime = readPointerTime(event);
+
+            if (Number.isFinite(pointerTime)) {
+                currentSession.latestValue = pointerTime;
+                currentSession.lastRequestAt = Date.now();
+                queueSeekChange(pointerTime);
+                scheduleCommit("Media Chrome pointer-move inactivity commit");
+            }
+        }
+
+        function handlePointerRelease(event) {
+            const currentSession = seekSessionRef.current;
+            if (
+                Number.isFinite(currentSession.pointerId) &&
+                Number.isFinite(event?.pointerId) &&
+                currentSession.pointerId !== event.pointerId
+            ) {
+                return;
+            }
+
+            const pointerTime = readPointerTime(event);
+            if (currentSession.active && Number.isFinite(pointerTime)) {
+                currentSession.latestValue = pointerTime;
+                currentSession.lastRequestAt = Date.now();
+                queueSeekChange(pointerTime);
+            }
+
+            commitSeek(`Media Chrome ${event?.type || "pointer"} seek released`);
+        }
+
+        function handleKeyDown(event) {
+            if (
+                [
+                    "ArrowLeft",
+                    "ArrowRight",
+                    "Home",
+                    "End",
+                    "PageDown",
+                    "PageUp",
+                ].includes(event.key)
+            ) {
+                beginSeek("Media Chrome keyboard seek started", event);
+            }
+        }
+
+        function handleKeyUp(event) {
+            if (
+                [
+                    "ArrowLeft",
+                    "ArrowRight",
+                    "Home",
+                    "End",
+                    "PageDown",
+                    "PageUp",
+                ].includes(event.key)
+            ) {
+                commitSeek("Media Chrome keyboard seek released");
+            }
+        }
+
+        function handleLifecycleRelease(event) {
+            const hidden =
+                event?.type === "pagehide" ||
+                event?.type === "freeze" ||
+                (event?.type === "visibilitychange" &&
+                    document.visibilityState !== "visible");
+
+            if (seekSessionRef.current.active) {
+                commitSeek(
+                    hidden
+                        ? `Media Chrome seek committed before ${event?.type || "background"}`
+                        : `Media Chrome seek released by ${event?.type || "lifecycle"}`
+                );
+            }
+        }
+
+        range.addEventListener("mediaseekrequest", handleSeekRequest);
+        range.addEventListener("pointerdown", handlePointerDown);
+        range.addEventListener("pointermove", handlePointerMove);
+        range.addEventListener("pointerup", handlePointerRelease);
+        range.addEventListener("pointercancel", handlePointerRelease);
+        range.addEventListener("lostpointercapture", handlePointerRelease);
+        range.addEventListener("keydown", handleKeyDown);
+        range.addEventListener("keyup", handleKeyUp);
+        range.addEventListener("blur", handleLifecycleRelease);
+        window.addEventListener("pointerup", handlePointerRelease, true);
+        window.addEventListener("pointercancel", handlePointerRelease, true);
+        window.addEventListener("mouseup", handlePointerRelease, true);
+        window.addEventListener("touchend", handlePointerRelease, true);
+        window.addEventListener("touchcancel", handlePointerRelease, true);
+        window.addEventListener("blur", handleLifecycleRelease, true);
+        window.addEventListener("pagehide", handleLifecycleRelease, true);
+        document.addEventListener(
+            "visibilitychange",
+            handleLifecycleRelease,
+            true
+        );
+        document.addEventListener("freeze", handleLifecycleRelease, true);
+
+        return () => {
+            clearCommitTimer();
+            clearParentSyncTimer();
+            clearChangeFrame();
+            seekSessionRef.current.active = false;
+            awaitingParentSyncRef.current = null;
+            range.removeEventListener("mediaseekrequest", handleSeekRequest);
+            range.removeEventListener("pointerdown", handlePointerDown);
+            range.removeEventListener("pointermove", handlePointerMove);
+            range.removeEventListener("pointerup", handlePointerRelease);
+            range.removeEventListener("pointercancel", handlePointerRelease);
+            range.removeEventListener(
+                "lostpointercapture",
+                handlePointerRelease
+            );
+            range.removeEventListener("keydown", handleKeyDown);
+            range.removeEventListener("keyup", handleKeyUp);
+            range.removeEventListener("blur", handleLifecycleRelease);
+            window.removeEventListener(
+                "pointerup",
+                handlePointerRelease,
+                true
+            );
+            window.removeEventListener(
+                "pointercancel",
+                handlePointerRelease,
+                true
+            );
+            window.removeEventListener("mouseup", handlePointerRelease, true);
+            window.removeEventListener("touchend", handlePointerRelease, true);
+            window.removeEventListener(
+                "touchcancel",
+                handlePointerRelease,
+                true
+            );
+            window.removeEventListener("blur", handleLifecycleRelease, true);
+            window.removeEventListener(
+                "pagehide",
+                handleLifecycleRelease,
+                true
+            );
+            document.removeEventListener(
+                "visibilitychange",
+                handleLifecycleRelease,
+                true
+            );
+            document.removeEventListener(
+                "freeze",
+                handleLifecycleRelease,
+                true
+            );
+        };
+    }, []);
+
+    const displayedTime = safeDuration > 0
+        ? clamp(numberOrDefault(optimisticTime, safeCurrentTime), 0, safeDuration)
+        : 0;
+
+    return (
+        <MediaTimeRange
+            ref={rangeRef}
+            mediaCurrentTime={displayedTime}
+            mediaDuration={safeDuration}
+            mediaSeekable={[0, safeDuration]}
+            mediaBuffered={safeDuration ? [[0, safeDuration]] : []}
+            mediaPaused={!isPlaying || seeking}
+            mediaPlaybackRate={Math.max(
+                0.0625,
+                numberOrDefault(playbackRate, 1)
+            )}
+            mediaLoading={false}
+            mediaEnded={Boolean(
+                safeDuration > 0 && displayedTime >= safeDuration - 0.015
+            )}
+            disabled={disabled}
+            aria-label="Seek through processed audio"
+            style={{
+                width: "100%",
+                minWidth: 0,
+                height: "42px",
+                touchAction: "none",
+                userSelect: "none",
+                background: "transparent",
+                color: "#67e8f9",
+                "--media-primary-color": "#67e8f9",
+                "--media-secondary-color": "rgba(255,255,255,0.18)",
+                "--media-control-height": "42px",
+                "--media-control-background": "transparent",
+                "--media-control-hover-background": "transparent",
+                "--media-control-padding": "0px",
+                "--media-range-padding": "0px",
+                "--media-range-track-height": "4px",
+                "--media-range-track-border-radius": "999px",
+                "--media-range-track-background":
+                    "rgba(255,255,255,0.18)",
+                "--media-range-bar-color": "#67e8f9",
+                "--media-range-thumb-background": "#67e8f9",
+                "--media-range-thumb-width": "20px",
+                "--media-range-thumb-height": "20px",
+                "--media-range-thumb-border-radius": "50%",
+                "--media-range-thumb-box-shadow":
+                    "0 0 0 8px rgba(103,232,249,0.08)",
+                "--media-time-range-buffered-color":
+                    "rgba(255,255,255,0.18)",
+                "--media-box-border-radius": "8px",
+                "--media-box-background": "rgba(7,10,19,0.94)",
+                "--media-box-padding-left": "8px",
+                "--media-box-padding-right": "8px",
+            }}
+        >
+            <span
+                slot="thumb"
+                style={{
+                    display: "block",
+                    width: 20,
+                    height: 20,
+                    borderRadius: "50%",
+                    background: "#67e8f9",
+                    boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
+                    pointerEvents: "none",
+                }}
+            />
+        </MediaTimeRange>
+    );
+}
+
+function LegacyMediaChromeVolumeRange({ value, max, disabled, onChange }) {
+    const rangeRef = useRef(null);
+    const latestRef = useRef(null);
+    const safeMax = Math.max(ZERO_VOLUME_EPSILON, numberOrDefault(max, 1));
+    const normalizedValue = clamp(numberOrDefault(value, 0) / safeMax, 0, 1);
+
+    latestRef.current = { disabled: Boolean(disabled), max: safeMax, onChange };
+
+    useEffect(() => {
+        const range = rangeRef.current;
+        if (!range) return undefined;
+
+        function handleVolumeRequest(event) {
+            event.stopPropagation();
+            const latest = latestRef.current;
+            const detail = event?.detail;
+            const requested = Number(
+                typeof detail === "object"
+                    ? detail?.volume ?? detail?.value
+                    : detail
+            );
+
+            if (
+                !latest ||
+                latest.disabled ||
+                !Number.isFinite(requested)
+            ) {
+                return;
+            }
+
+            latest.onChange?.(clamp(requested, 0, 1) * latest.max);
+        }
+
+        range.addEventListener("mediavolumerequest", handleVolumeRequest);
+        return () =>
+            range.removeEventListener(
+                "mediavolumerequest",
+                handleVolumeRequest
+            );
+    }, []);
+
+    return (
+        <MediaVolumeRange
+            ref={rangeRef}
+            mediaVolume={normalizedValue}
+            mediaMuted={normalizedValue <= ZERO_VOLUME_EPSILON}
+            disabled={disabled}
+            aria-label="Safe base volume"
+            style={{
+                width: "100%",
+                minWidth: 0,
+                height: "30px",
+                background: "transparent",
+                color: "#67e8f9",
+                "--media-primary-color": "#67e8f9",
+                "--media-secondary-color": "rgba(255,255,255,0.18)",
+                "--media-control-height": "30px",
+                "--media-control-background": "transparent",
+                "--media-control-hover-background": "transparent",
+                "--media-control-padding": "0px",
+                "--media-range-padding": "0px",
+                "--media-range-track-height": "4px",
+                "--media-range-track-border-radius": "999px",
+                "--media-range-track-background":
+                    "rgba(255,255,255,0.18)",
+                "--media-range-bar-color": "#67e8f9",
+                "--media-range-thumb-background": "#67e8f9",
+                "--media-range-thumb-width": "16px",
+                "--media-range-thumb-height": "16px",
+                "--media-range-thumb-border-radius": "50%",
+                "--media-range-thumb-box-shadow":
+                    "0 0 0 7px rgba(103,232,249,0.08)",
+            }}
+        >
+            <span
+                slot="thumb"
+                style={{
+                    display: "block",
+                    width: 16,
+                    height: 16,
+                    borderRadius: "50%",
+                    background: "#67e8f9",
+                    boxShadow: "0 0 0 7px rgba(103,232,249,0.08)",
+                    pointerEvents: "none",
+                }}
+            />
+        </MediaVolumeRange>
+    );
+}
+
+
 export default function Audio() {
     const objectUrlRef = useRef(null);
     const audioContextRef = useRef(null);
@@ -3939,6 +4923,37 @@ export default function Audio() {
         sourceUrl: "",
         title: "",
     });
+
+    const playerSessionRef = useRef(null);
+    if (!playerSessionRef.current) {
+        playerSessionRef.current = readOrCreateRuntimePlayerSession();
+    }
+    const lastPlayerSessionPersistAtRef = useRef(0);
+    const playerSessionHeartbeatTimerRef = useRef(null);
+    const playbackClockEpochRef = useRef(
+        Math.max(0, Number(playerSessionRef.current?.playbackClockEpoch || 0))
+    );
+    const lastAuthoritativeSeekRef = useRef({
+        epoch: playbackClockEpochRef.current,
+        at: Number(playerSessionRef.current?.lastCommittedSeekAt || 0),
+        position: Math.max(
+            0,
+            numberOrDefault(
+                playerSessionRef.current?.lastCommittedSeekPosition,
+                playerSessionRef.current?.position || 0
+            )
+        ),
+        direction: String(
+            playerSessionRef.current?.lastCommittedSeekDirection || "none"
+        ),
+        reason: "runtime session restored",
+    });
+    // Every WebAudio source is tied to the playback-clock epoch that created it.
+    // This prevents a delayed timer/source callback from an older position from
+    // pushing the UI forward again after a long-running backward scrub.
+    const sourceStartSerialRef = useRef(0);
+    const activeSourceStartSerialRef = useRef(0);
+    const activeSourceClockEpochRef = useRef(playbackClockEpochRef.current);
 
     const waveformCanvasRef = useRef(null);
     const frequencyCanvasRef = useRef(null);
@@ -3988,6 +5003,22 @@ export default function Audio() {
     const playlistDragIndexRef = useRef(-1);
     const playlistDragOverIndexRef = useRef(-1);
     const lastPlaylistAutoStartRef = useRef({ index: -1, reason: "" });
+    // A restored playlist selection is only metadata until its file/URL has been
+    // decoded. Auto-load that item while paused, and preserve any seek the user
+    // makes before decoding finishes so Play starts from the requested position.
+    const pageLoadPlaylistLoadTimerRef = useRef(null);
+    const pageLoadPlaylistLoadKeyRef = useRef("");
+    const playlistLoadInFlightRef = useRef(false);
+    const pendingPlaylistStartSeekRef = useRef({
+        active: false,
+        committed: false,
+        index: -1,
+        itemId: "",
+        position: 0,
+        ratio: 0,
+        durationHint: 0,
+        requestedAt: 0,
+    });
     const playlistEndRestartGuardRef = useRef({
         key: "",
         at: 0,
@@ -4007,6 +5038,14 @@ export default function Audio() {
     const lastMediaSessionSeekAtRef = useRef(0);
     const pendingMediaSessionSeekRef = useRef(null);
     const browserScrubResumeIntentRef = useRef(false);
+    // The last committed raw AudioBuffer position is the single source of truth
+    // whenever no AudioBufferSourceNode is actively advancing the clock. This
+    // prevents a paused seek from jumping back to the pre-seek position on Play.
+    const committedPlaybackOffsetRef = useRef(0);
+    // Capture play/pause intent once at the beginning of each scrub gesture.
+    // Do not infer it later from UI state because the UI intentionally stays in
+    // the playing state while the old source is stopped for a glitch-free seek.
+    const scrubPlaybackIntentRef = useRef(false);
     const scrubCommitInFlightRef = useRef(false);
     const scrubGestureActiveRef = useRef(false);
     const focusReturnScrubUnlockTimerRef = useRef(null);
@@ -4120,7 +5159,7 @@ export default function Audio() {
     );
     const [storageInfo, setStorageInfo] = useState(() => buildPersistenceInfo());
     const [expandedArtwork, setExpandedArtwork] = useState(null);
-    const [offlinePlaylistNotice, setOfflinePlaylistNotice] = useState("");
+    const [, setOfflinePlaylistNotice] = useState("");
 
     const dispatch = useDispatch();
     const offlineCacheObjectUrlRef = useRef("");
@@ -4132,10 +5171,6 @@ export default function Audio() {
 
     const settingsView = normalizeSettings(settings);
     const isOutputSilenced = Boolean(isMuted || settingsView.baseVolume <= ZERO_VOLUME_EPSILON);
-    const selectedVisualizer3DMode =
-        VISUALIZER_3D_MODE_OPTIONS.find(
-            (option) => option.value === visualizer3dSettings.model
-        ) || VISUALIZER_3D_MODE_OPTIONS[0];
     const hasMedia = bufferReady && Boolean(audioBufferRef.current);
     // Keep the visual Play/Pause toggle tied to real playback only. The pause
     // settling flag still disables controls while iOS quiets the route, but it
@@ -4184,13 +5219,17 @@ export default function Audio() {
         settings: settingsView,
         activePresetKey,
         onHydratePlaylist: ({ items, activePlaylistIndex: restoredIndex, repeatEnabled: restoredRepeat } = {}) => {
-            if (Array.isArray(items) && items.length) {
-                setPlaylist(items);
-                playlistRef.current = items;
+            const hydratedItems = Array.isArray(items) ? items : [];
+
+            if (hydratedItems.length) {
+                setPlaylist(hydratedItems);
+                playlistRef.current = hydratedItems;
             }
 
+            let cleanIndex = -1;
+
             if (Number.isFinite(Number(restoredIndex))) {
-                const cleanIndex = Number(restoredIndex);
+                cleanIndex = Number(restoredIndex);
                 setActivePlaylistIndex(cleanIndex);
                 activePlaylistIndexRef.current = cleanIndex;
             }
@@ -4198,6 +5237,76 @@ export default function Audio() {
             if (typeof restoredRepeat === "boolean") {
                 setRepeatEnabled(restoredRepeat);
                 repeatEnabledRef.current = restoredRepeat;
+            }
+
+            const restoredItem = cleanIndex >= 0 ? hydratedItems[cleanIndex] : null;
+            const restoredDurationHint = Math.max(
+                0,
+                numberOrDefault(restoredItem?.duration, 0)
+            );
+            const restoredSession =
+                pendingRestoreSessionRef.current || readPersistedSessionSummary();
+            const restoredPosition = restoredSession
+                ? getRestorableSessionPosition(
+                    restoredSession,
+                    restoredDurationHint || restoredSession.duration || 0
+                )
+                : 0;
+
+            if (!audioBufferRef.current && restoredDurationHint > 0) {
+                mediaDurationRef.current = restoredDurationHint;
+                setDuration(restoredDurationHint);
+
+                if (restoredPosition > 0) {
+                    mediaPositionRef.current = restoredPosition;
+                    committedPlaybackOffsetRef.current = restoredPosition;
+                    startedOffsetRef.current = restoredPosition;
+                    lastKnownGoodOffsetRef.current = restoredPosition;
+                    browserScrubLastValueRef.current = restoredPosition;
+                    setPosition(restoredPosition);
+                }
+            }
+
+            if (pageLoadPlaylistLoadTimerRef.current) {
+                window.clearTimeout(pageLoadPlaylistLoadTimerRef.current);
+                pageLoadPlaylistLoadTimerRef.current = null;
+            }
+
+            if (restoredItem && cleanIndex >= 0) {
+                const loadKey = `${restoredItem.id || cleanIndex}::${
+                    restoredItem.url || restoredItem.title || "playlist-item"
+                }`;
+
+                if (pageLoadPlaylistLoadKeyRef.current !== loadKey) {
+                    pageLoadPlaylistLoadKeyRef.current = loadKey;
+                    pageLoadPlaylistLoadTimerRef.current = window.setTimeout(() => {
+                        pageLoadPlaylistLoadTimerRef.current = null;
+
+                        const liveItem = playlistRef.current?.[cleanIndex];
+                        const stillSelected =
+                            activePlaylistIndexRef.current === cleanIndex &&
+                            liveItem &&
+                            (!restoredItem.id || liveItem.id === restoredItem.id);
+
+                        if (
+                            stillSelected &&
+                            !audioBufferRef.current &&
+                            !playlistLoadInFlightRef.current
+                        ) {
+                            loadPlaylistItem(cleanIndex, false, {
+                                suppressAutoSkip: true,
+                                restorePosition: restoredPosition,
+                                fromPageLoadHydration: true,
+                                quietStatus: true,
+                            }).catch((error) => {
+                                setError(
+                                    error?.message ||
+                                    "The restored playlist item could not be prepared for paused scrubbing."
+                                );
+                            });
+                        }
+                    }, 80);
+                }
             }
         },
         onHydrateSession: (session) => {
@@ -4209,6 +5318,8 @@ export default function Audio() {
 
             if (restoredPosition > 0) {
                 mediaPositionRef.current = restoredPosition;
+                committedPlaybackOffsetRef.current = restoredPosition;
+                startedOffsetRef.current = restoredPosition;
                 lastKnownGoodOffsetRef.current = restoredPosition;
                 browserScrubLastValueRef.current = restoredPosition;
                 setPosition(restoredPosition);
@@ -4278,6 +5389,11 @@ export default function Audio() {
 
     useEffect(() => {
         return () => {
+            if (pageLoadPlaylistLoadTimerRef.current) {
+                window.clearTimeout(pageLoadPlaylistLoadTimerRef.current);
+                pageLoadPlaylistLoadTimerRef.current = null;
+            }
+
             if (offlineCacheObjectUrlRef.current) {
                 releaseCachedPlayableUrl(offlineCacheObjectUrlRef.current);
                 offlineCacheObjectUrlRef.current = "";
@@ -4298,7 +5414,19 @@ export default function Audio() {
             Number.isFinite(pendingSeekPosition) &&
             Math.abs(visiblePosition - pendingSeekPosition) > 0.05;
 
-        if (!recentLockScreenSeek || !pendingSeekStillDifferent) {
+        const activeBrowserSeekOwnsClock = Boolean(
+            scrubbingRef.current ||
+            scrubGestureActiveRef.current ||
+            scrubCommitInFlightRef.current
+        );
+
+        // While a Media Chrome gesture is active, its raw buffer target is the
+        // authoritative clock. A stale React render must not pull the seek back
+        // to the position from before the pointer moved.
+        if (
+            !activeBrowserSeekOwnsClock &&
+            (!recentLockScreenSeek || !pendingSeekStillDifferent)
+        ) {
             mediaPositionRef.current = visiblePosition;
             if (!pendingSeekStillDifferent) {
                 pendingMediaSessionSeekRef.current = null;
@@ -4309,8 +5437,19 @@ export default function Audio() {
     hasMediaRef.current = Boolean(hasMedia);
 
     const effectiveRate = getEffectivePlaybackRate(settingsView);
-    const visibleDuration = getEffectiveTimelineDuration(settingsView);
-    const visiblePosition = bufferOffsetToTimelineSeconds(position, settingsView);
+    // Media Chrome follows native media semantics: currentTime and duration are
+    // raw media seconds. Playback rate changes how quickly currentTime advances;
+    // it must not change the seek coordinate system or make paused seeks drift.
+    const visibleDuration = getRawBufferDuration();
+    const pendingPlaylistStartSeek = getMatchingPendingPlaylistStartSeek();
+    const rawVisiblePosition = pendingPlaylistStartSeek
+        ? pendingPlaylistStartSeek.position
+        : Boolean(scrubbingRef.current || scrubCommitInFlightRef.current)
+            ? mediaPositionRef.current
+            : position;
+    const visiblePosition = visibleDuration > 0
+        ? clamp(numberOrDefault(rawVisiblePosition, 0), 0, visibleDuration)
+        : 0;
     const progressValue =
         visibleDuration > 0 ? clamp((visiblePosition / visibleDuration) * 100, 0, 100) : 0;
     const pitchCents = semitonesToCents(settingsView.pitchSemitones);
@@ -4494,9 +5633,32 @@ export default function Audio() {
         clearVisualizerCanvases();
 
         return () => {
+            updateRuntimePlayerSession(
+                "Audio page unmounted",
+                {
+                    lifecycle: "unmounted",
+                    position: getCurrentScrubTarget(),
+                    duration: getMediaSessionDuration(),
+                    wasPlaying: Boolean(
+                        playingRef.current ||
+                        isPlayingStateRef.current ||
+                        getScrubResumeIntent()
+                    ),
+                    explicitlyPaused: !Boolean(
+                        playingRef.current ||
+                        isPlayingStateRef.current ||
+                        getScrubResumeIntent()
+                    ),
+                    scrubActive: scrubbingRef.current,
+                    scrubPosition: getCurrentScrubTarget(),
+                    scrubResume: getScrubResumeIntent(),
+                },
+                { forcePersist: true }
+            );
             stopPlayback(false);
             stopVisualizer();
             clearPlaybackWatchdogTimer();
+            clearRuntimePlayerSessionHeartbeat();
             clearControlSelfHealTimer();
             clearControlWakeRepairTimer();
             clearCarPlayRecoveryTimer();
@@ -4551,6 +5713,31 @@ export default function Audio() {
     useEffect(() => {
         const finishScrubFromGlobalRelease = (event) => {
             const eventType = event?.type || "global-release";
+            const isPhysicalRelease = [
+                "pointerup",
+                "pointercancel",
+                "lostpointercapture",
+                "mouseup",
+                "touchend",
+                "touchcancel",
+                "dragend",
+                "keyup",
+            ].includes(eventType);
+
+            // Media Chrome owns the gesture-level seek session. The page-wide
+            // capture listener is only a fallback, so defer physical releases by
+            // one task and let MediaTimeRange commit first. This avoids two seeks
+            // racing each other after a long backgrounded session.
+            if (isPhysicalRelease && !event?.__audioMasterDeferredRelease) {
+                window.setTimeout(() => {
+                    finishScrubFromGlobalRelease({
+                        type: eventType,
+                        __audioMasterDeferredRelease: true,
+                    });
+                }, 0);
+                return;
+            }
+
             const hiddenNow = Boolean(
                 eventType === "pagehide" ||
                 eventType === "blur" ||
@@ -4930,6 +6117,370 @@ export default function Audio() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    function clearRuntimePlayerSessionHeartbeat() {
+        if (playerSessionHeartbeatTimerRef.current) {
+            window.clearInterval(playerSessionHeartbeatTimerRef.current);
+            playerSessionHeartbeatTimerRef.current = null;
+        }
+    }
+
+    function markAuthoritativePlaybackSeek(
+        nextOffset,
+        reason = "authoritative playback seek",
+        options = {}
+    ) {
+        const previousPosition = Math.max(
+            0,
+            numberOrDefault(
+                options.previousPosition,
+                mediaPositionRef.current || committedPlaybackOffsetRef.current || 0
+            )
+        );
+        const durationValue = Math.max(
+            0,
+            Number(audioBufferRef.current?.duration || getRawBufferDuration() || 0)
+        );
+        const safeOffset = durationValue > 0
+            ? clamp(numberOrDefault(nextOffset, 0), 0, durationValue)
+            : Math.max(0, numberOrDefault(nextOffset, 0));
+        const calculatedDirection = safeOffset + SCRUB_BACKWARD_FORCE_DELTA_SECONDS < previousPosition
+            ? "backward"
+            : safeOffset > previousPosition + SCRUB_BACKWARD_FORCE_DELTA_SECONDS
+                ? "forward"
+                : "same";
+        const previousSeek = lastAuthoritativeSeekRef.current || {};
+        const repeatsPreviousTarget = Boolean(
+            calculatedDirection === "same" &&
+            previousSeek.at &&
+            Date.now() - Number(previousSeek.at || 0) < 3200 &&
+            Math.abs(Number(previousSeek.position || 0) - safeOffset) < 0.08
+        );
+        const direction = repeatsPreviousTarget
+            ? String(previousSeek.direction || "same")
+            : calculatedDirection;
+
+        playbackClockEpochRef.current = Math.max(
+            playbackClockEpochRef.current + 1,
+            Number(playerSessionRef.current?.playbackClockEpoch || 0) + 1
+        );
+        lastAuthoritativeSeekRef.current = {
+            epoch: playbackClockEpochRef.current,
+            at: Date.now(),
+            position: safeOffset,
+            direction,
+            reason,
+        };
+        lastPositionTimerTickAtRef.current = 0;
+
+        return lastAuthoritativeSeekRef.current;
+    }
+
+    function startRuntimePlayerSessionHeartbeat() {
+        if (
+            playerSessionHeartbeatTimerRef.current ||
+            typeof window === "undefined"
+        ) {
+            return;
+        }
+
+        playerSessionHeartbeatTimerRef.current = window.setInterval(() => {
+            const buffer = audioBufferRef.current;
+            const scrubResume = Boolean(
+                scrubbingRef.current && getScrubResumeIntent()
+            );
+            const shouldStayAlive = Boolean(
+                buffer &&
+                (playingRef.current ||
+                    isPlayingStateRef.current ||
+                    scrubResume)
+            );
+
+            if (!shouldStayAlive) {
+                clearRuntimePlayerSessionHeartbeat();
+                return;
+            }
+
+            const durationValue = Math.max(
+                0,
+                Number(buffer?.duration || getMediaSessionDuration() || 0)
+            );
+            const rawOffset = scrubbingRef.current
+                ? getCurrentScrubTarget()
+                : getCurrentOffset();
+            const safeOffset = durationValue > 0
+                ? clamp(numberOrDefault(rawOffset, 0), 0, durationValue)
+                : Math.max(0, numberOrDefault(rawOffset, 0));
+
+            // The session heartbeat follows the same authoritative raw-buffer
+            // seconds used by Media Chrome, Redux, Dexie, and WebAudio. It does
+            // not create a second playback clock.
+            mediaPositionRef.current = safeOffset;
+            committedPlaybackOffsetRef.current = safeOffset;
+            lastKnownGoodOffsetRef.current = safeOffset;
+
+            updateRuntimePlayerSession(
+                scrubbingRef.current
+                    ? "live player session heartbeat during scrub"
+                    : "live player session heartbeat during playback",
+                {
+                    lifecycle:
+                        typeof document !== "undefined" &&
+                        document.visibilityState === "hidden"
+                            ? "hidden-playing"
+                            : "active-playing",
+                    heartbeatAt: Date.now(),
+                    playbackClockEpoch: playbackClockEpochRef.current,
+                    wasPlaying: true,
+                    explicitlyPaused: false,
+                    position: safeOffset,
+                    duration: durationValue,
+                    scrubActive: scrubbingRef.current,
+                    scrubPosition: scrubbingRef.current
+                        ? safeOffset
+                        : numberOrDefault(
+                            playerSessionRef.current?.scrub?.position,
+                            safeOffset
+                        ),
+                    scrubResume,
+                },
+                { forcePersist: true }
+            );
+
+            if (
+                typeof document !== "undefined" &&
+                document.visibilityState === "hidden"
+            ) {
+                updateMediaSessionPositionState({ forcePosition: true });
+            }
+        }, PLAYER_RUNTIME_SESSION_HEARTBEAT_MS);
+    }
+
+    function updateRuntimePlayerSession(
+        reason = "runtime player session update",
+        overrides = {},
+        options = {}
+    ) {
+        const now = Date.now();
+        const currentSession =
+            playerSessionRef.current || readOrCreateRuntimePlayerSession();
+        const durationValue = Math.max(
+            0,
+            numberOrDefault(
+                overrides.duration,
+                audioBufferRef.current?.duration ||
+                mediaDurationRef.current ||
+                currentSession.duration ||
+                0
+            )
+        );
+        const scrubActive = Boolean(
+            overrides.scrubActive ?? scrubbingRef.current
+        );
+        const rawPosition = numberOrDefault(
+            overrides.position,
+            scrubActive
+                ? browserScrubLastValueRef.current
+                : mediaPositionRef.current
+        );
+        const positionValue = durationValue
+            ? clamp(rawPosition, 0, durationValue)
+            : Math.max(0, rawPosition);
+        const scrubResume = Boolean(
+            overrides.scrubResume ??
+            (scrubActive ? getScrubResumeIntent() : false)
+        );
+        const wasPlaying = Boolean(
+            overrides.wasPlaying ??
+            (playingRef.current ||
+                isPlayingStateRef.current ||
+                scrubResume)
+        );
+        const explicitlyPaused = Boolean(
+            overrides.explicitlyPaused ??
+            (!wasPlaying && !scrubActive
+                ? true
+                : currentSession.explicitlyPaused)
+        );
+
+        const nextSession = {
+            ...currentSession,
+            revision: Math.max(0, Number(currentSession.revision || 0)) + 1,
+            focusEpoch: Math.max(
+                0,
+                Number(
+                    overrides.focusEpoch ?? currentSession.focusEpoch ?? 0
+                )
+            ),
+            actionEpoch: Math.max(
+                0,
+                Number(
+                    overrides.actionEpoch ?? currentSession.actionEpoch ?? 0
+                )
+            ),
+            playbackClockEpoch: Math.max(
+                0,
+                Number(
+                    overrides.playbackClockEpoch ??
+                    playbackClockEpochRef.current ??
+                    currentSession.playbackClockEpoch ??
+                    0
+                )
+            ),
+            heartbeatAt: Math.max(
+                0,
+                Number(
+                    overrides.heartbeatAt ??
+                    (wasPlaying ? now : currentSession.heartbeatAt) ??
+                    now
+                )
+            ),
+            lastCommittedSeekAt: Math.max(
+                0,
+                Number(
+                    overrides.lastCommittedSeekAt ??
+                    lastAuthoritativeSeekRef.current?.at ??
+                    currentSession.lastCommittedSeekAt ??
+                    0
+                )
+            ),
+            lastCommittedSeekPosition: Math.max(
+                0,
+                numberOrDefault(
+                    overrides.lastCommittedSeekPosition,
+                    lastAuthoritativeSeekRef.current?.position ??
+                    currentSession.lastCommittedSeekPosition ??
+                    positionValue
+                )
+            ),
+            lastCommittedSeekDirection: String(
+                overrides.lastCommittedSeekDirection ??
+                lastAuthoritativeSeekRef.current?.direction ??
+                currentSession.lastCommittedSeekDirection ??
+                "none"
+            ),
+            lifecycle: String(
+                overrides.lifecycle || currentSession.lifecycle || "active"
+            ),
+            wasPlaying,
+            explicitlyPaused,
+            position: positionValue,
+            duration: durationValue,
+            sourceKind: String(
+                overrides.sourceKind ?? sourceKind ?? currentSession.sourceKind ?? ""
+            ),
+            sourceUrl: String(
+                overrides.sourceUrl ?? sourceUrl ?? currentSession.sourceUrl ?? ""
+            ),
+            mediaTitle: String(
+                overrides.mediaTitle ??
+                mediaTitleRef.current ??
+                currentSession.mediaTitle ??
+                ""
+            ),
+            scrub: {
+                ...(currentSession.scrub || {}),
+                active: scrubActive,
+                gestureSerial: Math.max(
+                    0,
+                    Number(
+                        overrides.scrubGestureSerial ??
+                        browserScrubSerialRef.current ??
+                        0
+                    )
+                ),
+                position: Math.max(
+                    0,
+                    numberOrDefault(
+                        overrides.scrubPosition,
+                        scrubActive ? positionValue : positionValue
+                    )
+                ),
+                resumeAfterScrub: scrubResume,
+                startedAt: scrubActive
+                    ? Number(
+                        overrides.scrubStartedAt ??
+                        currentSession.scrub?.startedAt ??
+                        now
+                    )
+                    : 0,
+                mediaChromeSeekId: Math.max(
+                    0,
+                    Number(
+                        overrides.mediaChromeSeekId ??
+                        currentSession.scrub?.mediaChromeSeekId ??
+                        0
+                    )
+                ),
+                mediaChromeOwnerSessionId: String(
+                    overrides.mediaChromeOwnerSessionId ??
+                    currentSession.scrub?.mediaChromeOwnerSessionId ??
+                    ""
+                ),
+                updatedAt: now,
+            },
+            updatedAt: now,
+            lastReason: String(reason || "runtime player session update"),
+        };
+
+        playerSessionRef.current = nextSession;
+
+        const shouldPersist = Boolean(
+            options.forcePersist ||
+            now - Number(lastPlayerSessionPersistAtRef.current || 0) >=
+            PLAYER_RUNTIME_SESSION_PERSIST_THROTTLE_MS
+        );
+
+        if (shouldPersist) {
+            lastPlayerSessionPersistAtRef.current = now;
+            persistRuntimePlayerSession(nextSession);
+        }
+
+        return nextSession;
+    }
+
+    function getRuntimePlayerSessionIntent() {
+        const session = playerSessionRef.current;
+        if (!session) {
+            return {
+                shouldPlay: false,
+                position: getCurrentScrubTarget(),
+                scrubActive: false,
+                scrubResume: false,
+            };
+        }
+
+        const scrubActive = Boolean(session.scrub?.active);
+        const scrubResume = Boolean(session.scrub?.resumeAfterScrub);
+        const shouldPlay = Boolean(
+            !session.explicitlyPaused &&
+            (session.wasPlaying || (scrubActive && scrubResume))
+        );
+
+        return {
+            shouldPlay,
+            position: Math.max(
+                0,
+                numberOrDefault(
+                    scrubActive
+                        ? session.scrub?.position
+                        : session.position,
+                    getCurrentScrubTarget()
+                )
+            ),
+            scrubActive,
+            scrubResume,
+            focusEpoch: Number(session.focusEpoch || 0),
+            actionEpoch: Number(session.actionEpoch || 0),
+            playbackClockEpoch: Number(session.playbackClockEpoch || 0),
+            heartbeatAt: Number(session.heartbeatAt || 0),
+            sessionAlive: Boolean(
+                session.heartbeatAt &&
+                Date.now() - Number(session.heartbeatAt || 0) <=
+                PLAYER_RUNTIME_SESSION_HEARTBEAT_STALE_MS
+            ),
+        };
+    }
+
     function setPlayingState(nextValue) {
         const safeValue = Boolean(nextValue);
 
@@ -4944,6 +6495,7 @@ export default function Audio() {
 
         if (safeValue) {
             markControlInteraction("playback state entered playing");
+            startRuntimePlayerSessionHeartbeat();
             rememberSmartCarResumeIntent("playback is active", { force: true, playing: true });
             startCommunityListeningHeartbeat();
             startPlaybackWatchdog();
@@ -4952,8 +6504,22 @@ export default function Audio() {
             stopCommunityListeningHeartbeat(true);
             if (!scrubbingRef.current) {
                 clearPlaybackWatchdogTimer();
+                clearRuntimePlayerSessionHeartbeat();
             }
         }
+
+        updateRuntimePlayerSession(
+            safeValue ? "playback entered playing" : "playback entered paused",
+            {
+                wasPlaying: safeValue,
+                explicitlyPaused: !safeValue,
+                scrubActive: scrubbingRef.current,
+                scrubResume: scrubbingRef.current
+                    ? getScrubResumeIntent()
+                    : false,
+            },
+            { forcePersist: true }
+        );
 
         persistPlaybackSessionSnapshot(safeValue ? "playback started" : "playback paused", {
             force: true,
@@ -4972,9 +6538,28 @@ export default function Audio() {
         );
 
         mediaPositionRef.current = safeOffset;
+        committedPlaybackOffsetRef.current = safeOffset;
         lastKnownGoodOffsetRef.current = safeOffset;
 
-        if (options.commitStartOffset) {
+        const activeContext = audioContextRef.current;
+        const hasAuthoritativeLiveSourceClock = Boolean(
+            activeSourceRef.current &&
+            activeContext &&
+            activeContext.state !== "closed" &&
+            Number.isFinite(Number(startedAtContextTimeRef.current)) &&
+            Number(startedAtContextTimeRef.current) > 0 &&
+            activeSourceClockEpochRef.current === playbackClockEpochRef.current
+        );
+
+        // A paused/queued seek must replace the next source start offset. Once a
+        // new AudioBufferSourceNode is already running, however, resetting its
+        // context start time to zero makes getCurrentOffset() jump toward the end
+        // of the song. Preserve that live clock and update only the visible/session
+        // position after a resumed scrub.
+        if (
+            options.commitStartOffset &&
+            (!hasAuthoritativeLiveSourceClock || options.forceResetSourceClock)
+        ) {
             startedOffsetRef.current = safeOffset;
             startedAtContextTimeRef.current = 0;
         }
@@ -5003,6 +6588,29 @@ export default function Audio() {
         if (options.forceMediaSession || options.fromMediaSession) {
             updateMediaSessionPositionState({ forcePosition: true });
         }
+
+        updateRuntimePlayerSession(
+            options.fromMediaSession
+                ? "Media Session position update"
+                : scrubbingRef.current
+                    ? "Media Chrome scrub position update"
+                    : "playback position update",
+            {
+                position: safeOffset,
+                duration: durationValue,
+                scrubActive: scrubbingRef.current,
+                scrubPosition: safeOffset,
+                scrubResume: scrubbingRef.current
+                    ? getScrubResumeIntent()
+                    : false,
+                wasPlaying: Boolean(
+                    playingRef.current ||
+                    isPlayingStateRef.current ||
+                    (scrubbingRef.current && getScrubResumeIntent())
+                ),
+            },
+            { forcePersist: Boolean(options.forceSessionPersist) }
+        );
 
         if (!options.skipSessionPersist) {
             persistPlaybackSessionSnapshot("position update", {
@@ -5040,6 +6648,8 @@ export default function Audio() {
         pendingMediaSessionSeekRef.current = null;
         browserScrubLastValueRef.current = nextOffset;
         mediaPositionRef.current = nextOffset;
+        committedPlaybackOffsetRef.current = nextOffset;
+        scrubPlaybackIntentRef.current = false;
         startedOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
 
@@ -5820,6 +7430,10 @@ export default function Audio() {
     }
 
     function holdIPhonePauseSilence(reason = "Pause silence guard") {
+        // Keep the reason available for diagnostics without changing the quiet
+        // iOS pause path.
+        void reason;
+
         if (!isIOSAudioDevice()) {
             return;
         }
@@ -5864,6 +7478,13 @@ export default function Audio() {
     function getMediaSessionDuration() {
         const bufferDuration = Number(audioBufferRef.current?.duration);
         const refDuration = Number(mediaDurationRef.current);
+        const stateDuration = Number(duration);
+        const activeItemDuration = Number(
+            playlistRef.current?.[activePlaylistIndexRef.current]?.duration
+        );
+        const pendingDuration = Number(
+            getMatchingPendingPlaylistStartSeek()?.durationHint
+        );
 
         if (Number.isFinite(bufferDuration) && bufferDuration > 0) {
             return bufferDuration;
@@ -5871,6 +7492,18 @@ export default function Audio() {
 
         if (Number.isFinite(refDuration) && refDuration > 0) {
             return refDuration;
+        }
+
+        if (Number.isFinite(stateDuration) && stateDuration > 0) {
+            return stateDuration;
+        }
+
+        if (Number.isFinite(activeItemDuration) && activeItemDuration > 0) {
+            return activeItemDuration;
+        }
+
+        if (Number.isFinite(pendingDuration) && pendingDuration > 0) {
+            return pendingDuration;
         }
 
         return 0;
@@ -5941,59 +7574,104 @@ export default function Audio() {
         return clamp(getEffectivePlaybackRate(latestSettingsRef.current), 0.0625, 16);
     }
 
-    function getTimelineRate(settingsValue = latestSettingsRef.current) {
-        const rate = Number(getEffectivePlaybackRate(settingsValue));
+    function getMatchingPendingPlaylistStartSeek(
+        index = activePlaylistIndexRef.current,
+        item = playlistRef.current?.[activePlaylistIndexRef.current]
+    ) {
+        const pending = pendingPlaylistStartSeekRef.current;
 
-        if (Number.isFinite(rate) && rate > 0) {
-            return clamp(rate, 0.0625, 16);
+        if (!pending?.active) {
+            return null;
         }
 
-        return 1;
+        if (
+            pending.requestedAt &&
+            Date.now() - Number(pending.requestedAt) > 5 * 60 * 1000
+        ) {
+            clearPendingPlaylistStartSeek();
+            return null;
+        }
+
+        const safeIndex = Number(index);
+        const itemId = String(item?.id || "");
+        const indexMatches = safeIndex >= 0 && pending.index === safeIndex;
+        const idMatches = Boolean(itemId && pending.itemId && itemId === pending.itemId);
+
+        return indexMatches || idMatches ? pending : null;
+    }
+
+    function rememberPendingPlaylistStartSeek(nextOffset, durationHint, options = {}) {
+        const safeDuration = Math.max(0, numberOrDefault(durationHint, 0));
+        const safePosition = safeDuration > 0
+            ? clamp(numberOrDefault(nextOffset, 0), 0, safeDuration)
+            : Math.max(0, numberOrDefault(nextOffset, 0));
+        const activeIndex = activePlaylistIndexRef.current;
+        const activeItem = playlistRef.current?.[activeIndex];
+
+        pendingPlaylistStartSeekRef.current = {
+            active: true,
+            committed: Boolean(options.committed),
+            index: activeIndex,
+            itemId: String(activeItem?.id || ""),
+            position: safePosition,
+            ratio: safeDuration > 0 ? clamp(safePosition / safeDuration, 0, 1) : 0,
+            durationHint: safeDuration,
+            requestedAt: Date.now(),
+        };
+
+        return pendingPlaylistStartSeekRef.current;
+    }
+
+    function resolvePendingPlaylistStartSeek(decodedDuration, index, item) {
+        const pending = getMatchingPendingPlaylistStartSeek(index, item);
+        const safeDuration = Math.max(0, numberOrDefault(decodedDuration, 0));
+
+        if (!pending || safeDuration <= 0) {
+            return null;
+        }
+
+        const mappedPosition =
+            pending.durationHint > 0 && Number.isFinite(Number(pending.ratio))
+                ? Number(pending.ratio) * safeDuration
+                : Number(pending.position || 0);
+
+        return clamp(mappedPosition, 0, safeDuration);
+    }
+
+    function clearPendingPlaylistStartSeek() {
+        pendingPlaylistStartSeekRef.current = {
+            active: false,
+            committed: false,
+            index: -1,
+            itemId: "",
+            position: 0,
+            ratio: 0,
+            durationHint: 0,
+            requestedAt: 0,
+        };
     }
 
     function getRawBufferDuration() {
         const bufferDuration = Number(audioBufferRef.current?.duration);
         const stateDuration = Number(duration);
         const refDuration = Number(mediaDurationRef.current);
+        const activeItemDuration = Number(
+            playlistRef.current?.[activePlaylistIndexRef.current]?.duration
+        );
+        const pendingDuration = Number(
+            getMatchingPendingPlaylistStartSeek()?.durationHint
+        );
 
         if (Number.isFinite(bufferDuration) && bufferDuration > 0) return bufferDuration;
         if (Number.isFinite(stateDuration) && stateDuration > 0) return stateDuration;
         if (Number.isFinite(refDuration) && refDuration > 0) return refDuration;
+        if (Number.isFinite(activeItemDuration) && activeItemDuration > 0) return activeItemDuration;
+        if (Number.isFinite(pendingDuration) && pendingDuration > 0) return pendingDuration;
         return 0;
     }
 
-    function getEffectiveTimelineDuration(settingsValue = latestSettingsRef.current) {
-        const rawDuration = getRawBufferDuration();
-        const rate = getTimelineRate(settingsValue);
-
-        if (!rawDuration || !rate) {
-            return rawDuration || 0;
-        }
-
-        return rawDuration / rate;
-    }
-
-    function bufferOffsetToTimelineSeconds(bufferOffset, settingsValue = latestSettingsRef.current) {
-        const rawDuration = getRawBufferDuration();
-        const rate = getTimelineRate(settingsValue);
-        const safeOffset = rawDuration > 0
-            ? clamp(numberOrDefault(bufferOffset, 0), 0, rawDuration)
-            : Math.max(0, numberOrDefault(bufferOffset, 0));
-
-        return rate > 0 ? safeOffset / rate : safeOffset;
-    }
-
-    function timelineSecondsToBufferOffset(timelineSeconds, settingsValue = latestSettingsRef.current) {
-        const rawDuration = getRawBufferDuration();
-        const rate = getTimelineRate(settingsValue);
-        const safeTimeline = Math.max(0, numberOrDefault(timelineSeconds, 0));
-        const rawOffset = safeTimeline * rate;
-
-        return rawDuration > 0 ? clamp(rawOffset, 0, rawDuration) : rawOffset;
-    }
-
-    function formatTimelineOffset(bufferOffset, settingsValue = latestSettingsRef.current) {
-        return formatTime(bufferOffsetToTimelineSeconds(bufferOffset, settingsValue));
+    function formatTimelineOffset(bufferOffset) {
+        return formatTime(bufferOffset);
     }
 
     function normalizeScrubOffsetForSeek(nextOffset, bufferValue = audioBufferRef.current) {
@@ -8393,6 +10071,21 @@ export default function Audio() {
             title: mediaTitleRef.current || "",
         };
 
+        updateRuntimePlayerSession(
+            `player entered background: ${reason}`,
+            {
+                lifecycle: "background",
+                wasPlaying: shouldBePlaying,
+                explicitlyPaused: !shouldBePlaying && !scrubbingRef.current,
+                position: positionValue,
+                duration: durationValue,
+                scrubActive: scrubbingRef.current,
+                scrubPosition: getCurrentScrubTarget(),
+                scrubResume: getScrubResumeIntent(),
+            },
+            { forcePersist: true }
+        );
+
         if (shouldBePlaying) {
             rememberSmartCarResumeIntent(`background/unfocused: ${reason}`, {
                 force: true,
@@ -8435,6 +10128,34 @@ export default function Audio() {
         pageBackgroundedAtRef.current = 0;
         clearBackgroundControlCheckpointTimer();
 
+        const currentSession =
+            playerSessionRef.current || readOrCreateRuntimePlayerSession();
+        const nextFocusEpoch = Number(currentSession.focusEpoch || 0) + 1;
+        const session = updateRuntimePlayerSession(
+            `player returned to foreground: ${reason}`,
+            {
+                lifecycle: "foreground-recovering",
+                focusEpoch: nextFocusEpoch,
+                position: getCurrentScrubTarget(),
+                duration: getMediaSessionDuration(),
+                scrubActive: scrubbingRef.current,
+                scrubPosition: getCurrentScrubTarget(),
+                scrubResume: getScrubResumeIntent(),
+                wasPlaying: Boolean(
+                    currentSession.wasPlaying ||
+                    playingRef.current ||
+                    isPlayingStateRef.current ||
+                    getScrubResumeIntent()
+                ),
+                explicitlyPaused: Boolean(
+                    currentSession.explicitlyPaused &&
+                    !playingRef.current &&
+                    !getScrubResumeIntent()
+                ),
+            },
+            { forcePersist: true }
+        );
+
         if (!audioBufferRef.current) {
             return;
         }
@@ -8442,11 +10163,21 @@ export default function Audio() {
         startPlaybackWatchdog();
         startControlSelfHealWatchdog();
         scheduleProgressiveForegroundRepair(
-            `${reason}${wasHidden || hiddenMs ? ` after ${Math.round(hiddenMs / 1000)}s unfocused` : ""}`
+            `${reason}${
+                wasHidden || hiddenMs
+                    ? ` after ${Math.round(hiddenMs / 1000)}s unfocused`
+                    : ""
+            }`,
+            session.focusEpoch,
+            session.actionEpoch
         );
     }
 
-    function scheduleProgressiveForegroundRepair(reason = "foreground repair") {
+    function scheduleProgressiveForegroundRepair(
+        reason = "foreground repair",
+        repairFocusEpoch = playerSessionRef.current?.focusEpoch || 0,
+        scheduledActionEpoch = playerSessionRef.current?.actionEpoch || 0
+    ) {
         if (typeof window === "undefined") {
             return;
         }
@@ -8459,27 +10190,119 @@ export default function Audio() {
 
         clearForegroundRepairTimers();
 
-        foregroundRepairTimersRef.current = FOREGROUND_REPAIR_STEPS_MS.map((delayMs) => {
-            const timerId = window.setTimeout(() => {
-                foregroundRepairTimersRef.current = foregroundRepairTimersRef.current.filter(
-                    (activeTimerId) => activeTimerId !== timerId
-                );
+        foregroundRepairTimersRef.current = FOREGROUND_REPAIR_STEPS_MS.map(
+            (delayMs) => {
+                const timerId = window.setTimeout(() => {
+                    foregroundRepairTimersRef.current =
+                        foregroundRepairTimersRef.current.filter(
+                            (activeTimerId) => activeTimerId !== timerId
+                        );
 
-                if (audioContextRef.current?.state === "suspended" && playingRef.current && !isInsideCleanPauseWindow()) {
-                    audioContextRef.current.resume().catch(() => {});
-                }
+                    const session = playerSessionRef.current;
+                    if (!session) return;
 
-                recoverPendingScrubAfterPageResume(reason);
-                syncVisiblePlaybackUiWithAudioRoute(reason);
-                repairControlSurface(reason);
+                    // A newer focus cycle makes this timer stale. A real user
+                    // interaction after focus also invalidates delayed repair steps,
+                    // preventing an old callback from undoing Pause or a new scrub.
+                    if (Number(session.focusEpoch || 0) !== repairFocusEpoch) {
+                        return;
+                    }
+                    if (
+                        delayMs > 0 &&
+                        Number(session.actionEpoch || 0) !== scheduledActionEpoch
+                    ) {
+                        return;
+                    }
 
-                if (playingRef.current && !activeSourceRef.current && audioBufferRef.current && !pauseActionInFlightRef.current) {
-                    repairLongRunningPlaybackState(`${reason}: foreground source check`);
-                }
-            }, delayMs);
+                    const intent = getRuntimePlayerSessionIntent();
 
-            return timerId;
-        });
+                    if (
+                        intent.scrubActive &&
+                        !scrubbingRef.current &&
+                        audioBufferRef.current
+                    ) {
+                        scrubbingRef.current = true;
+                        scrubGestureActiveRef.current = false;
+                        browserScrubLastValueRef.current = intent.position;
+                        mediaPositionRef.current = intent.position;
+                        markScrubResumeIntent(
+                            intent.scrubResume,
+                            intent.position
+                        );
+                        setIsScrubbing(true);
+                    }
+
+                    if (
+                        intent.shouldPlay &&
+                        audioBufferRef.current &&
+                        !pauseActionInFlightRef.current &&
+                        !isPauseUiSettlingRef.current
+                    ) {
+                        playingRef.current = true;
+                        isPlayingStateRef.current = true;
+                        setIsPlaying((current) => (current ? current : true));
+                    } else if (
+                        !intent.shouldPlay &&
+                        !scrubbingRef.current
+                    ) {
+                        playingRef.current = false;
+                        isPlayingStateRef.current = false;
+                        setIsPlaying((current) => (current ? false : current));
+                    }
+
+                    if (
+                        audioContextRef.current?.state === "suspended" &&
+                        intent.shouldPlay &&
+                        !isInsideCleanPauseWindow()
+                    ) {
+                        audioContextRef.current.resume().catch(() => {});
+                    }
+
+                    recoverPendingScrubAfterPageResume(reason);
+                    syncVisiblePlaybackUiWithAudioRoute(reason);
+                    repairControlSurface(reason);
+
+                    if (
+                        intent.shouldPlay &&
+                        !activeSourceRef.current &&
+                        audioBufferRef.current &&
+                        !pauseActionInFlightRef.current
+                    ) {
+                        repairLongRunningPlaybackState(
+                            `${reason}: foreground source check`
+                        );
+                    }
+
+                    if (
+                        delayMs ===
+                        FOREGROUND_REPAIR_STEPS_MS[
+                        FOREGROUND_REPAIR_STEPS_MS.length - 1
+                            ]
+                    ) {
+                        updateRuntimePlayerSession(
+                            `${reason}: foreground repair completed`,
+                            {
+                                lifecycle: "active",
+                                wasPlaying: Boolean(
+                                    playingRef.current ||
+                                    isPlayingStateRef.current
+                                ),
+                                explicitlyPaused: !Boolean(
+                                    playingRef.current ||
+                                    isPlayingStateRef.current
+                                ),
+                                scrubActive: scrubbingRef.current,
+                                scrubPosition: getCurrentScrubTarget(),
+                                scrubResume: getScrubResumeIntent(),
+                            },
+                            { forcePersist: true }
+                        );
+                    }
+                }, delayMs);
+
+                return timerId;
+            }
+        );
     }
 
     function clearControlWakeRepairTimer() {
@@ -8498,6 +10321,16 @@ export default function Audio() {
 
     function markControlInteraction(reason = "control interaction") {
         lastControlInteractionAtRef.current = Date.now();
+
+        const currentSession =
+            playerSessionRef.current || readOrCreateRuntimePlayerSession();
+        updateRuntimePlayerSession(
+            reason,
+            {
+                actionEpoch: Number(currentSession.actionEpoch || 0) + 1,
+            },
+            { forcePersist: false }
+        );
 
         if (audioBufferRef.current) {
             startControlSelfHealWatchdog();
@@ -8921,11 +10754,17 @@ export default function Audio() {
     }
 
     function getScrubResumeIntent() {
+        if (
+            scrubbingRef.current ||
+            scrubGestureActiveRef.current ||
+            scrubCommitInFlightRef.current
+        ) {
+            return Boolean(scrubPlaybackIntentRef.current);
+        }
+
         return Boolean(
             wasPlayingBeforeScrubRef.current ||
             browserScrubResumeIntentRef.current ||
-            playingRef.current ||
-            isPlayingStateRef.current ||
             getRecentScrubResumeIntent()
         );
     }
@@ -8994,7 +10833,9 @@ export default function Audio() {
             clamp(getCurrentScrubTarget(), 0, buffer.duration),
             buffer
         );
-        const shouldResume = Boolean(getScrubResumeIntent() && nextOffset < buffer.duration);
+        const shouldResume = Boolean(
+            getScrubResumeIntent() && nextOffset < buffer.duration
+        );
 
         rememberScrubTarget(nextOffset);
         markScrubResumeIntent(shouldResume, nextOffset);
@@ -9194,6 +11035,7 @@ export default function Audio() {
     }
 
     async function commitCurrentScrubTarget(reason = "scrub commit", options = {}) {
+        markControlInteraction(reason);
         const buffer = audioBufferRef.current;
 
         if (!buffer) {
@@ -9229,16 +11071,27 @@ export default function Audio() {
         );
 
         if (duplicateRecentCommit && !scrubbingRef.current) {
-            syncPlaybackPosition(nextOffset, {
+            const duplicateCommitIsPlaying = Boolean(
+                lastCompleted.resume &&
+                playingRef.current &&
+                activeSourceRef.current &&
+                activeSourceClockEpochRef.current === playbackClockEpochRef.current
+            );
+            const duplicateOffset = duplicateCommitIsPlaying
+                ? getCurrentOffset()
+                : nextOffset;
+
+            syncPlaybackPosition(duplicateOffset, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 forceMediaSession: true,
-                commitStartOffset: true,
+                commitStartOffset: !duplicateCommitIsPlaying,
                 clearPendingMediaSessionSeek: true,
                 forceSessionPersist: true,
             });
-            updateMediaSessionState(lastCompleted.resume ? "playing" : "paused", {
-                forcePosition: true,
-            });
+            updateMediaSessionState(
+                duplicateCommitIsPlaying ? "playing" : "paused",
+                { forcePosition: true }
+            );
             return true;
         }
 
@@ -9249,7 +11102,7 @@ export default function Audio() {
             clearPageResumeScrubRecoveryTimer();
             clearMediaSessionFastSeekCommitTimer();
 
-            const resumeIntent = getScrubResumeIntent();
+            const resumeIntent = Boolean(scrubPlaybackIntentRef.current);
             const shouldResume = Boolean(resumeIntent && nextOffset < buffer.duration);
             const fromMediaSession = Boolean(options.fromMediaSession);
             let outputAlreadyRestarted = Boolean(options.outputAlreadyRestarted);
@@ -9297,12 +11150,21 @@ export default function Audio() {
                 quietStatus: Boolean(options.quietStatus),
             });
 
-            const actuallyPlaying = Boolean(shouldResume && didSeek && playingRef.current);
+            const actuallyPlaying = Boolean(
+                shouldResume &&
+                didSeek &&
+                playingRef.current &&
+                activeSourceRef.current &&
+                activeSourceClockEpochRef.current === playbackClockEpochRef.current
+            );
+            const settledOffset = actuallyPlaying
+                ? normalizeScrubOffsetForSeek(getCurrentOffset(), buffer)
+                : nextOffset;
 
-            syncPlaybackPosition(nextOffset, {
+            syncPlaybackPosition(settledOffset, {
                 fromMediaSession,
                 forceMediaSession: true,
-                commitStartOffset: true,
+                commitStartOffset: !actuallyPlaying,
                 clearPendingMediaSessionSeek: true,
                 forceSessionPersist: true,
             });
@@ -9320,6 +11182,17 @@ export default function Audio() {
                 resume: actuallyPlaying,
                 position: nextOffset,
             };
+            committedPlaybackOffsetRef.current = settledOffset;
+            mediaPositionRef.current = settledOffset;
+            browserScrubLastValueRef.current = settledOffset;
+            lastKnownGoodOffsetRef.current = settledOffset;
+
+            if (!actuallyPlaying) {
+                startedOffsetRef.current = nextOffset;
+                startedAtContextTimeRef.current = 0;
+            }
+
+            scrubPlaybackIntentRef.current = false;
 
             if (!options.quietStatus) {
                 setInfo(
@@ -9340,20 +11213,53 @@ export default function Audio() {
         const buffer = audioBufferRef.current;
 
         if (!buffer) {
-            return 0;
+            const pending = getMatchingPendingPlaylistStartSeek();
+            const stableOffset = Number(
+                pending?.position ??
+                committedPlaybackOffsetRef.current ??
+                mediaPositionRef.current ??
+                position ??
+                0
+            );
+            const durationHint = getRawBufferDuration();
+
+            return durationHint > 0
+                ? clamp(numberOrDefault(stableOffset, 0), 0, durationHint)
+                : Math.max(0, numberOrDefault(stableOffset, 0));
         }
 
         if (!context || !playingRef.current || !activeSourceRef.current) {
-            const stableOffset = Number.isFinite(mediaPositionRef.current)
-                ? mediaPositionRef.current
-                : startedOffsetRef.current;
+            const committedOffset = Number(committedPlaybackOffsetRef.current);
+            const stableOffset = Number.isFinite(committedOffset)
+                ? committedOffset
+                : Number.isFinite(mediaPositionRef.current)
+                    ? mediaPositionRef.current
+                    : startedOffsetRef.current;
 
             return clamp(stableOffset, 0, buffer.duration);
         }
 
-        const elapsedContextSeconds =
-            context.currentTime - startedAtContextTimeRef.current;
+        const sourceClockEpoch = Number(activeSourceClockEpochRef.current);
+        const currentClockEpoch = Number(playbackClockEpochRef.current);
+        const sourceStartedAt = Number(startedAtContextTimeRef.current);
 
+        if (
+            sourceClockEpoch !== currentClockEpoch ||
+            !Number.isFinite(sourceStartedAt) ||
+            sourceStartedAt <= 0 ||
+            sourceStartedAt > context.currentTime + 0.25
+        ) {
+            const committedOffset = Number(committedPlaybackOffsetRef.current);
+            const stableOffset = Number.isFinite(committedOffset)
+                ? committedOffset
+                : Number.isFinite(mediaPositionRef.current)
+                    ? mediaPositionRef.current
+                    : startedOffsetRef.current;
+
+            return clamp(numberOrDefault(stableOffset, 0), 0, buffer.duration);
+        }
+
+        const elapsedContextSeconds = context.currentTime - sourceStartedAt;
         const playbackSeconds = elapsedContextSeconds * currentEffectiveRateRef.current;
         const nextOffset = startedOffsetRef.current + playbackSeconds;
 
@@ -9375,8 +11281,24 @@ export default function Audio() {
     function startPositionTimer() {
         stopPositionTimer();
         startPlaybackWatchdog();
+        startRuntimePlayerSessionHeartbeat();
+
+        // A cleared interval can still have one callback queued by the browser.
+        // Capturing the playback epoch prevents that stale callback from a
+        // pre-seek source from overwriting a newly committed backward seek.
+        const timerClockEpoch = activeSourceClockEpochRef.current;
+        const timerSource = activeSourceRef.current;
+        const timerSourceSerial = activeSourceStartSerialRef.current;
 
         timerRef.current = window.setInterval(() => {
+            if (
+                timerClockEpoch !== playbackClockEpochRef.current ||
+                activeSourceClockEpochRef.current !== timerClockEpoch ||
+                activeSourceRef.current !== timerSource ||
+                activeSourceStartSerialRef.current !== timerSourceSerial
+            ) {
+                return;
+            }
             const buffer = audioBufferRef.current;
 
             if (!buffer || scrubbingRef.current) {
@@ -9410,6 +11332,19 @@ export default function Audio() {
 
             const nextOffset = getCurrentOffset();
 
+            updateRuntimePlayerSession(
+                "position timer kept live player session synchronized",
+                {
+                    heartbeatAt: now,
+                    playbackClockEpoch: timerClockEpoch,
+                    wasPlaying: true,
+                    explicitlyPaused: false,
+                    position: nextOffset,
+                    duration: buffer.duration,
+                    scrubActive: false,
+                    scrubResume: false,
+                }
+            );
             syncPlaybackPosition(nextOffset);
             updateMediaSessionPositionState();
 
@@ -9429,7 +11364,7 @@ export default function Audio() {
                     });
                 }
             }
-        }, 120);
+        }, 80);
     }
 
     function stopActiveSource() {
@@ -9450,7 +11385,10 @@ export default function Audio() {
             // Safe to ignore.
         }
 
-        activeSourceRef.current = null;
+        if (activeSourceRef.current === source) {
+            activeSourceRef.current = null;
+        }
+        activeSourceClockEpochRef.current = playbackClockEpochRef.current;
         clearBackgroundSourceRecovery("active source stopped");
         iPhoneLockScreenLivePauseRef.current = {
             active: false,
@@ -9562,6 +11500,8 @@ export default function Audio() {
         frequencyDataRef.current = null;
 
         startedOffsetRef.current = 0;
+        committedPlaybackOffsetRef.current = 0;
+        scrubPlaybackIntentRef.current = false;
         startedAtContextTimeRef.current = 0;
         currentEffectiveRateRef.current = getEffectivePlaybackRate(
             latestSettingsRef.current
@@ -9630,6 +11570,8 @@ export default function Audio() {
         frequencyDataRef.current = null;
 
         startedOffsetRef.current = 0;
+        committedPlaybackOffsetRef.current = 0;
+        scrubPlaybackIntentRef.current = false;
         startedAtContextTimeRef.current = 0;
         currentEffectiveRateRef.current = getEffectivePlaybackRate(
             latestSettingsRef.current
@@ -9698,31 +11640,39 @@ export default function Audio() {
         pendingMediaSessionSeekRef.current = null;
 
         startedOffsetRef.current = 0;
+        committedPlaybackOffsetRef.current = 0;
+        scrubPlaybackIntentRef.current = false;
+        browserScrubLastValueRef.current = 0;
         startedAtContextTimeRef.current = 0;
         currentEffectiveRateRef.current = getEffectivePlaybackRate(
             latestSettingsRef.current
         );
 
-        mediaDurationRef.current = decodedBuffer.duration;
-        mediaPositionRef.current = 0;
+        const decodedDuration = Number(decodedBuffer.duration) || 0;
+        const pendingDecodedOffset = resolvePendingPlaylistStartSeek(
+            decodedDuration,
+            activePlaylistIndexRef.current,
+            playlistRef.current?.[activePlaylistIndexRef.current]
+        );
+        const decodedStartOffset = pendingDecodedOffset !== null
+            ? pendingDecodedOffset
+            : 0;
+        mediaDurationRef.current = decodedDuration;
+        mediaPositionRef.current = decodedStartOffset;
+        committedPlaybackOffsetRef.current = decodedStartOffset;
+        startedOffsetRef.current = decodedStartOffset;
+        lastKnownGoodOffsetRef.current = decodedStartOffset;
+        browserScrubLastValueRef.current = decodedStartOffset;
         lastMediaSessionPositionSnapshotRef.current = {
-            duration: decodedBuffer.duration,
-            position: 0,
-            playbackRate: getMediaSessionPlaybackRate(),
-        };
-
-        mediaDurationRef.current = Number(decodedBuffer.duration) || 0;
-        mediaPositionRef.current = 0;
-        lastMediaSessionPositionSnapshotRef.current = {
-            duration: Number(decodedBuffer.duration) || 0,
+            duration: decodedDuration,
             position: 0,
             playbackRate: getMediaSessionPlaybackRate(),
         };
 
         setBufferReady(true);
         startControlSelfHealWatchdog();
-        setPosition(0);
-        setDuration(decodedBuffer.duration);
+        setPosition(decodedStartOffset);
+        setDuration(decodedDuration);
         setMixerEnabled(false);
         setMediaInfo(
             `${byteDescription} • ${decodedBuffer.numberOfChannels} channel(s) • ${decodedBuffer.sampleRate} Hz • ${formatTime(decodedBuffer.duration)}`
@@ -10420,7 +12370,20 @@ export default function Audio() {
         lastDecodedArrayBufferRef.current = arrayBuffer;
         lastDecodedMetadataRef.current = metadata;
 
-        startedOffsetRef.current = 0;
+        const pendingDecodedOffset = resolvePendingPlaylistStartSeek(
+            decodedBuffer.duration,
+            activePlaylistIndexRef.current,
+            playlistRef.current?.[activePlaylistIndexRef.current]
+        );
+        const decodedStartOffset = pendingDecodedOffset !== null
+            ? pendingDecodedOffset
+            : 0;
+
+        startedOffsetRef.current = decodedStartOffset;
+        committedPlaybackOffsetRef.current = decodedStartOffset;
+        mediaPositionRef.current = decodedStartOffset;
+        lastKnownGoodOffsetRef.current = decodedStartOffset;
+        browserScrubLastValueRef.current = decodedStartOffset;
         startedAtContextTimeRef.current = 0;
         currentEffectiveRateRef.current = getEffectivePlaybackRate(
             latestSettingsRef.current
@@ -10428,7 +12391,7 @@ export default function Audio() {
 
         setBufferReady(true);
         startControlSelfHealWatchdog();
-        setPosition(0);
+        setPosition(decodedStartOffset);
         setDuration(decodedBuffer.duration);
         setMixerEnabled(false);
         setMediaInfo(
@@ -10716,6 +12679,16 @@ export default function Audio() {
 
         const loadToken = playlistLoadTokenRef.current + 1;
         playlistLoadTokenRef.current = loadToken;
+        playlistLoadInFlightRef.current = true;
+
+        const pendingForDifferentItem = pendingPlaylistStartSeekRef.current;
+        if (
+            pendingForDifferentItem?.active &&
+            pendingForDifferentItem.index !== safeIndex &&
+            (!pendingForDifferentItem.itemId || pendingForDifferentItem.itemId !== item.id)
+        ) {
+            clearPendingPlaylistStartSeek();
+        }
 
         const shouldSuppressAutoSkip = Boolean(options.suppressAutoSkip);
         const shouldAutoSkip = autoplay && !shouldSuppressAutoSkip;
@@ -10765,22 +12738,33 @@ export default function Audio() {
                 })
             );
 
+            const decodedDuration = Math.max(0, Number(decodedBuffer.duration || 0));
+            const pendingStartOffset = resolvePendingPlaylistStartSeek(
+                decodedDuration,
+                safeIndex,
+                item
+            );
             const requestedRestorePosition = Number(options.restorePosition);
-            const hasRequestedRestorePosition = Number.isFinite(requestedRestorePosition) && requestedRestorePosition > 0;
-            const restoredOffset = hasRequestedRestorePosition
-                ? clamp(
-                    requestedRestorePosition,
-                    0,
-                    Math.max(0, Number(decodedBuffer.duration || 0) - SESSION_RESTORE_END_GUARD_SECONDS)
-                )
-                : !autoplay
-                    ? applyRestoredPlaybackSessionPosition(decodedBuffer, {
-                        loadedPlaylistIndex: safeIndex,
-                    })
-                    : 0;
+            const hasRequestedRestorePosition =
+                Number.isFinite(requestedRestorePosition) && requestedRestorePosition > 0;
+            const restoredOffset = pendingStartOffset !== null
+                ? pendingStartOffset
+                : hasRequestedRestorePosition
+                    ? clamp(
+                        requestedRestorePosition,
+                        0,
+                        Math.max(0, decodedDuration - SESSION_RESTORE_END_GUARD_SECONDS)
+                    )
+                    : !autoplay
+                        ? applyRestoredPlaybackSessionPosition(decodedBuffer, {
+                            loadedPlaylistIndex: safeIndex,
+                        })
+                        : 0;
 
-            if (hasRequestedRestorePosition && restoredOffset > 0) {
+            if (restoredOffset > 0 || pendingStartOffset !== null) {
                 startedOffsetRef.current = restoredOffset;
+                committedPlaybackOffsetRef.current = restoredOffset;
+                lastKnownGoodOffsetRef.current = restoredOffset;
                 startedAtContextTimeRef.current = 0;
                 mediaPositionRef.current = restoredOffset;
                 browserScrubLastValueRef.current = restoredOffset;
@@ -10789,6 +12773,10 @@ export default function Audio() {
                     commitStartOffset: true,
                     forceSessionPersist: true,
                 });
+            }
+
+            if (pendingStartOffset !== null) {
+                clearPendingPlaylistStartSeek();
             }
 
             updateMediaSessionMetadata();
@@ -11055,6 +13043,7 @@ export default function Audio() {
             return false;
         } finally {
             if (ensureStillCurrentLoad()) {
+                playlistLoadInFlightRef.current = false;
                 setIsLoading(false);
                 refreshStorageInfo();
             }
@@ -11696,14 +13685,48 @@ export default function Audio() {
 
     async function startBufferPlayback(resetToBeginning = false, options = {}) {
         const buffer = audioBufferRef.current;
+        const expectedClockEpoch = Number(options.expectedClockEpoch);
+        const hasExpectedClockEpoch = Number.isFinite(expectedClockEpoch);
+        const isExpectedClockCurrent = () =>
+            !hasExpectedClockEpoch ||
+            playbackClockEpochRef.current === expectedClockEpoch;
 
         if (!buffer) {
-            setError("Load and decode a media source before playback.");
+            const activeIndex = activePlaylistIndexRef.current;
+            const activeItem = playlistRef.current?.[activeIndex];
+            const pendingStart = getMatchingPendingPlaylistStartSeek(
+                activeIndex,
+                activeItem
+            );
+
+            if (activeIndex >= 0 && activeItem && !playlistLoadInFlightRef.current) {
+                const loaded = await loadPlaylistItem(activeIndex, false, {
+                    suppressAutoSkip: true,
+                    restorePosition: pendingStart?.position || getCurrentOffset(),
+                    fromPlayAfterQueuedSeek: true,
+                    quietStatus: true,
+                });
+
+                if (loaded && audioBufferRef.current) {
+                    return startBufferPlayback(false, options);
+                }
+            }
+
+            setError("The selected playlist track is still loading. Its queued start position is saved; press Play again when decoding finishes.");
+            return false;
+        }
+
+        if (!isExpectedClockCurrent()) {
             return false;
         }
 
         if (playbackStartInFlightRef.current) {
-            return Boolean(playingRef.current || activeSourceRef.current || isPlayingStateRef.current);
+            return Boolean(
+                isExpectedClockCurrent() &&
+                (playingRef.current ||
+                    activeSourceRef.current ||
+                    isPlayingStateRef.current)
+            );
         }
 
         if (!resetToBeginning && playingRef.current && activeSourceRef.current) {
@@ -11772,11 +13795,22 @@ export default function Audio() {
                 );
             }
 
+            if (!isExpectedClockCurrent()) {
+                return false;
+            }
+
             manualStopRef.current = false;
             playbackEndedHandledRef.current = false;
             stopActiveSource();
 
-            let safeOffset = resetToBeginning ? 0 : startedOffsetRef.current;
+            const committedOffset = Number(committedPlaybackOffsetRef.current);
+            let safeOffset = resetToBeginning
+                ? 0
+                : Number.isFinite(committedOffset)
+                    ? committedOffset
+                    : Number.isFinite(mediaPositionRef.current)
+                        ? mediaPositionRef.current
+                        : startedOffsetRef.current;
 
             safeOffset = clamp(safeOffset, 0, buffer.duration);
 
@@ -11796,8 +13830,13 @@ export default function Audio() {
 
             source.connect(nodes.baseVolumeGain);
 
+            const sourceStartSerial = sourceStartSerialRef.current + 1;
+            sourceStartSerialRef.current = sourceStartSerial;
+            activeSourceStartSerialRef.current = sourceStartSerial;
+            activeSourceClockEpochRef.current = playbackClockEpochRef.current;
             activeSourceRef.current = source;
             startedOffsetRef.current = safeOffset;
+            committedPlaybackOffsetRef.current = safeOffset;
             startedAtContextTimeRef.current = context.currentTime;
             mediaPositionRef.current = safeOffset;
             mediaDurationRef.current = Number(buffer.duration) || mediaDurationRef.current;
@@ -11808,7 +13847,13 @@ export default function Audio() {
             prepareOutputForGlitchlessSourceStart(context, nodes);
 
             source.onended = () => {
-                if (playbackEndedHandledRef.current || manualStopRef.current) {
+                if (
+                    activeSourceRef.current !== source ||
+                    activeSourceStartSerialRef.current !== sourceStartSerial ||
+                    activeSourceClockEpochRef.current !== playbackClockEpochRef.current ||
+                    playbackEndedHandledRef.current ||
+                    manualStopRef.current
+                ) {
                     return;
                 }
 
@@ -11835,7 +13880,23 @@ export default function Audio() {
                 runEndedHandler();
             };
 
+            const sourceClockEpoch = activeSourceClockEpochRef.current;
             source.start(0, safeOffset);
+            updateRuntimePlayerSession(
+                "WebAudio source started on authoritative playback clock",
+                {
+                    heartbeatAt: Date.now(),
+                    playbackClockEpoch: sourceClockEpoch,
+                    wasPlaying: true,
+                    explicitlyPaused: false,
+                    position: safeOffset,
+                    duration: buffer.duration,
+                    scrubActive: false,
+                    scrubPosition: safeOffset,
+                    scrubResume: false,
+                },
+                { forcePersist: true }
+            );
             releaseOutputAfterGlitchlessSourceStart(context, nodes, {
                 rampSeconds: options.fromMediaSession || options.forceIPhoneOutputPostStart
                     ? 0.09
@@ -11869,6 +13930,27 @@ export default function Audio() {
                 }
             }
 
+            if (
+                !isExpectedClockCurrent() ||
+                activeSourceRef.current !== source ||
+                activeSourceStartSerialRef.current !== sourceStartSerial ||
+                activeSourceClockEpochRef.current !== sourceClockEpoch
+            ) {
+                try {
+                    source.onended = null;
+                    source.stop();
+                    source.disconnect();
+                } catch {
+                    // The source may already have been stopped by a newer seek.
+                }
+
+                if (activeSourceRef.current === source) {
+                    activeSourceRef.current = null;
+                }
+
+                return false;
+            }
+
             setMixerEnabled(true);
             lastSuccessfulSourceStartAtRef.current = Date.now();
             backgroundPlaybackStateRef.current = {
@@ -11881,6 +13963,7 @@ export default function Audio() {
                 sourceUrl: sourceUrl || "",
                 title: mediaTitleRef.current || "",
             };
+            activeSourceClockEpochRef.current = sourceClockEpoch;
             setPlayingState(true);
             updateMediaSessionMetadata();
             updateMediaSessionState("playing", { forcePosition: true });
@@ -12011,6 +14094,25 @@ export default function Audio() {
             return;
         }
 
+        const pausedResumeOffset = normalizeScrubOffsetForSeek(
+            Number.isFinite(Number(committedPlaybackOffsetRef.current))
+                ? Number(committedPlaybackOffsetRef.current)
+                : Number.isFinite(Number(mediaPositionRef.current))
+                    ? Number(mediaPositionRef.current)
+                    : Number(startedOffsetRef.current || 0),
+            audioBufferRef.current
+        );
+        committedPlaybackOffsetRef.current = pausedResumeOffset;
+        startedOffsetRef.current = pausedResumeOffset;
+        mediaPositionRef.current = pausedResumeOffset;
+        browserScrubLastValueRef.current = pausedResumeOffset;
+        syncPlaybackPosition(pausedResumeOffset, {
+            forceMediaSession: true,
+            commitStartOffset: true,
+            clearPendingMediaSessionSeek: true,
+            forceSessionPersist: true,
+        });
+
         const outputAlreadyRestarted = isIOSAudioDevice()
             ? await restartIPhoneOutputStreamForLockScreenPlay("Page Play")
             : false;
@@ -12023,7 +14125,33 @@ export default function Audio() {
     }
 
     async function restartPlayback() {
+        const restartClock = markAuthoritativePlaybackSeek(
+            0,
+            "restart button committed playback to zero",
+            { previousPosition: getCurrentOffset() }
+        );
         stopPlayback(true);
+        committedPlaybackOffsetRef.current = 0;
+        startedOffsetRef.current = 0;
+        mediaPositionRef.current = 0;
+        browserScrubLastValueRef.current = 0;
+        updateRuntimePlayerSession(
+            "restart button created a fresh playback clock",
+            {
+                heartbeatAt: Date.now(),
+                playbackClockEpoch: restartClock.epoch,
+                lastCommittedSeekAt: restartClock.at,
+                lastCommittedSeekPosition: 0,
+                lastCommittedSeekDirection: "backward",
+                position: 0,
+                scrubActive: false,
+                scrubPosition: 0,
+                scrubResume: true,
+                wasPlaying: true,
+                explicitlyPaused: false,
+            },
+            { forcePersist: true }
+        );
         await startBufferPlayback(true);
     }
 
@@ -12032,12 +14160,30 @@ export default function Audio() {
 
         if (!buffer) return false;
 
+        const requestedClockEpoch = Number(options.clockEpoch);
+        const seekClock = Number.isFinite(requestedClockEpoch)
+            ? {
+                ...(lastAuthoritativeSeekRef.current || {}),
+                epoch: requestedClockEpoch,
+            }
+            : markAuthoritativePlaybackSeek(
+                seconds,
+                options.fromMediaSession
+                    ? "Media Session seek committed"
+                    : "programmatic seek committed"
+            );
+        playbackClockEpochRef.current = Math.max(
+            playbackClockEpochRef.current,
+            Number(seekClock.epoch || 0)
+        );
+
         const nextOffset = normalizeScrubOffsetForSeek(
             clamp(numberOrDefault(seconds, 0), 0, buffer.duration),
             buffer
         );
         const restartingFromZero = nextOffset === 0;
         const shouldResumeAfterSeek = Boolean(shouldResume && nextOffset < buffer.duration);
+        let completedOffset = nextOffset;
 
         if (options.fromMediaSession) {
             lastMediaSessionSeekAtRef.current = Date.now();
@@ -12050,6 +14196,7 @@ export default function Audio() {
         stopVisualizer();
 
         startedOffsetRef.current = nextOffset;
+        committedPlaybackOffsetRef.current = nextOffset;
         startedAtContextTimeRef.current = 0;
         mediaPositionRef.current = nextOffset;
 
@@ -12085,7 +14232,14 @@ export default function Audio() {
                 forceIPhoneOutputPostStart: Boolean(options.forceIPhoneOutputPostStart),
                 quietStatus: Boolean(options.quietStatus),
                 zeroScrubRestartNoReload: restartingFromZero,
+                expectedClockEpoch: Number(seekClock.epoch || 0),
             });
+
+            if (playbackClockEpochRef.current !== Number(seekClock.epoch || 0)) {
+                // A newer scrub/seek won while the async audio route was starting.
+                // Do not let this older completion move the timer or session back.
+                return false;
+            }
 
             if (!startedAfterSeek) {
                 setPlayingState(false);
@@ -12106,10 +14260,14 @@ export default function Audio() {
                 return false;
             }
 
-            syncPlaybackPosition(nextOffset, {
+            completedOffset = normalizeScrubOffsetForSeek(
+                getCurrentOffset(),
+                buffer
+            );
+            syncPlaybackPosition(completedOffset, {
                 fromMediaSession: Boolean(options.fromMediaSession),
                 forceMediaSession: true,
-                commitStartOffset: true,
+                commitStartOffset: false,
                 clearPendingMediaSessionSeek: true,
                 forceSessionPersist: true,
             });
@@ -12136,110 +14294,180 @@ export default function Audio() {
             }
         }
 
+        updateRuntimePlayerSession(
+            shouldResumeAfterSeek
+                ? "seek completed with live session playback"
+                : "seek completed while paused",
+            {
+                heartbeatAt: Date.now(),
+                playbackClockEpoch: Number(seekClock.epoch || 0),
+                lastCommittedSeekAt:
+                    lastAuthoritativeSeekRef.current?.at || Date.now(),
+                lastCommittedSeekPosition: nextOffset,
+                lastCommittedSeekDirection:
+                    lastAuthoritativeSeekRef.current?.direction || "same",
+                wasPlaying: Boolean(shouldResumeAfterSeek && playingRef.current),
+                explicitlyPaused: !Boolean(
+                    shouldResumeAfterSeek && playingRef.current
+                ),
+                position: completedOffset,
+                duration: buffer.duration,
+                scrubActive: false,
+                scrubPosition: nextOffset,
+                scrubResume: false,
+            },
+            { forcePersist: true }
+        );
+
+        if (shouldResumeAfterSeek && playingRef.current) {
+            startRuntimePlayerSessionHeartbeat();
+        } else {
+            clearRuntimePlayerSessionHeartbeat();
+        }
+
         return true;
     }
 
-    function handleScrubRelease(reason = "browser scrub released") {
-        pendingMediaSessionSeekRef.current = null;
-
-        dispatch(
-            audioPlayerActions.commitScrub({
-                currentTime: mediaPositionRef.current,
-                shouldResumeAfterScrub: wasPlayingBeforeScrubRef.current,
-                source: reason || "scrub-release",
-            })
-        );
-
-        markControlInteraction(reason);
-        scrubGestureActiveRef.current = false;
-        if (!scrubbingRef.current || !audioBufferRef.current) {
-            repairLongRunningPlaybackState(reason);
-            return;
-        }
-
-        commitCurrentScrubTarget(reason, {
-            quietStatus: true,
-            preserveUnlockedOutput: isIOSAudioDevice(),
-            forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
-            keepPlayingUiDuringSeek: getScrubResumeIntent(),
-        }).catch(() => {
-            scrubbingRef.current = false;
-            wasPlayingBeforeScrubRef.current = false;
-            browserScrubResumeIntentRef.current = false;
-            setIsScrubbing(false);
-            syncVisiblePlaybackUiWithAudioRoute(`${reason} failed`);
-        });
-    }
-
-    function handleScrubStart() {
-        const recentlyReturnedFromFocus = Date.now() - Number(lastFocusReturnScrubResetAtRef.current || 0) < FOCUS_RETURN_FORCE_NEW_SCRUB_MS;
+    function handleScrubStart(mediaChromeSeekSession = null) {
+        const recentlyReturnedFromFocus =
+            Date.now() - Number(lastFocusReturnScrubResetAtRef.current || 0) <
+            FOCUS_RETURN_FORCE_NEW_SCRUB_MS;
 
         if (
             recentlyReturnedFromFocus ||
             scrubCommitInFlightRef.current ||
             (scrubbingRef.current && !scrubGestureActiveRef.current)
         ) {
-            resetScrubStateForFreshBrowserGesture("browser scrub start after focus return");
+            resetScrubStateForFreshBrowserGesture(
+                "browser scrub start after focus return"
+            );
         }
 
         pendingMediaSessionSeekRef.current = null;
-
-        dispatch(
-            audioPlayerActions.startScrub({
-                value: bufferOffsetToTimelineSeconds(mediaPositionRef.current, settingsView),
-                shouldResumeAfterScrub: playingRef.current,
-                source: "browser-slider",
-            })
-        );
-
         markControlInteraction("browser scrub started");
+
         if (audioBufferRef.current && !hasMediaRef.current) {
             hasMediaRef.current = true;
             setBufferReady(true);
         }
 
-        if (!audioBufferRef.current || isRendering || isLoading) return;
+        const buffer = audioBufferRef.current;
+        const timelineDuration = getRawBufferDuration();
+
+        if (isRendering || timelineDuration <= 0) return;
+        mediaDurationRef.current = timelineDuration;
+        if (buffer && isLoading) return;
         if (scrubbingRef.current && scrubGestureActiveRef.current) return;
 
         const currentOffset = getCurrentOffset();
+        const scrubStartClock = markAuthoritativePlaybackSeek(
+            currentOffset,
+            "Media Chrome scrub gesture started",
+            { previousPosition: currentOffset }
+        );
+        const capturedMediaChromeResumeIntent =
+            typeof mediaChromeSeekSession?.resumeAfterSeek === "boolean"
+                ? mediaChromeSeekSession.resumeAfterSeek
+                : null;
         const wasPlaying = Boolean(
-            (playingRef.current || isPlayingStateRef.current || activeSourceRef.current) &&
+            buffer &&
+            (capturedMediaChromeResumeIntent ??
+                Boolean(
+                    playingRef.current ||
+                    isPlayingStateRef.current ||
+                    activeSourceRef.current
+                )) &&
             !pauseActionInFlightRef.current &&
             !isPauseUiSettlingRef.current
         );
 
+        dispatch(
+            audioPlayerActions.startScrub({
+                value: currentOffset,
+                shouldResumeAfterScrub: wasPlaying,
+                source: "media-chrome-time-range",
+            })
+        );
+
         browserScrubSerialRef.current += 1;
+        scrubPlaybackIntentRef.current = wasPlaying;
         scrubGestureActiveRef.current = true;
         scrubbingRef.current = true;
         rememberScrubTarget(currentOffset);
         markScrubResumeIntent(wasPlaying, currentOffset);
 
-        manualStopRef.current = true;
-        stopActiveSource();
-        stopPositionTimer();
-        stopVisualizer();
+        if (!buffer) {
+            rememberPendingPlaylistStartSeek(currentOffset, timelineDuration, {
+                committed: false,
+            });
+        }
+
+        updateRuntimePlayerSession(
+            buffer
+                ? "Media Chrome scrub session started"
+                : "Media Chrome pre-decode playlist scrub session started",
+            {
+                lifecycle: "active",
+                wasPlaying,
+                explicitlyPaused: !wasPlaying,
+                position: currentOffset,
+                duration: timelineDuration,
+                scrubActive: true,
+                scrubGestureSerial: browserScrubSerialRef.current,
+                scrubPosition: currentOffset,
+                scrubResume: wasPlaying,
+                scrubStartedAt:
+                    mediaChromeSeekSession?.startedAt || Date.now(),
+                mediaChromeSeekId: mediaChromeSeekSession?.id || 0,
+                mediaChromeOwnerSessionId:
+                    mediaChromeSeekSession?.ownerSessionId || "",
+                heartbeatAt: Date.now(),
+                playbackClockEpoch: scrubStartClock.epoch,
+                lastCommittedSeekAt: scrubStartClock.at,
+                lastCommittedSeekPosition: currentOffset,
+                lastCommittedSeekDirection: scrubStartClock.direction,
+            },
+            { forcePersist: true }
+        );
+
+        if (buffer) {
+            manualStopRef.current = true;
+            stopActiveSource();
+            stopPositionTimer();
+            stopVisualizer();
+        }
 
         startedOffsetRef.current = currentOffset;
+        committedPlaybackOffsetRef.current = currentOffset;
         startedAtContextTimeRef.current = 0;
         mediaPositionRef.current = currentOffset;
         syncPlaybackPosition(currentOffset, {
             forceMediaSession: true,
+            commitStartOffset: true,
+            forceSessionPersist: true,
         });
 
         if (!wasPlaying) {
             setPlayingState(false);
         } else {
+            startRuntimePlayerSessionHeartbeat();
             playingRef.current = true;
             isPlayingStateRef.current = true;
             setIsPlaying(true);
-            persistPlaybackSessionSnapshot("scrub in progress while playing", {
-                force: true,
-                position: currentOffset,
-                playing: true,
-            });
+            persistPlaybackSessionSnapshot(
+                "scrub in progress while playing",
+                {
+                    force: true,
+                    position: currentOffset,
+                    playing: true,
+                }
+            );
         }
+
         setIsScrubbing(true);
-        updateMediaSessionState(wasPlaying ? "playing" : "paused", { forcePosition: true });
+        updateMediaSessionState(wasPlaying ? "playing" : "paused", {
+            forcePosition: true,
+        });
         scheduleBrowserScrubAutoCommit("browser scrub started");
 
         if (wasPlaying && isIOSAudioDevice()) {
@@ -12255,80 +14483,250 @@ export default function Audio() {
         pendingMediaSessionSeekRef.current = null;
 
         if (scrubCommitInFlightRef.current && !scrubGestureActiveRef.current) {
-            resetScrubStateForFreshBrowserGesture("browser scrub changed after focus return");
-        }
-
-        const reduxScrubValue = Array.isArray(arguments[1]) ? arguments[1][0] : arguments[1];
-        if (Number.isFinite(Number(reduxScrubValue))) {
-            dispatch(
-                audioPlayerActions.updateScrubValue(
-                    timelineSecondsToBufferOffset(Number(reduxScrubValue), settingsView)
-                )
+            resetScrubStateForFreshBrowserGesture(
+                "browser scrub changed after focus return"
             );
         }
 
         markControlInteraction("browser scrub changed");
         const buffer = audioBufferRef.current;
+        const timelineDuration = getRawBufferDuration();
 
-        if (!buffer) return;
+        if (timelineDuration <= 0) return;
+        mediaDurationRef.current = timelineDuration;
 
         if (!scrubbingRef.current) {
             handleScrubStart();
         }
 
-        const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-        const nextOffset = normalizeScrubOffsetForSeek(
-            timelineSecondsToBufferOffset(cleanValue, settingsView),
-            buffer
+        const cleanTimelineValue = Array.isArray(nextValue)
+            ? nextValue[0]
+            : nextValue;
+
+        if (!Number.isFinite(Number(cleanTimelineValue))) {
+            return;
+        }
+
+        const nextOffset = clamp(
+            numberOrDefault(cleanTimelineValue, 0),
+            0,
+            timelineDuration
         );
-        const strongBackwardScrub = isStrongBackwardScrubTarget(nextOffset);
+        const normalizedOffset = buffer
+            ? normalizeScrubOffsetForSeek(nextOffset, buffer)
+            : nextOffset;
+        const previousScrubPosition = numberOrDefault(
+            mediaPositionRef.current || getCurrentOffset(),
+            0
+        );
+        const strongBackwardScrub = buffer
+            ? isStrongBackwardScrubTarget(normalizedOffset)
+            : normalizedOffset + SCRUB_BACKWARD_FORCE_DELTA_SECONDS <
+            previousScrubPosition;
+        const scrubChangeClock = markAuthoritativePlaybackSeek(
+            normalizedOffset,
+            strongBackwardScrub
+                ? "Media Chrome backward scrub changed"
+                : "Media Chrome scrub changed",
+            { previousPosition: previousScrubPosition }
+        );
+
+        dispatch(audioPlayerActions.updateScrubValue(normalizedOffset));
 
         scrubGestureActiveRef.current = true;
         scrubbingRef.current = true;
-        rememberScrubTarget(nextOffset);
+        rememberScrubTarget(normalizedOffset);
 
-        if (strongBackwardScrub || nextOffset === 0) {
+        if (buffer && (strongBackwardScrub || normalizedOffset === 0)) {
             forceScrubTargetIntoPlaybackClock(
-                nextOffset,
-                nextOffset === 0 ? "browser scrub reached zero" : "browser scrub moved backward"
+                normalizedOffset,
+                normalizedOffset === 0
+                    ? "browser scrub reached zero"
+                    : "browser scrub moved backward"
             );
         }
-        markScrubResumeIntent(getScrubResumeIntent(), nextOffset);
-        mediaPositionRef.current = nextOffset;
+
+        const shouldResumeAfterScrub = Boolean(
+            buffer && scrubPlaybackIntentRef.current
+        );
+        markScrubResumeIntent(shouldResumeAfterScrub, normalizedOffset);
+        mediaPositionRef.current = normalizedOffset;
+        committedPlaybackOffsetRef.current = normalizedOffset;
+        startedOffsetRef.current = normalizedOffset;
+        startedAtContextTimeRef.current = 0;
         setIsScrubbing(true);
-        syncPlaybackPosition(nextOffset, {
+
+        if (!buffer) {
+            rememberPendingPlaylistStartSeek(
+                normalizedOffset,
+                timelineDuration,
+                { committed: false }
+            );
+        }
+
+        syncPlaybackPosition(normalizedOffset, {
             forceMediaSession: true,
+            commitStartOffset: true,
+            forceSessionPersist: true,
         });
-        updateMediaSessionState(getScrubResumeIntent() ? "playing" : "paused", {
-            forcePosition: true,
-        });
+        updateRuntimePlayerSession(
+            buffer
+                ? "Media Chrome scrub target changed"
+                : "Media Chrome queued playlist start position changed",
+            {
+                lifecycle: "active",
+                wasPlaying: shouldResumeAfterScrub,
+                explicitlyPaused: !shouldResumeAfterScrub,
+                position: normalizedOffset,
+                duration: timelineDuration,
+                scrubActive: true,
+                scrubPosition: normalizedOffset,
+                scrubResume: shouldResumeAfterScrub,
+                heartbeatAt: Date.now(),
+                playbackClockEpoch: scrubChangeClock.epoch,
+                lastCommittedSeekAt: scrubChangeClock.at,
+                lastCommittedSeekPosition: normalizedOffset,
+                lastCommittedSeekDirection: scrubChangeClock.direction,
+            },
+            { forcePersist: true }
+        );
+        updateMediaSessionState(
+            shouldResumeAfterScrub ? "playing" : "paused",
+            { forcePosition: true }
+        );
         scheduleBrowserScrubAutoCommit("browser scrub changed");
     }
 
-    async function handleScrubCommit(_, nextValue) {
+    async function handleScrubCommit(_, nextValue, mediaChromeCommit = null) {
         pendingMediaSessionSeekRef.current = null;
-        const reduxCommittedValue = Array.isArray(arguments[1]) ? arguments[1][0] : arguments[1];
-        if (Number.isFinite(Number(reduxCommittedValue))) {
-            dispatch(
-                audioPlayerActions.commitScrub({
-                    currentTime: timelineSecondsToBufferOffset(Number(reduxCommittedValue), settingsView),
-                    shouldResumeAfterScrub: wasPlayingBeforeScrubRef.current,
-                    source: "browser-slider",
-                })
-            );
+        markControlInteraction(
+            mediaChromeCommit?.reason || "Media Chrome scrub committed"
+        );
+        scrubGestureActiveRef.current = false;
+
+        const buffer = audioBufferRef.current;
+        const timelineDuration = getRawBufferDuration();
+        const cleanTimelineValue = Array.isArray(nextValue)
+            ? nextValue[0]
+            : nextValue;
+
+        if (
+            timelineDuration <= 0 ||
+            !Number.isFinite(Number(cleanTimelineValue))
+        ) {
+            return;
         }
 
-        markControlInteraction("browser scrub committed");
-        scrubGestureActiveRef.current = false;
-        const buffer = audioBufferRef.current;
-
-        if (!buffer) return;
-
-        const cleanValue = Array.isArray(nextValue) ? nextValue[0] : nextValue;
-        const nextOffset = normalizeScrubOffsetForSeek(
-            timelineSecondsToBufferOffset(cleanValue, settingsView),
-            buffer
+        const rawOffset = clamp(
+            numberOrDefault(cleanTimelineValue, 0),
+            0,
+            timelineDuration
         );
+        const nextOffset = buffer
+            ? normalizeScrubOffsetForSeek(rawOffset, buffer)
+            : rawOffset;
+        const shouldResumeFromGesture = Boolean(
+            buffer && scrubPlaybackIntentRef.current
+        );
+        const finalSeekClock = markAuthoritativePlaybackSeek(
+            nextOffset,
+            "Media Chrome scrub committed",
+            {
+                previousPosition: numberOrDefault(
+                    mediaPositionRef.current,
+                    nextOffset
+                ),
+            }
+        );
+
+        dispatch(
+            audioPlayerActions.commitScrub({
+                currentTime: nextOffset,
+                shouldResumeAfterScrub: shouldResumeFromGesture,
+                source: "media-chrome-time-range",
+            })
+        );
+
+        clearBrowserScrubAutoCommitTimer();
+        clearPageResumeScrubRecoveryTimer();
+        rememberScrubTarget(nextOffset);
+        lastScrubCommitAtRef.current = Date.now();
+
+        if (!buffer) {
+            rememberPendingPlaylistStartSeek(nextOffset, timelineDuration, {
+                committed: true,
+            });
+
+            scrubbingRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
+            scrubPlaybackIntentRef.current = false;
+            setIsScrubbing(false);
+            setPlayingState(false);
+
+            committedPlaybackOffsetRef.current = nextOffset;
+            startedOffsetRef.current = nextOffset;
+            startedAtContextTimeRef.current = 0;
+            mediaPositionRef.current = nextOffset;
+            browserScrubLastValueRef.current = nextOffset;
+            lastKnownGoodOffsetRef.current = nextOffset;
+
+            syncPlaybackPosition(nextOffset, {
+                forceMediaSession: true,
+                commitStartOffset: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+            });
+            updateMediaSessionState("paused", { forcePosition: true });
+            updateRuntimePlayerSession(
+                "Media Chrome queued playlist start position committed",
+                {
+                    lifecycle: "active",
+                    wasPlaying: false,
+                    explicitlyPaused: true,
+                    position: nextOffset,
+                    duration: timelineDuration,
+                    scrubActive: false,
+                    scrubPosition: nextOffset,
+                    scrubResume: false,
+                    mediaChromeSeekId:
+                        mediaChromeCommit?.seekSession?.id || 0,
+                    mediaChromeOwnerSessionId:
+                        mediaChromeCommit?.seekSession?.ownerSessionId || "",
+                    heartbeatAt: Date.now(),
+                    playbackClockEpoch: finalSeekClock.epoch,
+                    lastCommittedSeekAt: finalSeekClock.at,
+                    lastCommittedSeekPosition: nextOffset,
+                    lastCommittedSeekDirection: finalSeekClock.direction,
+                },
+                { forcePersist: true }
+            );
+
+            const activeIndex = activePlaylistIndexRef.current;
+            if (
+                activeIndex >= 0 &&
+                playlistRef.current?.[activeIndex] &&
+                !playlistLoadInFlightRef.current
+            ) {
+                loadPlaylistItem(activeIndex, false, {
+                    suppressAutoSkip: true,
+                    restorePosition: nextOffset,
+                    fromQueuedStartSeek: true,
+                    quietStatus: true,
+                }).catch((error) => {
+                    setError(
+                        error?.message ||
+                        "The selected playlist position was saved, but the track could not be decoded."
+                    );
+                });
+            }
+
+            setInfo(
+                `Start position set to ${formatTimelineOffset(nextOffset)}. The restored playlist track will remain paused and Play will begin from this point.`
+            );
+            return;
+        }
+
         const lastCompleted = lastCompletedScrubCommitRef.current || {};
         const isDuplicateFinalCommit = Boolean(
             !scrubbingRef.current &&
@@ -12338,30 +14736,35 @@ export default function Audio() {
         );
 
         if (isDuplicateFinalCommit) {
-            syncPlaybackPosition(nextOffset, {
+            const duplicateCommitIsPlaying = Boolean(
+                lastCompleted.resume &&
+                playingRef.current &&
+                activeSourceRef.current
+            );
+            const duplicateOffset = duplicateCommitIsPlaying
+                ? getCurrentOffset()
+                : nextOffset;
+
+            syncPlaybackPosition(duplicateOffset, {
                 forceMediaSession: true,
-                commitStartOffset: true,
+                commitStartOffset: !duplicateCommitIsPlaying,
                 clearPendingMediaSessionSeek: true,
                 forceSessionPersist: true,
             });
-            updateMediaSessionState(lastCompleted.resume ? "playing" : "paused", {
-                forcePosition: true,
-            });
+            updateMediaSessionState(
+                duplicateCommitIsPlaying ? "playing" : "paused",
+                { forcePosition: true }
+            );
             return;
         }
 
-        const shouldResume = Boolean(getScrubResumeIntent() && nextOffset < buffer.duration);
+        const shouldResume = Boolean(
+            shouldResumeFromGesture && nextOffset < buffer.duration
+        );
         let outputAlreadyRestarted = false;
 
-        clearBrowserScrubAutoCommitTimer();
-        clearPageResumeScrubRecoveryTimer();
-        rememberScrubTarget(nextOffset);
         markScrubResumeIntent(shouldResume, nextOffset);
-        lastScrubCommitAtRef.current = Date.now();
 
-        // Correct older implementation: determine iOS output status before seekTo()
-        // so startBufferPlayback() can create the fresh source without fighting the
-        // already-unlocked hidden MediaStream element.
         if (isIOSAudioDevice() && shouldResume) {
             try {
                 const { context, nodes } = ensureLiveGraph();
@@ -12380,40 +14783,81 @@ export default function Audio() {
         setIsScrubbing(false);
 
         const didSeek = await seekTo(nextOffset, shouldResume, {
+            clockEpoch: finalSeekClock.epoch,
             preserveUnlockedOutput: isIOSAudioDevice(),
             outputAlreadyRestarted,
             forceIPhoneOutputPostStart: isIOSAudioDevice() && shouldResume,
             keepPlayingUiDuringSeek: shouldResume,
         });
 
+        const resumedFromScrub = Boolean(
+            shouldResume &&
+            didSeek &&
+            playingRef.current &&
+            activeSourceRef.current &&
+            activeSourceClockEpochRef.current === finalSeekClock.epoch
+        );
+        const settledOffset = resumedFromScrub
+            ? normalizeScrubOffsetForSeek(getCurrentOffset(), buffer)
+            : nextOffset;
+
+        committedPlaybackOffsetRef.current = settledOffset;
+        mediaPositionRef.current = settledOffset;
+        browserScrubLastValueRef.current = settledOffset;
+        lastKnownGoodOffsetRef.current = settledOffset;
+
+        if (!resumedFromScrub) {
+            startedOffsetRef.current = nextOffset;
+            startedAtContextTimeRef.current = 0;
+        }
+
+        syncPlaybackPosition(settledOffset, {
+            forceMediaSession: true,
+            commitStartOffset: !resumedFromScrub,
+            clearPendingMediaSessionSeek: true,
+            forceSessionPersist: true,
+        });
+
         lastCompletedScrubCommitRef.current = {
             at: Date.now(),
             position: nextOffset,
-            resume: Boolean(shouldResume && didSeek && playingRef.current),
+            resume: resumedFromScrub,
         };
+        updateRuntimePlayerSession(
+            "Media Chrome scrub session committed",
+            {
+                lifecycle: "active",
+                wasPlaying: resumedFromScrub,
+                explicitlyPaused: !resumedFromScrub,
+                position: settledOffset,
+                scrubActive: false,
+                scrubPosition: nextOffset,
+                scrubResume: false,
+                mediaChromeSeekId:
+                    mediaChromeCommit?.seekSession?.id || 0,
+                mediaChromeOwnerSessionId:
+                    mediaChromeCommit?.seekSession?.ownerSessionId || "",
+                heartbeatAt: Date.now(),
+                playbackClockEpoch: finalSeekClock.epoch,
+                lastCommittedSeekAt: finalSeekClock.at,
+                lastCommittedSeekPosition: nextOffset,
+                lastCommittedSeekDirection: finalSeekClock.direction,
+            },
+            { forcePersist: true }
+        );
+        if (resumedFromScrub) {
+            startRuntimePlayerSessionHeartbeat();
+        } else {
+            clearRuntimePlayerSessionHeartbeat();
+        }
         recentScrubResumeIntentRef.current = {
             at: Date.now(),
             position: nextOffset,
-            resume: Boolean(shouldResume && didSeek && playingRef.current),
+            resume: resumedFromScrub,
         };
+        scrubPlaybackIntentRef.current = false;
 
         repairLongRunningPlaybackState("browser scrub committed");
-    }
-
-    function handleScrubKeyDown(event) {
-        const key = event?.key || "";
-        const isScrubKey = [
-            "ArrowLeft",
-            "ArrowRight",
-            "Home",
-            "End",
-            "PageDown",
-            "PageUp",
-        ].includes(key);
-
-        if (isScrubKey && !scrubbingRef.current) {
-            handleScrubStart();
-        }
     }
 
     function updateSetting(key, value) {
@@ -14155,40 +16599,13 @@ export default function Audio() {
                                                                         flex: "0 0 auto",
                                                                     }}
                                                                 />
-
-                                                                <Slider
+                                                                <LegacyMediaChromeVolumeRange
                                                                     value={settingsView.baseVolume}
-                                                                    min={0}
                                                                     max={HUMAN_SAFE_LIMITS.baseVolume.max}
-                                                                    step={0.01}
-                                                                    aria-label="Safe base volume"
                                                                     disabled={isRendering || isLoading || isPreloadingPlaylist}
-                                                                    onChange={(_, value) =>
-                                                                        updateSetting(
-                                                                            "baseVolume",
-                                                                            Array.isArray(value) ? value[0] : value
-                                                                        )
+                                                                    onChange={(value) =>
+                                                                        updateSetting("baseVolume", value)
                                                                     }
-                                                                    valueLabelDisplay="auto"
-                                                                    valueLabelFormat={(value) =>
-                                                                        `${Number(value).toFixed(2)}x`
-                                                                    }
-                                                                    sx={{
-                                                                        color: "#67e8f9",
-                                                                        py: 0,
-                                                                        "& .MuiSlider-thumb": {
-                                                                            width: 16,
-                                                                            height: 16,
-                                                                            boxShadow:
-                                                                                "0 0 0 7px rgba(103,232,249,0.08)",
-                                                                        },
-                                                                        "& .MuiSlider-rail": {
-                                                                            color: "rgba(255,255,255,0.18)",
-                                                                        },
-                                                                        "& .MuiSlider-track": {
-                                                                            border: "none",
-                                                                        },
-                                                                    }}
                                                                 />
 
                                                                 <VolumeUpRoundedIcon
@@ -14202,41 +16619,25 @@ export default function Audio() {
                                                         </Stack>
                                                     </Box>
                                                 </Box>
-
-                                                <Slider
-                                                    value={clamp(visiblePosition, 0, visibleDuration || 0)}
-                                                    min={0}
-                                                    max={visibleDuration || 0}
-                                                    step={0.01}
-                                                    disabled={!hasMedia || isRendering || isLoading}
-                                                    onPointerDown={handleScrubStart}
-                                                    onPointerDownCapture={handleScrubStart}
-                                                    onPointerUp={() => handleScrubRelease("slider pointer release")}
-                                                    onPointerCancel={() => handleScrubRelease("slider pointer cancel")}
-                                                    onMouseDown={handleScrubStart}
-                                                    onMouseDownCapture={handleScrubStart}
-                                                    onMouseUp={() => handleScrubRelease("slider mouse release")}
-                                                    onTouchStart={handleScrubStart}
-                                                    onTouchStartCapture={handleScrubStart}
-                                                    onTouchEnd={() => handleScrubRelease("slider touch release")}
-                                                    onTouchCancel={() => handleScrubRelease("slider touch cancel")}
-                                                    onKeyDown={handleScrubKeyDown}
-                                                    onKeyUp={() => handleScrubRelease("slider keyboard release")}
-                                                    onChange={handleScrubChange}
-                                                    onChangeCommitted={handleScrubCommit}
-                                                    valueLabelDisplay="auto"
-                                                    valueLabelFormat={(value) => formatTime(value)}
-                                                    sx={{
-                                                        color: "#67e8f9",
-                                                        touchAction: "none",
-                                                        userSelect: "none",
-                                                        "& .MuiSlider-thumb": {
-                                                            boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
-                                                        },
-                                                        "& .MuiSlider-rail": {
-                                                            color: "rgba(255,255,255,0.18)",
-                                                        },
-                                                    }}
+                                                <LegacyMediaChromeTimeRange
+                                                    currentTime={clamp(visiblePosition, 0, visibleDuration || 0)}
+                                                    duration={visibleDuration || 0}
+                                                    playbackRate={effectiveRate}
+                                                    isPlaying={showPauseForMainControls}
+                                                    sessionId={playerSessionRef.current?.id || ""}
+                                                    disabled={visibleDuration <= 0 || isRendering}
+                                                    onSeekStart={(seekSession) =>
+                                                        handleScrubStart(seekSession)
+                                                    }
+                                                    onSeekChange={(value) =>
+                                                        handleScrubChange(null, value)
+                                                    }
+                                                    onSeekCommit={(value, reason, seekSession) =>
+                                                        handleScrubCommit(null, value, {
+                                                            reason,
+                                                            seekSession,
+                                                        })
+                                                    }
                                                 />
 
                                                 <LinearProgress
@@ -14261,7 +16662,7 @@ export default function Audio() {
                                                     {settingsView.delayMix.toFixed(2)} | reverb ={" "}
                                                     {settingsView.reverbMix.toFixed(2)} | playbackRate ={" "}
                                                     {settingsView.speed.toFixed(2)}x | detune ={" "}
-                                                    {pitchCents.toFixed(0)} cents | end time ={" "}
+                                                    {pitchCents.toFixed(0)} cents | media duration ={" "}
                                                     {formatTime(visibleDuration)} | effective rate ={" "}
                                                     {effectiveRate.toFixed(2)}x
                                                 </Typography>
@@ -14269,143 +16670,76 @@ export default function Audio() {
                                         </Box>
                                     )}
 
-                                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant="contained"
-                                            startIcon={
-                                                showPauseForMainControls ? <PauseRoundedIcon /> : <PlayArrowRoundedIcon />
-                                            }
-                                            onClick={handlePlayPause}
-                                            disabled={!hasMedia || isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.35,
-                                                fontWeight: 950,
-                                                color: "#06111e",
-                                                background: "linear-gradient(135deg, #67e8f9, #a78bfa)",
-                                            }}
-                                        >
-                                            {showPauseForMainControls ? "Pause playback" : "Play processed audio"}
-                                        </Button>
+                                    <>
+                                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
+                                            <LegacyMediaChromeButton
+                                                label={showPauseForMainControls ? "Pause playback" : "Play processed audio"}
+                                                icon={
+                                                    showPauseForMainControls ? (
+                                                        <PauseRoundedIcon />
+                                                    ) : (
+                                                        <PlayArrowRoundedIcon />
+                                                    )
+                                                }
+                                                variant="contained"
+                                                onClick={handlePlayPause}
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
 
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant="outlined"
-                                            startIcon={<RestartAltRoundedIcon />}
-                                            onClick={restartPlayback}
-                                            disabled={!hasMedia || isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.35,
-                                                color: "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 950,
-                                            }}
-                                        >
-                                            Restart
-                                        </Button>
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant={repeatEnabled ? "contained" : "outlined"}
-                                            startIcon={<RepeatRoundedIcon />}
-                                            onClick={toggleRepeat}
-                                            disabled={!hasMedia || isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.35,
-                                                color: repeatEnabled ? "#06111e" : "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 950,
-                                                background: repeatEnabled
-                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                    : "transparent",
-                                            }}
-                                        >
-                                            {repeatEnabled ? "Repeat on" : "Repeat off"}
-                                        </Button>
+                                            <LegacyMediaChromeButton
+                                                label="Restart"
+                                                icon={<RestartAltRoundedIcon />}
+                                                onClick={restartPlayback}
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
 
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant="outlined"
-                                            startIcon={<SkipPreviousRoundedIcon />}
-                                            onClick={playPreviousPlaylistItem}
-                                            disabled={!playlist.length || isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.35,
-                                                color: "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 950,
-                                            }}
-                                        >
-                                            Previous track
-                                        </Button>
+                                            <LegacyMediaChromeButton
+                                                label={repeatEnabled ? "Repeat on" : "Repeat off"}
+                                                icon={<RepeatRoundedIcon />}
+                                                active={repeatEnabled}
+                                                onClick={toggleRepeat}
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
 
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant="outlined"
-                                            startIcon={<SkipNextRoundedIcon />}
-                                            onClick={playNextPlaylistItem}
-                                            disabled={!playlist.length || isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.35,
-                                                color: "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 950,
-                                            }}
-                                        >
-                                            Next track
-                                        </Button>
-                                    </Stack>
+                                            <LegacyMediaChromeButton
+                                                label="Previous track"
+                                                icon={<SkipPreviousRoundedIcon />}
+                                                onClick={playPreviousPlaylistItem}
+                                                disabled={!playlist.length || isRendering || isLoading}
+                                            />
 
-                                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
-                                        <Button
-                                            fullWidth
-                                            size="large"
-                                            variant={isOutputSilenced ? "contained" : "outlined"}
-                                            startIcon={
-                                                isOutputSilenced ? (
-                                                    <VolumeUpRoundedIcon />
-                                                ) : (
-                                                    <VolumeOffRoundedIcon />
-                                                )
-                                            }
-                                            onClick={toggleMute}
-                                            disabled={isRendering || isLoading}
-                                            sx={{
-                                                borderRadius: 4,
-                                                py: 1.25,
-                                                color: isOutputSilenced ? "#06111e" : "#fff",
-                                                borderColor: "rgba(255,255,255,0.18)",
-                                                fontWeight: 950,
-                                                background: isMuted
-                                                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
-                                                    : "transparent",
-                                            }}
-                                        >
-                                            {isMuted ? "Unmute preview" : "Mute preview"}
-                                        </Button>
+                                            <LegacyMediaChromeButton
+                                                label="Next track"
+                                                icon={<SkipNextRoundedIcon />}
+                                                onClick={playNextPlaylistItem}
+                                                disabled={!playlist.length || isRendering || isLoading}
+                                            />
+                                        </Stack>
 
-                                        <Button
-                                            fullWidth
-                                            variant="text"
-                                            onClick={() => stopPlayback(true)}
-                                            disabled={!hasMedia || isRendering || isLoading}
-                                            sx={{
-                                                color: "rgba(255,255,255,0.72)",
-                                                fontWeight: 900,
-                                            }}
-                                        >
-                                            Stop and reset position
-                                        </Button>
-                                    </Stack>
+                                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
+                                            <LegacyMediaChromeButton
+                                                label={isMuted ? "Unmute preview" : "Mute preview"}
+                                                paddingY={1.25}
+                                                icon={
+                                                    isOutputSilenced ? (
+                                                        <VolumeUpRoundedIcon />
+                                                    ) : (
+                                                        <VolumeOffRoundedIcon />
+                                                    )
+                                                }
+                                                active={isMuted}
+                                                onClick={toggleMute}
+                                                disabled={isRendering || isLoading}
+                                            />
+
+                                            <LegacyMediaChromeButton
+                                                label="Stop and reset position"
+                                                variant="text"
+                                                onClick={() => stopPlayback(true)}
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
+                                        </Stack>
+                                    </>
 
                                     <Button
                                         fullWidth

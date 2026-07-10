@@ -90,16 +90,18 @@ function sanitizeSnapshotItem(item) {
 function makeNewsSnapshot({
                               rssArticles,
                               hypebeastArticles,
+                              traditionsArticles,
                               videos,
                               embeds,
                               statuses,
                               generatedAt,
                           }) {
     return {
-        version: 1,
+        version: 2,
         generatedAt,
         rssArticles: rssArticles.map(sanitizeSnapshotItem),
         hypebeastArticles: hypebeastArticles.map(sanitizeSnapshotItem),
+        traditionsArticles: traditionsArticles.map(sanitizeSnapshotItem),
         videos: videos.map(sanitizeSnapshotItem),
         embeds: embeds.map(sanitizeSnapshotItem),
         statuses,
@@ -172,8 +174,33 @@ const YOUTUBE_CHANNEL_FEEDS = [
 const FEATURED_OEMBEDS = [
     {
         type: "youtube",
-        label: "Featured YouTube Video",
+        label: "Charli xcx — Rock Music",
         sourceUrl: "https://www.youtube.com/watch?v=ox1Eemj8FDo",
+    },
+    {
+        type: "youtube",
+        label: "Featured YouTube Discovery",
+        sourceUrl: "https://www.youtube.com/watch?v=mqMZAHOhzeE",
+    },
+    {
+        type: "youtube",
+        label: "YouTube Music Classic",
+        sourceUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    },
+    {
+        type: "youtube",
+        label: "Global Music Video",
+        sourceUrl: "https://www.youtube.com/watch?v=kJQP7kiw5Fk",
+    },
+    {
+        type: "youtube",
+        label: "Pop Music Video",
+        sourceUrl: "https://www.youtube.com/watch?v=CevxZvSJLk8",
+    },
+    {
+        type: "youtube",
+        label: "YouTube Release Preview",
+        sourceUrl: "https://www.youtube.com/watch?v=JGwWNGJdvx8",
     },
     {
         type: "spotify",
@@ -182,13 +209,38 @@ const FEATURED_OEMBEDS = [
     },
     {
         type: "spotify",
-        label: "Spotify Playlist Preview",
+        label: "Today's Top Hits",
         sourceUrl: "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
     },
     {
+        type: "spotify",
+        label: "RapCaviar",
+        sourceUrl: "https://open.spotify.com/playlist/37i9dQZF1DX0XUsuxWHRQd",
+    },
+    {
+        type: "spotify",
+        label: "New Music Friday",
+        sourceUrl: "https://open.spotify.com/playlist/37i9dQZF1DX4JAvHpjipBk",
+    },
+    {
+        type: "spotify",
+        label: "Featured Spotify Track",
+        sourceUrl: "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+    },
+    {
         type: "soundcloud",
-        label: "SoundCloud Track Preview",
+        label: "SoundCloud Electronic Preview",
         sourceUrl: "https://soundcloud.com/forss/flickermood",
+    },
+    {
+        type: "soundcloud",
+        label: "SoundCloud ODESZA Preview",
+        sourceUrl: "https://soundcloud.com/odesza/say-my-name-feat-zyra",
+    },
+    {
+        type: "soundcloud",
+        label: "SoundCloud Flume Preview",
+        sourceUrl: "https://soundcloud.com/flume/never-be-like-you-feat-kai",
     },
 ];
 
@@ -203,6 +255,14 @@ function buildProxyImageUrl(imageUrl) {
 
 function buildHypebeastFeedUrl(feedKey) {
     return `${SCRAPE_API_ROOT}/hypebeastproxy?feed=${encodeURIComponent(feedKey)}`;
+}
+
+function buildTraditionsFeedUrl() {
+    const target = new URL(`${SCRAPE_API_ROOT}/traditionsofthesunproxy`);
+    target.searchParams.set("endpoint", "posts");
+    target.searchParams.set("per_page", "12");
+    target.searchParams.set("_embed", "1");
+    return target.toString();
 }
 
 function buildYoutubeFeedTarget(channelId) {
@@ -768,6 +828,85 @@ function parseHypebeastHtml(htmlText, sourceLabel) {
     return cards;
 }
 
+function getWordPressRenderedText(value) {
+    if (value && typeof value === "object" && "rendered" in value) {
+        return normalizeText(value.rendered);
+    }
+
+    return normalizeText(value);
+}
+
+function getTraditionsFeaturedImage(post) {
+    const embeddedMedia = post?._embedded?.["wp:featuredmedia"]?.[0];
+
+    const candidates = [
+        post?.jetpack_featured_media_url,
+        post?.better_featured_image?.source_url,
+        embeddedMedia?.media_details?.sizes?.large?.source_url,
+        embeddedMedia?.media_details?.sizes?.medium_large?.source_url,
+        embeddedMedia?.source_url,
+    ];
+
+    for (const candidate of candidates) {
+        const image = normalizeImageUrl(
+            candidate,
+            "https://www.traditionsofthesun.org"
+        );
+
+        if (image) return image;
+    }
+
+    const contentHtml = post?.content?.rendered || post?.excerpt?.rendered || "";
+    return (
+        extractImageFromHtml(
+            contentHtml,
+            post?.link || "https://www.traditionsofthesun.org"
+        ) || FALLBACK_IMAGE
+    );
+}
+
+function parseTraditionsPosts(payload) {
+    const posts = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.posts)
+            ? payload.posts
+            : Array.isArray(payload?.data)
+                ? payload.data
+                : [];
+
+    return posts
+        .slice(0, 12)
+        .map((post, index) => {
+            const title =
+                getWordPressRenderedText(post?.title) ||
+                "Traditions of the Sun story";
+            const description =
+                getWordPressRenderedText(post?.excerpt).slice(0, 280) ||
+                getWordPressRenderedText(post?.content).slice(0, 280) ||
+                "Open Traditions of the Sun to read the full story.";
+            const link = absoluteUrl(
+                post?.link,
+                "https://www.traditionsofthesun.org"
+            );
+
+            return {
+                id: `traditions-${post?.id || index}-${link || title}`,
+                source: "Traditions of the Sun",
+                type: "traditions",
+                title,
+                link,
+                publishedAt: post?.date_gmt || post?.date || post?.modified_gmt || "",
+                description,
+                image: getTraditionsFeaturedImage(post),
+                creator:
+                    post?._embedded?.author?.[0]?.name ||
+                    post?._embedded?.["author"]?.[0]?.name ||
+                    "Traditions of the Sun",
+            };
+        })
+        .filter((item) => item.title && item.link);
+}
+
 function parseYoutubeFeed(xmlText, sourceLabel) {
     if (isReactShellHtml(xmlText)) {
         throw new Error(`${sourceLabel} returned the React app shell instead of YouTube XML.`);
@@ -947,6 +1086,51 @@ function parseSpotifyUrl(inputUrl) {
     }
 }
 
+
+function isUpstreamFailurePayload(data) {
+    const upstreamStatus = Number(data?.upstreamStatus || 0);
+
+    return (
+        data?.ok === false ||
+        data?.fallback === true ||
+        (Number.isFinite(upstreamStatus) && upstreamStatus >= 400)
+    );
+}
+
+function getEmbedPlatform(item) {
+    return String(item?.platform || item?.type || "").toLowerCase();
+}
+
+function isRenderableEmbedCard(item) {
+    if (!item || typeof item !== "object") return false;
+
+    const platform = getEmbedPlatform(item);
+    const iframeSrc = getAllowedIframeSrcFromHtml(item.html);
+
+    if (!["youtube", "spotify", "soundcloud"].includes(platform)) {
+        return false;
+    }
+
+    if (!iframeSrc) {
+        return false;
+    }
+
+    /*
+     * SoundCloud proxy fallback payloads are synthetic cards generated after
+     * SoundCloud returned a 4xx/5xx response. Do not display those cards,
+     * because their player commonly resolves to an unavailable-track screen.
+     */
+    if (
+        platform === "soundcloud" &&
+        (item.proxyFallback === true ||
+            Number(item.upstreamStatus || 0) >= 400)
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
 function buildManualEmbedCard(item, reason) {
     if (item.type === "youtube") {
         const videoId = getYoutubeVideoId(item.sourceUrl);
@@ -956,6 +1140,7 @@ function buildManualEmbedCard(item, reason) {
         return {
             card: {
                 ...item,
+                platform: item.type,
                 title: item.label,
                 author_name: "YouTube",
                 provider_name: "YouTube",
@@ -979,6 +1164,7 @@ function buildManualEmbedCard(item, reason) {
         return {
             card: {
                 ...item,
+                platform: item.type,
                 title: item.label,
                 author_name: "Spotify",
                 provider_name: "Spotify",
@@ -1002,6 +1188,7 @@ function buildManualEmbedCard(item, reason) {
         return {
             card: {
                 ...item,
+                platform: item.type,
                 title: item.label,
                 author_name: "SoundCloud",
                 provider_name: "SoundCloud",
@@ -1028,23 +1215,83 @@ async function fetchOembedCard(item, signal) {
 
     try {
         const data = await fetchJson(proxyUrl, signal);
+        const upstreamStatus = Number(data?.upstreamStatus || 0);
+        const proxyFallback = data?.fallback === true;
+
+        /*
+         * Some SoundCloud proxy responses use HTTP 200 and ok:true while also
+         * reporting fallback:true and upstreamStatus:404. That object is not a
+         * genuine SoundCloud oEmbed result. Hide it rather than rendering a
+         * player that leads to an unavailable-track screen.
+         */
+        if (
+            item.type === "soundcloud" &&
+            isUpstreamFailurePayload(data)
+        ) {
+            return {
+                card: null,
+                status: {
+                    label: item.label,
+                    kind: "SoundCloud oEmbed",
+                    state: "fallback",
+                    message:
+                        `Hidden unavailable SoundCloud card. Upstream returned ` +
+                        `${upstreamStatus || "an error"}: ` +
+                        `${data?.reason || data?.message || data?.error || "SoundCloud oEmbed failed."}`,
+                },
+            };
+        }
 
         if (data?.ok === false) {
-            throw new Error(data?.message || data?.error || `${proxyName} returned ok:false.`);
+            throw new Error(
+                data?.message ||
+                data?.error ||
+                `${proxyName} returned ok:false.`
+            );
+        }
+
+        const normalizedHtml =
+            data?.html ||
+            (data?.iframe_url
+                ? `<iframe src="${data.iframe_url}" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy" allowfullscreen></iframe>`
+                : "");
+
+        const card = {
+            ...item,
+            ...data,
+            platform: item.type,
+            oembedType: data?.type || "",
+            type: item.type,
+            sourceUrl: item.sourceUrl,
+            label: item.label,
+            html: normalizedHtml,
+            proxyFallback,
+            upstreamStatus,
+        };
+
+        if (!isRenderableEmbedCard(card)) {
+            return {
+                card: null,
+                status: {
+                    label: item.label,
+                    kind: "oEmbed",
+                    state: "failed",
+                    message:
+                        `Hidden ${item.type} card because the proxy response did not ` +
+                        `contain a safe, playable iframe.`,
+                },
+            };
         }
 
         return {
-            card: {
-                ...item,
-                ...data,
-                sourceUrl: item.sourceUrl,
-                label: item.label,
-            },
+            card,
             status: {
                 label: item.label,
                 kind: "oEmbed",
-                state: "ok",
-                message: `Loaded through /api/${proxyName}.`,
+                state: proxyFallback ? "fallback" : "ok",
+                message: proxyFallback
+                    ? `Loaded a playable fallback through /api/${proxyName}.`
+                    : `Loaded through /api/${proxyName}.`,
             },
         };
     } catch (error) {
@@ -1053,11 +1300,21 @@ async function fetchOembedCard(item, signal) {
             error?.message || `${proxyName} failed.`
         );
 
-        if (fallback) {
+        if (fallback && isRenderableEmbedCard(fallback.card)) {
             return fallback;
         }
 
-        throw error;
+        return {
+            card: null,
+            status: {
+                label: item.label,
+                kind: "oEmbed",
+                state: "failed",
+                message:
+                    error?.message ||
+                    `${proxyName} failed and no safe fallback was available.`,
+            },
+        };
     }
 }
 
@@ -1126,6 +1383,7 @@ function NewsCard({ item }) {
     const externalMediaEnabled = useExternalMediaAfterHydration();
     const isVideo = item.type === "video";
     const isHypebeast = item.type === "hypebeast";
+    const isTraditions = item.type === "traditions";
     const preferredImage = item.imageViaProxy || item.image || FALLBACK_IMAGE;
     const [imgSrc, setImgSrc] = useState(FALLBACK_IMAGE);
 
@@ -1207,6 +1465,8 @@ function NewsCard({ item }) {
                                     <PlayCircleRounded sx={{ fontSize: 16 }} />
                                 ) : isHypebeast ? (
                                     <WhatshotRounded sx={{ fontSize: 16 }} />
+                                ) : isTraditions ? (
+                                    <AutoAwesomeRounded sx={{ fontSize: 16 }} />
                                 ) : (
                                     <ArticleRounded sx={{ fontSize: 16 }} />
                                 )
@@ -1298,7 +1558,7 @@ function EmbedCard({ item }) {
                     sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-presentation"
                     sx={{
                         width: "100%",
-                        height: item.type === "youtube" ? 245 : 360,
+                        height: getEmbedPlatform(item) === "youtube" ? 245 : 360,
                         border: 0,
                         display: "block",
                         background: "#050816",
@@ -1334,7 +1594,7 @@ function EmbedCard({ item }) {
                         />
 
                         <Chip
-                            label={item.provider_name || item.type}
+                            label={item.provider_name || item.platform || item.type}
                             size="small"
                             sx={{
                                 color: "rgba(255,255,255,.72)",
@@ -1410,84 +1670,118 @@ function statusIcon(state) {
     return <ErrorOutlineRounded sx={{ fontSize: 17, color: "#ef4444" }} />;
 }
 
-function BottomStatusPanel({ statuses, loading }) {
+function BottomStatusPanel({ statuses, loading, onRefresh }) {
     const failedCount = statuses.filter((item) => item.state === "failed").length;
     const fallbackCount = statuses.filter((item) => item.state === "fallback").length;
     const okCount = statuses.filter((item) => item.state === "ok").length;
 
     return (
         <Paper
+            component="section"
+            aria-labelledby="request-status-heading"
             elevation={12}
             sx={{
-                position: "fixed",
-                left: { xs: 10, md: 24 },
-                right: { xs: 10, md: 24 },
-                bottom: { xs: 10, md: 18 },
-                zIndex: 1400,
-                p: { xs: 1.25, md: 1.6 },
+                mt: 6,
+                p: { xs: 2, md: 2.5 },
                 border: "1px solid rgba(255,255,255,.14)",
                 background:
-                    "linear-gradient(135deg, rgba(7,10,19,.94), rgba(13,18,36,.94))",
-                backdropFilter: "blur(18px)",
-                boxShadow: "0 24px 80px rgba(0,0,0,.45)",
+                    "linear-gradient(135deg, rgba(7,10,19,.96), rgba(13,18,36,.96))",
+                boxShadow: "0 24px 80px rgba(0,0,0,.38)",
             }}
         >
-            <Stack spacing={1}>
+            <Stack spacing={1.5}>
                 <Stack
-                    direction={{ xs: "column", sm: "row" }}
+                    direction={{ xs: "column", md: "row" }}
                     justifyContent="space-between"
-                    alignItems={{ xs: "flex-start", sm: "center" }}
-                    spacing={1}
+                    alignItems={{ xs: "stretch", md: "center" }}
+                    spacing={1.5}
                 >
-                    <Typography sx={{ color: "#fff", fontWeight: 950 }}>
-                        News API status{" "}
-                        {loading ? (
-                            <Typography component="span" sx={{ color: "rgba(255,255,255,.62)" }}>
-                                — refreshing...
-                            </Typography>
-                        ) : null}
-                    </Typography>
+                    <Box>
+                        <Typography
+                            id="request-status-heading"
+                            sx={{ color: "#fff", fontWeight: 950 }}
+                        >
+                            News request status
+                        </Typography>
+                        <Typography
+                            variant="body2"
+                            sx={{ color: "rgba(255,255,255,.58)" }}
+                        >
+                            This request bar stays at the bottom of the page and reports every
+                            RSS, WordPress, YouTube, Spotify, and SoundCloud request.
+                        </Typography>
+                    </Box>
 
-                    <Stack direction="row" spacing={1} flexWrap="wrap">
-                        <Chip size="small" label={`${okCount} loaded`} sx={{ color: "#fff" }} />
-                        <Chip
-                            size="small"
-                            label={`${fallbackCount} fallback`}
-                            sx={{ color: "#fff" }}
-                        />
-                        <Chip size="small" label={`${failedCount} failed`} sx={{ color: "#fff" }} />
+                    <Stack
+                        direction={{ xs: "column", sm: "row" }}
+                        spacing={1}
+                        alignItems={{ xs: "stretch", sm: "center" }}
+                    >
+                        <Stack direction="row" spacing={1} flexWrap="wrap">
+                            <Chip size="small" label={`${okCount} loaded`} sx={{ color: "#fff" }} />
+                            <Chip
+                                size="small"
+                                label={`${fallbackCount} fallback`}
+                                sx={{ color: "#fff" }}
+                            />
+                            <Chip
+                                size="small"
+                                label={`${failedCount} failed`}
+                                sx={{ color: "#fff" }}
+                            />
+                        </Stack>
+
+                        <Button
+                            variant="outlined"
+                            startIcon={
+                                loading ? (
+                                    <CircularProgress size={16} color="inherit" />
+                                ) : (
+                                    <RefreshRounded />
+                                )
+                            }
+                            onClick={onRefresh}
+                            disabled={loading}
+                            sx={{
+                                borderColor: "rgba(103,232,249,.38)",
+                                color: "#67e8f9",
+                                fontWeight: 900,
+                            }}
+                        >
+                            {loading ? "Requesting..." : "Run requests again"}
+                        </Button>
                     </Stack>
                 </Stack>
 
-                <Box
-                    sx={{
-                        maxHeight: 92,
-                        overflow: "auto",
-                        pr: 0.5,
-                    }}
-                >
+                <Box sx={{ maxHeight: 160, overflow: "auto", pr: 0.5 }}>
                     <Stack direction="row" spacing={1} flexWrap="wrap">
-                        {statuses.map((item, index) => (
-                            <Chip
-                                key={`${item.label}-${index}`}
-                                size="small"
-                                icon={statusIcon(item.state)}
-                                label={`${item.label}: ${item.state}`}
-                                title={item.message}
-                                sx={{
-                                    color: "rgba(255,255,255,.86)",
-                                    borderColor: "rgba(255,255,255,.12)",
-                                    background:
-                                        item.state === "ok"
-                                            ? "rgba(34,197,94,.10)"
-                                            : item.state === "fallback"
-                                                ? "rgba(245,158,11,.12)"
-                                                : "rgba(239,68,68,.12)",
-                                    mb: 0.75,
-                                }}
-                                variant="outlined"
-                            />
-                        ))}
+                        {statuses.length > 0 ? (
+                            statuses.map((item, index) => (
+                                <Chip
+                                    key={`${item.label}-${index}`}
+                                    size="small"
+                                    icon={statusIcon(item.state)}
+                                    label={`${item.label}: ${item.state}`}
+                                    title={item.message}
+                                    sx={{
+                                        color: "rgba(255,255,255,.86)",
+                                        borderColor: "rgba(255,255,255,.12)",
+                                        background:
+                                            item.state === "ok"
+                                                ? "rgba(34,197,94,.10)"
+                                                : item.state === "fallback"
+                                                    ? "rgba(245,158,11,.12)"
+                                                    : "rgba(239,68,68,.12)",
+                                        mb: 0.75,
+                                    }}
+                                    variant="outlined"
+                                />
+                            ))
+                        ) : (
+                            <Typography variant="body2" sx={{ color: "rgba(255,255,255,.58)" }}>
+                                No requests have completed yet.
+                            </Typography>
+                        )}
                     </Stack>
                 </Box>
             </Stack>
@@ -1515,8 +1809,13 @@ function buildArticleSchema(items) {
     }));
 }
 
-function SeoBlock({ articles, hypebeastArticles, videos }) {
-    const allItems = [...articles, ...hypebeastArticles, ...videos].filter(Boolean);
+function SeoBlock({ articles, hypebeastArticles, traditionsArticles, videos }) {
+    const allItems = [
+        ...articles,
+        ...hypebeastArticles,
+        ...traditionsArticles,
+        ...videos,
+    ].filter(Boolean);
     const itemList = allItems.slice(0, 24).map((item, index) => ({
         "@type": "ListItem",
         position: index + 1,
@@ -1534,7 +1833,7 @@ function SeoBlock({ articles, hypebeastArticles, videos }) {
                 url: PAGE_URL,
                 name: "Music News, Releases & Culture | AudioMaster Lab",
                 description:
-                    "Fresh music news, NPR Music stories, Hypebeast culture updates, YouTube videos, Spotify embeds, and SoundCloud previews.",
+                    "Fresh music news, NPR Music stories, Hypebeast culture updates, Traditions of the Sun articles, YouTuber videos, Spotify embeds, and SoundCloud previews.",
                 isPartOf: {
                     "@type": "WebSite",
                     "@id": `${SITE_ROOT}/#website`,
@@ -1577,11 +1876,11 @@ function SeoBlock({ articles, hypebeastArticles, videos }) {
             <title>Music News, Releases & Culture | AudioMaster Lab</title>
             <meta
                 name="description"
-                content="Fresh music news, NPR Music stories, Hypebeast culture updates, YouTube videos, Spotify embeds, and SoundCloud previews from AudioMaster Lab."
+                content="Fresh music news, NPR Music stories, Hypebeast culture updates, Traditions of the Sun articles, YouTuber videos, Spotify embeds, and SoundCloud previews from AudioMaster Lab."
             />
             <meta
                 name="keywords"
-                content="music news, AudioMaster Lab, NPR Music, Hypebeast music, YouTube Music, Spotify, SoundCloud, new releases, music culture"
+                content="music news, AudioMaster Lab, NPR Music, Hypebeast music, Traditions of the Sun, YouTubers, YouTube Music, Spotify, SoundCloud, new releases, music culture"
             />
             <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1" />
             <meta name="googlebot" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1" />
@@ -1624,6 +1923,9 @@ export default function NewsPage() {
     const [hypebeastArticles, setHypebeastArticles] = useState(
         () => initialSnapshot?.hypebeastArticles || []
     );
+    const [traditionsArticles, setTraditionsArticles] = useState(
+        () => initialSnapshot?.traditionsArticles || []
+    );
     const [videos, setVideos] = useState(
         () => initialSnapshot?.videos || []
     );
@@ -1643,6 +1945,7 @@ export default function NewsPage() {
             makeNewsSnapshot({
                 rssArticles,
                 hypebeastArticles,
+                traditionsArticles,
                 videos,
                 embeds,
                 statuses,
@@ -1651,6 +1954,7 @@ export default function NewsPage() {
         [
             rssArticles,
             hypebeastArticles,
+            traditionsArticles,
             videos,
             embeds,
             statuses,
@@ -1710,6 +2014,17 @@ export default function NewsPage() {
                 };
             });
 
+            const traditionsJobs = [
+                (async () => {
+                    const data = await fetchJson(buildTraditionsFeedUrl(), signal);
+
+                    return {
+                        label: "Traditions of the Sun",
+                        items: parseTraditionsPosts(data),
+                    };
+                })(),
+            ];
+
             const videoJobs = YOUTUBE_CHANNEL_FEEDS.map(async (feed) => {
                 const targetUrl = buildYoutubeFeedTarget(feed.channelId);
                 const proxyUrl = buildProxyUrl("youtuberssproxy", targetUrl);
@@ -1729,13 +2044,19 @@ export default function NewsPage() {
                 fetchOembedCard(item, signal)
             );
 
-            const [nprSettled, hypebeastSettled, videoSettled, embedSettled] =
-                await Promise.all([
-                    Promise.allSettled(nprJobs),
-                    Promise.allSettled(hypebeastJobs),
-                    Promise.allSettled(videoJobs),
-                    Promise.allSettled(embedJobs),
-                ]);
+            const [
+                nprSettled,
+                hypebeastSettled,
+                traditionsSettled,
+                videoSettled,
+                embedSettled,
+            ] = await Promise.all([
+                Promise.allSettled(nprJobs),
+                Promise.allSettled(hypebeastJobs),
+                Promise.allSettled(traditionsJobs),
+                Promise.allSettled(videoJobs),
+                Promise.allSettled(embedJobs),
+            ]);
 
             const nextRssArticles = nprSettled
                 .filter((result) => result.status === "fulfilled")
@@ -1767,6 +2088,20 @@ export default function NewsPage() {
                 )
                 .slice(0, 15);
 
+            const nextTraditionsArticles = traditionsSettled
+                .filter((result) => result.status === "fulfilled")
+                .flatMap((result) => result.value.items)
+                .filter((item) => item.title && item.link)
+                .filter((item, index, array) =>
+                    array.findIndex((other) => other.link === item.link) === index
+                )
+                .sort(
+                    (a, b) =>
+                        new Date(b.publishedAt || 0) -
+                        new Date(a.publishedAt || 0)
+                )
+                .slice(0, 12);
+
             const nextVideos = videoSettled
                 .filter((result) => result.status === "fulfilled")
                 .flatMap((result) => result.value.items)
@@ -1781,7 +2116,8 @@ export default function NewsPage() {
             const nextEmbeds = embedSettled
                 .filter((result) => result.status === "fulfilled")
                 .map((result) => result.value.card)
-                .filter((item) => item.title || item.html || item.thumbnail_url);
+                .filter(Boolean)
+                .filter(isRenderableEmbedCard);
 
             const nextStatuses = [
                 ...nprSettled.map((result, index) => ({
@@ -1800,6 +2136,15 @@ export default function NewsPage() {
                     message:
                         result.status === "fulfilled"
                             ? "Loaded through hypebeastproxy with empty-card filtering."
+                            : result.reason?.message || "Failed.",
+                })),
+                ...traditionsSettled.map((result) => ({
+                    label: "Traditions of the Sun",
+                    kind: "WordPress REST",
+                    state: result.status === "fulfilled" ? "ok" : "failed",
+                    message:
+                        result.status === "fulfilled"
+                            ? "Loaded through traditionsofthesunproxy using public wp/v2 posts."
                             : result.reason?.message || "Failed.",
                 })),
                 ...videoSettled.map((result, index) => ({
@@ -1827,6 +2172,7 @@ export default function NewsPage() {
 
             setRssArticles(nextRssArticles);
             setHypebeastArticles(nextHypebeastArticles);
+            setTraditionsArticles(nextTraditionsArticles);
             setVideos(nextVideos);
             setEmbeds(nextEmbeds);
             setStatuses(nextStatuses);
@@ -1861,6 +2207,28 @@ export default function NewsPage() {
         };
     }, [loadNews]);
 
+    const youtubeEmbeds = useMemo(
+        () =>
+            embeds.filter(
+                (item) => (item.platform || item.type) === "youtube"
+            ),
+        [embeds]
+    );
+    const spotifyEmbeds = useMemo(
+        () =>
+            embeds.filter(
+                (item) => (item.platform || item.type) === "spotify"
+            ),
+        [embeds]
+    );
+    const soundCloudEmbeds = useMemo(
+        () =>
+            embeds.filter(
+                (item) => (item.platform || item.type) === "soundcloud"
+            ),
+        [embeds]
+    );
+
     return (
         <Box
             component="main"
@@ -1869,12 +2237,13 @@ export default function NewsPage() {
                 color: "#fff",
                 background:
                     "radial-gradient(circle at top left, rgba(103,232,249,.16), transparent 35%), radial-gradient(circle at top right, rgba(167,139,250,.18), transparent 36%), #070a13",
-                pb: 18,
+                pb: 6,
             }}
         >
             <SeoBlock
                 articles={rssArticles}
                 hypebeastArticles={hypebeastArticles}
+                traditionsArticles={traditionsArticles}
                 videos={videos}
             />
 
@@ -1919,7 +2288,8 @@ export default function NewsPage() {
                             <SourceChip icon={<RssFeedRounded sx={{ fontSize: 16 }} />} label="RSS" />
                             <SourceChip icon={<PlayCircleRounded sx={{ fontSize: 16 }} />} label="YouTube" />
                             <SourceChip icon={<MusicNoteRounded sx={{ fontSize: 16 }} />} label="Spotify" />
-                            <SourceChip icon={<AutoAwesomeRounded sx={{ fontSize: 16 }} />} label="Culture" />
+                            <SourceChip icon={<MusicNoteRounded sx={{ fontSize: 16 }} />} label="SoundCloud" />
+                            <SourceChip icon={<AutoAwesomeRounded sx={{ fontSize: 16 }} />} label="Traditions of the Sun" />
                         </Stack>
 
                         <Typography
@@ -1943,9 +2313,10 @@ export default function NewsPage() {
                             }}
                         >
                             AudioMaster Lab pulls NPR Music RSS, Hypebeast culture feeds,
-                            YouTube channel RSS, and platform previews through your
-                            scrapewebsite proxy APIs. NPR images are read directly from RSS
-                            content, which avoids the NPR article-page 520 errors.
+                            Traditions of the Sun WordPress posts, YouTuber channel RSS, and
+                            expanded Spotify and SoundCloud previews through your scrapewebsite
+                            proxy APIs. NPR images are read directly from RSS content, avoiding
+                            the NPR article-page 520 errors.
                         </Typography>
 
                         <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5}>
@@ -2020,6 +2391,45 @@ export default function NewsPage() {
                         )}
                     </Box>
 
+                    <Box component="section" aria-labelledby="traditions-heading">
+                        <Stack sx={{ mb: 2.5 }}>
+                            <Typography
+                                id="traditions-heading"
+                                variant="h2"
+                                sx={{
+                                    fontSize: { xs: 28, md: 34 },
+                                    fontWeight: 950,
+                                    letterSpacing: "-.035em",
+                                }}
+                            >
+                                Traditions of the Sun
+                            </Typography>
+
+                            <Typography sx={{ color: "rgba(255,255,255,.62)" }}>
+                                Public WordPress stories loaded through
+                                `/api/traditionsofthesunproxy?endpoint=posts&amp;per_page=12&amp;_embed=1`.
+                            </Typography>
+                        </Stack>
+
+                        <Divider sx={{ mb: 3, borderColor: "rgba(255,255,255,.08)" }} />
+
+                        {loading && traditionsArticles.length === 0 ? (
+                            <Box sx={{ py: 7, textAlign: "center" }}>
+                                <CircularProgress />
+                            </Box>
+                        ) : traditionsArticles.length > 0 ? (
+                            <Grid container spacing={2.5}>
+                                {traditionsArticles.map((item) => (
+                                    <Grid item xs={12} md={6} lg={4} key={item.id}>
+                                        <NewsCard item={item} />
+                                    </Grid>
+                                ))}
+                            </Grid>
+                        ) : (
+                            <EmptyState label="No Traditions of the Sun posts loaded. Check /api/traditionsofthesunproxy and confirm the proxy was deployed beside the other API routes." />
+                        )}
+                    </Box>
+
                     <Box component="section" aria-labelledby="npr-heading">
                         <Stack sx={{ mb: 2.5 }}>
                             <Typography id="npr-heading" variant="h2" sx={{ fontSize: { xs: 28, md: 34 }, fontWeight: 950, letterSpacing: "-.035em" }}>
@@ -2054,11 +2464,11 @@ export default function NewsPage() {
                     <Box component="section" aria-labelledby="video-heading">
                         <Stack sx={{ mb: 2.5 }}>
                             <Typography id="video-heading" variant="h2" sx={{ fontSize: { xs: 28, md: 34 }, fontWeight: 950, letterSpacing: "-.035em" }}>
-                                Latest music videos
+                                YouTubers and music creator channels
                             </Typography>
 
                             <Typography sx={{ color: "rgba(255,255,255,.62)" }}>
-                                YouTube channel RSS cards with parsed media thumbnails.
+                                YouTuber and official music-channel RSS cards with parsed media thumbnails, plus featured YouTube embeds.
                             </Typography>
                         </Stack>
 
@@ -2079,29 +2489,53 @@ export default function NewsPage() {
                         ) : (
                             <EmptyState label="No video cards loaded yet. Check /api/youtuberssproxy." />
                         )}
+
+                        {youtubeEmbeds.length > 0 ? (
+                            <Grid container spacing={2.5} sx={{ mt: 0.5 }}>
+                                {youtubeEmbeds.map((item, index) => (
+                                    <Grid
+                                        item
+                                        xs={12}
+                                        md={6}
+                                        lg={4}
+                                        key={`${item.type}-${item.sourceUrl}-${index}`}
+                                    >
+                                        <EmbedCard item={item} />
+                                    </Grid>
+                                ))}
+                            </Grid>
+                        ) : null}
                     </Box>
 
-                    <Box component="section" aria-labelledby="previews-heading">
+                    <Box component="section" aria-labelledby="spotify-heading">
                         <Stack sx={{ mb: 2.5 }}>
-                            <Typography id="previews-heading" variant="h2" sx={{ fontSize: { xs: 28, md: 34 }, fontWeight: 950, letterSpacing: "-.035em" }}>
-                                New release and platform previews
+                            <Typography
+                                id="spotify-heading"
+                                variant="h2"
+                                sx={{
+                                    fontSize: { xs: 28, md: 34 },
+                                    fontWeight: 950,
+                                    letterSpacing: "-.035em",
+                                }}
+                            >
+                                Spotify release radar
                             </Typography>
 
                             <Typography sx={{ color: "rgba(255,255,255,.62)" }}>
-                                YouTube, Spotify, and SoundCloud previews with safe iframe
-                                rendering and manual fallback cards.
+                                Multiple albums, playlists, and tracks loaded through
+                                `/api/spotifyoembedproxy`, with safe direct-player fallback.
                             </Typography>
                         </Stack>
 
                         <Divider sx={{ mb: 3, borderColor: "rgba(255,255,255,.08)" }} />
 
-                        {loading && embeds.length === 0 ? (
+                        {loading && spotifyEmbeds.length === 0 ? (
                             <Box sx={{ py: 7, textAlign: "center" }}>
                                 <CircularProgress />
                             </Box>
-                        ) : embeds.length > 0 ? (
+                        ) : spotifyEmbeds.length > 0 ? (
                             <Grid container spacing={2.5}>
-                                {embeds.map((item, index) => (
+                                {spotifyEmbeds.map((item, index) => (
                                     <Grid
                                         item
                                         xs={12}
@@ -2114,13 +2548,63 @@ export default function NewsPage() {
                                 ))}
                             </Grid>
                         ) : (
-                            <EmptyState label="No embed previews loaded yet. Check the oEmbed proxy routes." />
+                            <EmptyState label="No Spotify embeds loaded. Check /api/spotifyoembedproxy." />
+                        )}
+                    </Box>
+
+                    <Box component="section" aria-labelledby="soundcloud-heading">
+                        <Stack sx={{ mb: 2.5 }}>
+                            <Typography
+                                id="soundcloud-heading"
+                                variant="h2"
+                                sx={{
+                                    fontSize: { xs: 28, md: 34 },
+                                    fontWeight: 950,
+                                    letterSpacing: "-.035em",
+                                }}
+                            >
+                                SoundCloud listening room
+                            </Typography>
+
+                            <Typography sx={{ color: "rgba(255,255,255,.62)" }}>
+                                Expanded SoundCloud tracks loaded through
+                                `/api/soundcloudoembedproxy`, with the secure SoundCloud player
+                                used whenever oEmbed metadata is unavailable.
+                            </Typography>
+                        </Stack>
+
+                        <Divider sx={{ mb: 3, borderColor: "rgba(255,255,255,.08)" }} />
+
+                        {loading && soundCloudEmbeds.length === 0 ? (
+                            <Box sx={{ py: 7, textAlign: "center" }}>
+                                <CircularProgress />
+                            </Box>
+                        ) : soundCloudEmbeds.length > 0 ? (
+                            <Grid container spacing={2.5}>
+                                {soundCloudEmbeds.map((item, index) => (
+                                    <Grid
+                                        item
+                                        xs={12}
+                                        md={6}
+                                        lg={4}
+                                        key={`${item.type}-${item.sourceUrl}-${index}`}
+                                    >
+                                        <EmbedCard item={item} />
+                                    </Grid>
+                                ))}
+                            </Grid>
+                        ) : (
+                            <EmptyState label="No SoundCloud embeds loaded. Check /api/soundcloudoembedproxy." />
                         )}
                     </Box>
                 </Stack>
-            </Container>
 
-            <BottomStatusPanel statuses={statuses} loading={loading} />
+                <BottomStatusPanel
+                    statuses={statuses}
+                    loading={loading}
+                    onRefresh={loadNews}
+                />
+            </Container>
         </Box>
     );
 }
