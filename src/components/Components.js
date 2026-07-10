@@ -40,6 +40,73 @@ import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownR
 import NewspaperRoundedIcon from "@mui/icons-material/NewspaperRounded";
 import InfoRoundedIcon from "@mui/icons-material/InfoRounded";
 
+const TOP_LEVEL_NAV_ITEMS = [
+    {
+        label: "Home",
+        path: "/",
+        Icon: HomeRoundedIcon,
+    },
+    {
+        label: "Audio Tool",
+        path: "/audio",
+        Icon: GraphicEqRoundedIcon,
+    },
+    {
+        label: "YouTube",
+        path: "/youtube",
+        Icon: YouTubeIcon,
+    },
+    {
+        label: "Archive",
+        path: "/archive",
+        Icon: AudioFileRoundedIcon,
+    },
+];
+
+const TOOLS_NAV_ITEMS = [
+    {
+        label: "Recorder",
+        path: "/recorder",
+        Icon: MicRoundedIcon,
+    },
+    {
+        label: "Editor",
+        path: "/editor",
+        Icon: TimelineRoundedIcon,
+    },
+    {
+        label: "Transcribe",
+        path: "/transcribe",
+        Icon: SubtitlesRoundedIcon,
+    },
+    {
+        label: "Visualizer",
+        path: "/visualizer",
+        Icon: ThreeDRotationRoundedIcon,
+    },
+];
+
+const INFO_NAV_ITEMS = [
+    {
+        label: "News",
+        path: "/news",
+        Icon: NewspaperRoundedIcon,
+    },
+    {
+        label: "Community",
+        path: "/community",
+        Icon: PeopleRoundedIcon,
+    },
+];
+
+function pathIsActive(pathname, path) {
+    if (path === "/") {
+        return pathname === "/";
+    }
+
+    return pathname === path || pathname.startsWith(`${path}/`);
+}
+
 export function NavBar() {
     const location = useLocation();
 
@@ -49,86 +116,92 @@ export function NavBar() {
     const toolsOpen = Boolean(toolsAnchorEl);
     const infoOpen = Boolean(infoAnchorEl);
 
-    const topLevelItems = [
-        {
-            label: "Home",
-            path: "/",
-            icon: <HomeRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "Audio Tool",
-            path: "/audio",
-            icon: <GraphicEqRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "YouTube",
-            path: "/youtube",
-            icon: <YouTubeIcon fontSize="small" />,
-        },
-        {
-            label: "Archive",
-            path: "/archive",
-            icon: <AudioFileRoundedIcon fontSize="small" />,
-        },
-    ];
+    const toolsButtonId = "audiomasterlab-tools-button";
+    const toolsMenuId = "audiomasterlab-tools-menu";
+    const infoButtonId = "audiomasterlab-info-button";
+    const infoMenuId = "audiomasterlab-info-menu";
 
-    const toolsItems = [
-        {
-            label: "Recorder",
-            path: "/recorder",
-            icon: <MicRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "Editor",
-            path: "/editor",
-            icon: <TimelineRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "Transcribe",
-            path: "/transcribe",
-            icon: <SubtitlesRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "Visualizer",
-            path: "/visualizer",
-            icon: <ThreeDRotationRoundedIcon fontSize="small" />,
-        },
-    ];
+    const closeToolsMenu = React.useCallback(() => {
+        setToolsAnchorEl(null);
+    }, []);
 
-    const infoItems = [
-        {
-            label: "News",
-            path: "/news",
-            icon: <NewspaperRoundedIcon fontSize="small" />,
-        },
-        {
-            label: "Community",
-            path: "/community",
-            icon: <PeopleRoundedIcon fontSize="small" />,
-        },
-    ];
+    const closeInfoMenu = React.useCallback(() => {
+        setInfoAnchorEl(null);
+    }, []);
 
-    const isActivePath = (path) => {
-        if (path === "/") {
-            return location.pathname === "/";
+    const closeAllMenus = React.useCallback(() => {
+        setToolsAnchorEl(null);
+        setInfoAnchorEl(null);
+    }, []);
+
+    const toggleToolsMenu = React.useCallback((event) => {
+        const nextAnchor = event.currentTarget;
+
+        setInfoAnchorEl(null);
+        setToolsAnchorEl((currentAnchor) =>
+            currentAnchor ? null : nextAnchor
+        );
+    }, []);
+
+    const toggleInfoMenu = React.useCallback((event) => {
+        const nextAnchor = event.currentTarget;
+
+        setToolsAnchorEl(null);
+        setInfoAnchorEl((currentAnchor) =>
+            currentAnchor ? null : nextAnchor
+        );
+    }, []);
+
+    React.useEffect(() => {
+        closeAllMenus();
+    }, [location.pathname, closeAllMenus]);
+
+    React.useEffect(() => {
+        if (typeof window === "undefined") {
+            return undefined;
         }
 
-        return location.pathname === path || location.pathname.startsWith(`${path}/`);
-    };
+        const handleOrientationChange = () => {
+            closeAllMenus();
+        };
 
-    const toolsActive = toolsItems.some((item) => isActivePath(item.path));
-    const infoActive = infoItems.some((item) => isActivePath(item.path));
+        window.addEventListener(
+            "orientationchange",
+            handleOrientationChange
+        );
+
+        return () => {
+            window.removeEventListener(
+                "orientationchange",
+                handleOrientationChange
+            );
+        };
+    }, [closeAllMenus]);
+
+    const toolsActive = TOOLS_NAV_ITEMS.some((item) =>
+        pathIsActive(location.pathname, item.path)
+    );
+
+    const infoActive = INFO_NAV_ITEMS.some((item) =>
+        pathIsActive(location.pathname, item.path)
+    );
 
     const navButtonSx = (active) => ({
         flex: "0 0 auto",
+        minWidth: { xs: 44, sm: 64 },
+        minHeight: 44,
+        px: { xs: 1.25, sm: 2.2 },
         borderRadius: 999,
         color: active ? "#08111f" : "rgba(255,255,255,0.78)",
         background: active
             ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
             : "transparent",
         fontWeight: 900,
-        px: { xs: 1.35, sm: 2.2 },
-        minWidth: { xs: "auto", sm: 64 },
+        whiteSpace: "nowrap",
+        touchAction: "manipulation",
+        WebkitTapHighlightColor: "transparent",
+        WebkitTouchCallout: "none",
+        userSelect: "none",
         "& .MuiButton-startIcon": {
             mr: { xs: 0, sm: 0.8 },
         },
@@ -140,55 +213,100 @@ export function NavBar() {
                 ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
                 : "rgba(255,255,255,0.08)",
         },
+        "&:focus-visible": {
+            outline: "3px solid rgba(103,232,249,0.52)",
+            outlineOffset: 2,
+        },
+        "@media (hover: none)": {
+            "&:hover": {
+                background: active
+                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                    : "transparent",
+            },
+            "&:active": {
+                background: active
+                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                    : "rgba(255,255,255,0.12)",
+            },
+        },
     });
 
-    const dropdownButtonSx = (active) => ({
+    const dropdownButtonSx = (active, open) => ({
         ...navButtonSx(active),
         "& .MuiButton-endIcon": {
-            ml: { xs: 0, sm: 0.7 },
+            ml: { xs: 0.2, sm: 0.7 },
+        },
+        "& .MuiButton-endIcon svg": {
+            transition: "transform 160ms ease",
+            transform: open ? "rotate(180deg)" : "rotate(0deg)",
         },
     });
 
     const menuPaperSx = {
-        mt: 1.2,
-        minWidth: 220,
+        mt: 1,
+        minWidth: 224,
+        maxWidth: "calc(100vw - 16px)",
         borderRadius: 4,
         overflow: "hidden",
         color: "#fff",
         background:
-            "linear-gradient(135deg, rgba(13,18,36,0.98), rgba(18,25,52,0.96))",
+            "linear-gradient(135deg, rgba(13,18,36,0.99), rgba(18,25,52,0.98))",
         border: "1px solid rgba(255,255,255,0.12)",
-        boxShadow: "0 22px 70px rgba(0,0,0,0.38)",
+        boxShadow: "0 22px 70px rgba(0,0,0,0.42)",
         backdropFilter: "blur(18px)",
+        WebkitBackdropFilter: "blur(18px)",
+        transformOrigin: "top right",
+        overscrollBehavior: "contain",
     };
 
     const menuItemSx = (active) => ({
         gap: 1,
-        py: 1.2,
+        minHeight: 48,
+        mx: 0.25,
+        my: 0.2,
+        py: 1.15,
         px: 1.5,
         borderRadius: 3,
-        color: active ? "#06111e" : "rgba(255,255,255,0.82)",
+        color: active ? "#06111e" : "rgba(255,255,255,0.84)",
         background: active
             ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
             : "transparent",
         fontWeight: 900,
+        touchAction: "manipulation",
+        WebkitTapHighlightColor: "transparent",
+        WebkitTouchCallout: "none",
+        userSelect: "none",
         "&:hover": {
             background: active
                 ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
                 : "rgba(255,255,255,0.08)",
         },
+        "&:focus-visible": {
+            outline: "2px solid rgba(103,232,249,0.72)",
+            outlineOffset: -2,
+        },
         "& .MuiListItemIcon-root": {
             minWidth: 34,
             color: active ? "#06111e" : "rgba(255,255,255,0.72)",
         },
+        "@media (hover: none)": {
+            "&:hover": {
+                background: active
+                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                    : "transparent",
+            },
+            "&:active": {
+                background: active
+                    ? "linear-gradient(135deg, #67e8f9, #a78bfa)"
+                    : "rgba(255,255,255,0.12)",
+            },
+        },
     });
 
-    const closeToolsMenu = () => {
-        setToolsAnchorEl(null);
-    };
-
-    const closeInfoMenu = () => {
-        setInfoAnchorEl(null);
+    const handleMenuListKeyDown = (closeMenu) => (event) => {
+        if (event.key === "Tab" || event.key === "Escape") {
+            closeMenu();
+        }
     };
 
     return (
@@ -200,18 +318,26 @@ export function NavBar() {
                 background:
                     "linear-gradient(90deg, rgba(8,11,24,0.96), rgba(14,20,42,0.94))",
                 backdropFilter: "blur(14px)",
-                zIndex: 50,
+                WebkitBackdropFilter: "blur(14px)",
+                zIndex: (theme) => theme.zIndex.appBar,
             }}
         >
-            <Toolbar sx={{ minHeight: 76 }}>
+            <Toolbar
+                disableGutters
+                sx={{
+                    minHeight: 76,
+                    px: { xs: 1, sm: 2 },
+                }}
+            >
                 <Container
                     maxWidth="xl"
                     sx={{
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "space-between",
-                        gap: 2,
-                        px: { xs: 1, sm: 2 },
+                        gap: { xs: 1, sm: 2 },
+                        px: { xs: 0, sm: 1 },
+                        minWidth: 0,
                     }}
                 >
                     <Stack
@@ -220,10 +346,15 @@ export function NavBar() {
                         direction="row"
                         spacing={1.4}
                         alignItems="center"
+                        aria-label="AudioMaster Lab home"
+                        onClick={closeAllMenus}
                         sx={{
                             minWidth: 0,
+                            flex: "0 0 auto",
                             textDecoration: "none",
                             color: "inherit",
+                            touchAction: "manipulation",
+                            WebkitTapHighlightColor: "transparent",
                         }}
                     >
                         <Box
@@ -236,14 +367,20 @@ export function NavBar() {
                                 placeItems: "center",
                                 background:
                                     "linear-gradient(135deg, rgba(103,232,249,0.95), rgba(167,139,250,0.95))",
-                                boxShadow: "0 16px 44px rgba(103,232,249,0.22)",
+                                boxShadow:
+                                    "0 16px 44px rgba(103,232,249,0.22)",
                                 color: "#06111e",
                             }}
                         >
                             <AudiotrackRoundedIcon />
                         </Box>
 
-                        <Box sx={{ minWidth: 0, display: { xs: "none", sm: "block" } }}>
+                        <Box
+                            sx={{
+                                minWidth: 0,
+                                display: { xs: "none", sm: "block" },
+                            }}
+                        >
                             <Typography
                                 variant="h6"
                                 sx={{
@@ -258,7 +395,10 @@ export function NavBar() {
 
                             <Typography
                                 variant="caption"
-                                sx={{ color: "rgba(255,255,255,0.62)" }}
+                                sx={{
+                                    color: "rgba(255,255,255,0.62)",
+                                    whiteSpace: "nowrap",
+                                }}
                             >
                                 WebAudio mastering + playlists
                             </Typography>
@@ -266,27 +406,46 @@ export function NavBar() {
                     </Stack>
 
                     <Stack
+                        component="nav"
+                        aria-label="Primary navigation"
                         direction="row"
-                        spacing={{ xs: 0.5, sm: 1 }}
+                        spacing={{ xs: 0.45, sm: 1 }}
                         sx={{
-                            overflowX: "auto",
+                            minWidth: 0,
                             maxWidth: "100%",
-                            pb: 0.2,
+                            overflowX: "auto",
+                            overflowY: "hidden",
+                            pb: 0.25,
+                            pr: 0.25,
+                            scrollBehavior: "smooth",
+                            WebkitOverflowScrolling: "touch",
+                            overscrollBehaviorX: "contain",
+                            scrollbarWidth: "none",
                             "&::-webkit-scrollbar": {
-                                height: 0,
+                                display: "none",
                             },
                         }}
                     >
-                        {topLevelItems.map((item) => {
-                            const active = isActivePath(item.path);
+                        {TOP_LEVEL_NAV_ITEMS.map((item) => {
+                            const active = pathIsActive(
+                                location.pathname,
+                                item.path
+                            );
+                            const ItemIcon = item.Icon;
 
                             return (
                                 <Button
                                     key={item.path}
                                     component={RouterLink}
                                     to={item.path}
-                                    startIcon={item.icon}
+                                    type="button"
+                                    aria-current={active ? "page" : undefined}
+                                    aria-label={item.label}
+                                    startIcon={
+                                        <ItemIcon fontSize="small" />
+                                    }
                                     variant={active ? "contained" : "text"}
+                                    onClick={closeAllMenus}
                                     sx={navButtonSx(active)}
                                 >
                                     {item.label}
@@ -295,41 +454,100 @@ export function NavBar() {
                         })}
 
                         <Button
-                            startIcon={<TuneRoundedIcon fontSize="small" />}
-                            endIcon={<KeyboardArrowDownRoundedIcon fontSize="small" />}
+                            id={toolsButtonId}
+                            type="button"
+                            aria-label="Open tools navigation menu"
+                            aria-controls={toolsOpen ? toolsMenuId : undefined}
+                            aria-haspopup="menu"
+                            aria-expanded={toolsOpen ? "true" : undefined}
+                            startIcon={
+                                <TuneRoundedIcon fontSize="small" />
+                            }
+                            endIcon={
+                                <KeyboardArrowDownRoundedIcon fontSize="small" />
+                            }
                             variant={toolsActive ? "contained" : "text"}
-                            onClick={(event) => setToolsAnchorEl(event.currentTarget)}
-                            sx={dropdownButtonSx(toolsActive)}
+                            onClick={toggleToolsMenu}
+                            onKeyDown={(event) => {
+                                if (
+                                    event.key === "ArrowDown" &&
+                                    !toolsOpen
+                                ) {
+                                    event.preventDefault();
+                                    toggleToolsMenu(event);
+                                }
+
+                                if (event.key === "Escape") {
+                                    closeToolsMenu();
+                                }
+                            }}
+                            sx={dropdownButtonSx(
+                                toolsActive,
+                                toolsOpen
+                            )}
                         >
                             Tools
                         </Button>
 
                         <Menu
+                            id={toolsMenuId}
                             anchorEl={toolsAnchorEl}
                             open={toolsOpen}
                             onClose={closeToolsMenu}
+                            keepMounted
+                            disableScrollLock
+                            marginThreshold={8}
+                            transitionDuration={{
+                                enter: 140,
+                                exit: 100,
+                            }}
+                            anchorOrigin={{
+                                vertical: "bottom",
+                                horizontal: "right",
+                            }}
+                            transformOrigin={{
+                                vertical: "top",
+                                horizontal: "right",
+                            }}
                             MenuListProps={{
-                                dense: false,
+                                "aria-labelledby": toolsButtonId,
+                                autoFocusItem: false,
+                                onKeyDown:
+                                    handleMenuListKeyDown(
+                                        closeToolsMenu
+                                    ),
                                 sx: {
-                                    p: 0.75,
+                                    p: 0.65,
+                                    touchAction: "manipulation",
                                 },
                             }}
                             PaperProps={{
+                                elevation: 0,
                                 sx: menuPaperSx,
                             }}
                         >
-                            {toolsItems.map((item) => {
-                                const active = isActivePath(item.path);
+                            {TOOLS_NAV_ITEMS.map((item) => {
+                                const active = pathIsActive(
+                                    location.pathname,
+                                    item.path
+                                );
+                                const ItemIcon = item.Icon;
 
                                 return (
                                     <MenuItem
                                         key={item.path}
                                         component={RouterLink}
                                         to={item.path}
-                                        onClick={closeToolsMenu}
+                                        aria-current={
+                                            active ? "page" : undefined
+                                        }
+                                        onClick={closeAllMenus}
                                         sx={menuItemSx(active)}
                                     >
-                                        <ListItemIcon>{item.icon}</ListItemIcon>
+                                        <ListItemIcon>
+                                            <ItemIcon fontSize="small" />
+                                        </ListItemIcon>
+
                                         <ListItemText
                                             primary={item.label}
                                             primaryTypographyProps={{
@@ -342,41 +560,100 @@ export function NavBar() {
                         </Menu>
 
                         <Button
-                            startIcon={<InfoRoundedIcon fontSize="small" />}
-                            endIcon={<KeyboardArrowDownRoundedIcon fontSize="small" />}
+                            id={infoButtonId}
+                            type="button"
+                            aria-label="Open information navigation menu"
+                            aria-controls={infoOpen ? infoMenuId : undefined}
+                            aria-haspopup="menu"
+                            aria-expanded={infoOpen ? "true" : undefined}
+                            startIcon={
+                                <InfoRoundedIcon fontSize="small" />
+                            }
+                            endIcon={
+                                <KeyboardArrowDownRoundedIcon fontSize="small" />
+                            }
                             variant={infoActive ? "contained" : "text"}
-                            onClick={(event) => setInfoAnchorEl(event.currentTarget)}
-                            sx={dropdownButtonSx(infoActive)}
+                            onClick={toggleInfoMenu}
+                            onKeyDown={(event) => {
+                                if (
+                                    event.key === "ArrowDown" &&
+                                    !infoOpen
+                                ) {
+                                    event.preventDefault();
+                                    toggleInfoMenu(event);
+                                }
+
+                                if (event.key === "Escape") {
+                                    closeInfoMenu();
+                                }
+                            }}
+                            sx={dropdownButtonSx(
+                                infoActive,
+                                infoOpen
+                            )}
                         >
                             Info
                         </Button>
 
                         <Menu
+                            id={infoMenuId}
                             anchorEl={infoAnchorEl}
                             open={infoOpen}
                             onClose={closeInfoMenu}
+                            keepMounted
+                            disableScrollLock
+                            marginThreshold={8}
+                            transitionDuration={{
+                                enter: 140,
+                                exit: 100,
+                            }}
+                            anchorOrigin={{
+                                vertical: "bottom",
+                                horizontal: "right",
+                            }}
+                            transformOrigin={{
+                                vertical: "top",
+                                horizontal: "right",
+                            }}
                             MenuListProps={{
-                                dense: false,
+                                "aria-labelledby": infoButtonId,
+                                autoFocusItem: false,
+                                onKeyDown:
+                                    handleMenuListKeyDown(
+                                        closeInfoMenu
+                                    ),
                                 sx: {
-                                    p: 0.75,
+                                    p: 0.65,
+                                    touchAction: "manipulation",
                                 },
                             }}
                             PaperProps={{
+                                elevation: 0,
                                 sx: menuPaperSx,
                             }}
                         >
-                            {infoItems.map((item) => {
-                                const active = isActivePath(item.path);
+                            {INFO_NAV_ITEMS.map((item) => {
+                                const active = pathIsActive(
+                                    location.pathname,
+                                    item.path
+                                );
+                                const ItemIcon = item.Icon;
 
                                 return (
                                     <MenuItem
                                         key={item.path}
                                         component={RouterLink}
                                         to={item.path}
-                                        onClick={closeInfoMenu}
+                                        aria-current={
+                                            active ? "page" : undefined
+                                        }
+                                        onClick={closeAllMenus}
                                         sx={menuItemSx(active)}
                                     >
-                                        <ListItemIcon>{item.icon}</ListItemIcon>
+                                        <ListItemIcon>
+                                            <ItemIcon fontSize="small" />
+                                        </ListItemIcon>
+
                                         <ListItemText
                                             primary={item.label}
                                             primaryTypographyProps={{
