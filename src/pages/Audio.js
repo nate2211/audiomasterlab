@@ -55,6 +55,9 @@ import {
     MediaVolumeRange,
 } from "media-chrome/react";
 
+// Media Chrome renders the timeline; AudioMasterLab owns one native gesture
+// session so pointer/touch release commits once without a second click.
+
 const DEFAULT_SETTINGS = {
     baseVolume: 1,
 
@@ -4155,28 +4158,26 @@ function LegacyMediaChromeTimeRange({
                                         onSeekChange,
                                         onSeekCommit,
                                     }) {
-    const rangeRef = useRef(null);
+    const overlayRef = useRef(null);
     const latestRef = useRef(null);
     const optimisticTimeRef = useRef(0);
-    const awaitingParentSyncRef = useRef(null);
-    const parentSyncTimerRef = useRef(null);
-    const lastOwnerSessionIdRef = useRef(String(sessionId || ""));
+    const committedHoldRef = useRef(null);
+    const releaseSerialRef = useRef(0);
+    const suppressCompatibilityUntilRef = useRef(0);
+    const activeTouchIdRef = useRef(null);
     const [optimisticTime, setOptimisticTimeState] = useState(0);
     const [seeking, setSeeking] = useState(false);
-    const seekSessionRef = useRef({
+    const gestureRef = useRef({
         id: 0,
-        ownerSessionId: "",
         active: false,
         committed: false,
+        ownerSessionId: "",
+        inputType: "",
         pointerId: null,
-        latestValue: 0,
+        value: 0,
         resumeAfterSeek: false,
         startedAt: 0,
-        lastRequestAt: 0,
     });
-    const queuedValueRef = useRef(null);
-    const changeFrameRef = useRef(null);
-    const commitTimerRef = useRef(null);
 
     const safeDuration = Math.max(0, numberOrDefault(duration, 0));
     const safeCurrentTime = safeDuration > 0
@@ -4184,8 +4185,6 @@ function LegacyMediaChromeTimeRange({
         : 0;
 
     function setOptimisticTime(nextValue) {
-        // Event listeners are installed once, so read the newest duration from
-        // latestRef instead of closing over the first render's duration.
         const liveDuration = Math.max(
             0,
             numberOrDefault(latestRef.current?.duration, safeDuration)
@@ -4195,18 +4194,20 @@ function LegacyMediaChromeTimeRange({
             : 0;
 
         optimisticTimeRef.current = next;
-        setOptimisticTimeState((current) =>
-            Math.abs(Number(current || 0) - next) < 0.005 ? current : next
+        setOptimisticTimeState((previous) =>
+            Math.abs(numberOrDefault(previous, 0) - next) < 0.005
+                ? previous
+                : next
         );
         return next;
     }
 
     latestRef.current = {
-        disabled: Boolean(disabled),
-        duration: safeDuration,
         currentTime: safeCurrentTime,
-        isPlaying: Boolean(isPlaying),
+        duration: safeDuration,
         playbackRate: Math.max(0.0625, numberOrDefault(playbackRate, 1)),
+        isPlaying: Boolean(isPlaying),
+        disabled: Boolean(disabled),
         sessionId: String(sessionId || ""),
         onSeekStart,
         onSeekChange,
@@ -4214,106 +4215,107 @@ function LegacyMediaChromeTimeRange({
     };
 
     useEffect(() => {
+        const gesture = gestureRef.current;
         const ownerSessionId = String(sessionId || "");
-        const ownerChanged = lastOwnerSessionIdRef.current !== ownerSessionId;
 
-        if (ownerChanged) {
-            lastOwnerSessionIdRef.current = ownerSessionId;
-            seekSessionRef.current.active = false;
-            seekSessionRef.current.committed = false;
-            seekSessionRef.current.ownerSessionId = ownerSessionId;
-            awaitingParentSyncRef.current = null;
+        if (gesture.ownerSessionId !== ownerSessionId) {
+            gesture.active = false;
+            gesture.committed = false;
+            gesture.ownerSessionId = ownerSessionId;
+            gesture.inputType = "";
+            gesture.pointerId = null;
+            activeTouchIdRef.current = null;
+            committedHoldRef.current = null;
             setSeeking(false);
         }
 
+        if (gesture.active) {
+            return;
+        }
+
         if (safeDuration <= 0) {
-            awaitingParentSyncRef.current = null;
+            committedHoldRef.current = null;
             setOptimisticTime(0);
             return;
         }
 
-        if (seekSessionRef.current.active) {
-            return;
-        }
-
-        const pendingSync = awaitingParentSyncRef.current;
-        if (pendingSync) {
-            const parentCaughtUp =
-                Math.abs(safeCurrentTime - pendingSync.value) <= 0.08;
-            const expired = Date.now() >= pendingSync.expiresAt;
+        const heldCommit = committedHoldRef.current;
+        if (heldCommit) {
+            const parentCaughtUp = Math.abs(safeCurrentTime - heldCommit.value) <= 0.08;
+            const expired = Date.now() >= heldCommit.expiresAt;
 
             if (!parentCaughtUp && !expired) {
-                setOptimisticTime(pendingSync.value);
+                setOptimisticTime(heldCommit.value);
                 return;
             }
 
-            awaitingParentSyncRef.current = null;
+            committedHoldRef.current = null;
         }
 
         setOptimisticTime(safeCurrentTime);
     }, [safeCurrentTime, safeDuration, sessionId]);
 
     useEffect(() => {
-        const range = rangeRef.current;
-        if (!range) return undefined;
+        const overlay = overlayRef.current;
+        if (!overlay) return undefined;
 
-        function clearCommitTimer() {
-            if (commitTimerRef.current) {
-                window.clearTimeout(commitTimerRef.current);
-                commitTimerRef.current = null;
+        const nonPassiveCapture = { capture: true, passive: false };
+        const supportsPointerEvents = typeof window.PointerEvent === "function";
+
+        function preventGestureDefaults(event) {
+            if (event?.cancelable) {
+                event.preventDefault();
             }
+            event?.stopPropagation?.();
         }
 
-        function clearParentSyncTimer() {
-            if (parentSyncTimerRef.current) {
-                window.clearTimeout(parentSyncTimerRef.current);
-                parentSyncTimerRef.current = null;
-            }
-        }
+        function findTouch(touchList, touchId) {
+            if (!touchList) return null;
 
-        function clearChangeFrame() {
-            if (changeFrameRef.current) {
-                window.cancelAnimationFrame(changeFrameRef.current);
-                changeFrameRef.current = null;
-            }
-        }
-
-        function readRequestedTime(event) {
-            const detail = event?.detail;
-            const candidates = [
-                detail,
-                detail?.seekTime,
-                detail?.currentTime,
-                detail?.value,
-                event?.target?.mediaCurrentTime,
-                event?.target?.value,
-            ];
-
-            for (const candidate of candidates) {
-                const numeric = Number(candidate);
-                if (Number.isFinite(numeric)) {
-                    return numeric;
+            for (let index = 0; index < touchList.length; index += 1) {
+                const touch = touchList[index];
+                if (touchId === null || touch.identifier === touchId) {
+                    return touch;
                 }
             }
 
-            return NaN;
+            return null;
         }
 
-        function readPointerTime(event) {
-            const latest = latestRef.current;
+        function readClientX(event, preferChangedTouches = false) {
+            const touchId = activeTouchIdRef.current;
+            const primaryTouches = preferChangedTouches
+                ? event?.changedTouches
+                : event?.touches;
+            const secondaryTouches = preferChangedTouches
+                ? event?.touches
+                : event?.changedTouches;
+            const touch =
+                findTouch(primaryTouches, touchId) ||
+                findTouch(secondaryTouches, touchId);
+
+            if (touch && Number.isFinite(Number(touch.clientX))) {
+                return Number(touch.clientX);
+            }
+
             const clientX = Number(event?.clientX);
+            return Number.isFinite(clientX) ? clientX : NaN;
+        }
+
+        function readTimelineValue(event, preferChangedTouches = false) {
+            const latest = latestRef.current;
+            const clientX = readClientX(event, preferChangedTouches);
 
             if (
                 !latest ||
                 latest.disabled ||
-                !latest.duration ||
+                latest.duration <= 0 ||
                 !Number.isFinite(clientX)
             ) {
                 return NaN;
             }
 
-            const bounds = range.getBoundingClientRect();
-
+            const bounds = overlay.getBoundingClientRect();
             if (!bounds || !Number.isFinite(bounds.width) || bounds.width <= 0) {
                 return NaN;
             }
@@ -4322,283 +4324,299 @@ function LegacyMediaChromeTimeRange({
             return ratio * latest.duration;
         }
 
-        function beginSeek(reason, event) {
+        function publishChange(nextValue, reason) {
             const latest = latestRef.current;
-            if (!latest || latest.disabled || !latest.duration) return null;
+            const gesture = gestureRef.current;
 
-            clearParentSyncTimer();
-            awaitingParentSyncRef.current = null;
-
-            const currentSession = seekSessionRef.current;
-            const ownerChanged =
-                currentSession.ownerSessionId !== latest.sessionId;
-
-            if (!currentSession.active || ownerChanged) {
-                currentSession.id += 1;
-                currentSession.ownerSessionId = latest.sessionId;
-                currentSession.active = true;
-                currentSession.committed = false;
-                currentSession.pointerId = Number.isFinite(event?.pointerId)
-                    ? event.pointerId
-                    : null;
-                currentSession.latestValue = setOptimisticTime(
-                    clamp(
-                        numberOrDefault(latest.currentTime, 0),
-                        0,
-                        latest.duration
-                    )
-                );
-                currentSession.resumeAfterSeek = latest.isPlaying;
-                currentSession.startedAt = Date.now();
-                currentSession.lastRequestAt = Date.now();
-                setSeeking(true);
-
-                if (
-                    Number.isFinite(event?.pointerId) &&
-                    typeof range.setPointerCapture === "function"
-                ) {
-                    try {
-                        range.setPointerCapture(event.pointerId);
-                    } catch {
-                        // Pointer capture is optional and can fail on Safari.
-                    }
-                }
-
-                latest.onSeekStart?.({
-                    id: currentSession.id,
-                    ownerSessionId: currentSession.ownerSessionId,
-                    reason,
-                    resumeAfterSeek: currentSession.resumeAfterSeek,
-                    startedAt: currentSession.startedAt,
-                    initialTime: currentSession.latestValue,
-                    duration: latest.duration,
-                });
-            }
-
-            return currentSession;
-        }
-
-        function flushQueuedChange() {
-            changeFrameRef.current = null;
-            const latest = latestRef.current;
-            const currentSession = seekSessionRef.current;
-            const queuedValue = Number(queuedValueRef.current);
-            queuedValueRef.current = null;
-
-            if (
-                !latest ||
-                latest.disabled ||
-                !currentSession.active ||
-                !Number.isFinite(queuedValue)
-            ) {
+            if (!latest || !gesture.active || gesture.committed) {
                 return;
             }
 
-            const nextValue = setOptimisticTime(
-                clamp(queuedValue, 0, latest.duration || 0)
-            );
-            currentSession.latestValue = nextValue;
-            currentSession.lastRequestAt = Date.now();
-            latest.onSeekChange?.(nextValue, {
-                id: currentSession.id,
-                ownerSessionId: currentSession.ownerSessionId,
-                resumeAfterSeek: currentSession.resumeAfterSeek,
+            const value = setOptimisticTime(nextValue);
+            gesture.value = value;
+            latest.onSeekChange?.(value, {
+                id: gesture.id,
+                ownerSessionId: gesture.ownerSessionId,
+                inputType: gesture.inputType,
+                resumeAfterSeek: gesture.resumeAfterSeek,
+                startedAt: gesture.startedAt,
                 duration: latest.duration,
+                reason,
+                safariIOS: isIOSAudioDevice(),
             });
         }
 
-        function queueSeekChange(nextValue) {
-            queuedValueRef.current = nextValue;
-            setOptimisticTime(nextValue);
-
-            if (!changeFrameRef.current) {
-                changeFrameRef.current = window.requestAnimationFrame(
-                    flushQueuedChange
-                );
-            }
-        }
-
-        function finishOptimisticParentSync(targetTime) {
-            clearParentSyncTimer();
+        function beginGesture(event, inputType, reason) {
             const latest = latestRef.current;
-            const safeTarget = latest?.duration
-                ? clamp(numberOrDefault(targetTime, 0), 0, latest.duration)
-                : 0;
+            const gesture = gestureRef.current;
 
-            awaitingParentSyncRef.current = {
-                value: safeTarget,
-                expiresAt: Date.now() + 3000,
-            };
-            setOptimisticTime(safeTarget);
-            setSeeking(false);
-
-            parentSyncTimerRef.current = window.setTimeout(() => {
-                const pending = awaitingParentSyncRef.current;
-                if (!pending) return;
-
-                awaitingParentSyncRef.current = null;
-                const current = latestRef.current;
-                setOptimisticTime(current?.currentTime || 0);
-            }, 3050);
-        }
-
-        function commitSeek(reason) {
-            clearCommitTimer();
-            clearChangeFrame();
-            flushQueuedChange();
-
-            const latest = latestRef.current;
-            const currentSession = seekSessionRef.current;
-
-            if (
-                !latest ||
-                latest.disabled ||
-                !currentSession.active ||
-                currentSession.committed
-            ) {
-                currentSession.active = false;
-                setSeeking(false);
-                return;
+            if (!latest || latest.disabled || latest.duration <= 0) {
+                return false;
             }
 
-            currentSession.committed = true;
-            currentSession.active = false;
+            if (gesture.active) {
+                return gesture.inputType === inputType;
+            }
+
+            committedHoldRef.current = null;
+            gesture.id += 1;
+            gesture.active = true;
+            gesture.committed = false;
+            gesture.ownerSessionId = latest.sessionId;
+            gesture.inputType = inputType;
+            gesture.pointerId = Number.isFinite(Number(event?.pointerId))
+                ? Number(event.pointerId)
+                : null;
+            gesture.value = clamp(
+                numberOrDefault(optimisticTimeRef.current, latest.currentTime),
+                0,
+                latest.duration
+            );
+            gesture.resumeAfterSeek = Boolean(latest.isPlaying);
+            gesture.startedAt = Date.now();
+            releaseSerialRef.current += 1;
+            setSeeking(true);
 
             if (
-                Number.isFinite(currentSession.pointerId) &&
-                typeof range.releasePointerCapture === "function"
+                inputType === "pointer" &&
+                Number.isFinite(gesture.pointerId) &&
+                typeof overlay.setPointerCapture === "function"
             ) {
                 try {
-                    range.releasePointerCapture(currentSession.pointerId);
+                    overlay.setPointerCapture(gesture.pointerId);
                 } catch {
-                    // The pointer may already have been released by the browser.
+                    // Safari can decline pointer capture for some touch routes.
                 }
             }
 
-            const committedTime = clamp(
-                numberOrDefault(currentSession.latestValue, 0),
-                0,
-                latest.duration || 0
-            );
-
-            finishOptimisticParentSync(committedTime);
-
-            latest.onSeekCommit?.(
-                committedTime,
+            latest.onSeekStart?.({
+                id: gesture.id,
+                ownerSessionId: gesture.ownerSessionId,
+                inputType,
                 reason,
-                {
-                    id: currentSession.id,
-                    ownerSessionId: currentSession.ownerSessionId,
-                    resumeAfterSeek: currentSession.resumeAfterSeek,
-                    startedAt: currentSession.startedAt,
-                    committedAt: Date.now(),
-                    duration: latest.duration,
-                }
-            );
+                resumeAfterSeek: gesture.resumeAfterSeek,
+                startedAt: gesture.startedAt,
+                initialTime: gesture.value,
+                duration: latest.duration,
+                safariIOS: isIOSAudioDevice(),
+            });
 
-            currentSession.pointerId = null;
+            return true;
         }
 
-        function scheduleCommit(reason, delay = 360) {
-            clearCommitTimer();
-            commitTimerRef.current = window.setTimeout(
-                () => commitSeek(reason),
-                delay
-            );
-        }
-
-        function handleSeekRequest(event) {
-            event.preventDefault?.();
-            event.stopPropagation();
+        function commitGesture(event, reason, preferChangedTouches = false) {
             const latest = latestRef.current;
-            const requested = readRequestedTime(event);
+            const gesture = gestureRef.current;
+
+            if (!latest || !gesture.active || gesture.committed) {
+                return false;
+            }
+
+            const finalPointerValue = readTimelineValue(
+                event,
+                preferChangedTouches
+            );
+            if (Number.isFinite(finalPointerValue)) {
+                publishChange(finalPointerValue, `${reason}: final coordinate`);
+            }
+
+            // Close the gesture before the parent callback. This is the key to a
+            // true one-release seek: any pointerup/touchend/mouseup compatibility
+            // event that follows sees an inactive gesture and cannot reopen it.
+            gesture.committed = true;
+            gesture.active = false;
+            const committedAt = Date.now();
+            const committedValue = clamp(
+                numberOrDefault(gesture.value, optimisticTimeRef.current),
+                0,
+                latest.duration
+            );
+            const committedSession = {
+                id: gesture.id,
+                ownerSessionId: gesture.ownerSessionId,
+                inputType: gesture.inputType,
+                resumeAfterSeek: gesture.resumeAfterSeek,
+                startedAt: gesture.startedAt,
+                committedAt,
+                duration: latest.duration,
+                safariIOS: isIOSAudioDevice(),
+                releasedImmediately: true,
+                releaseSerial: releaseSerialRef.current,
+            };
 
             if (
-                !latest ||
-                latest.disabled ||
-                !latest.duration ||
-                !Number.isFinite(requested)
+                Number.isFinite(gesture.pointerId) &&
+                typeof overlay.releasePointerCapture === "function"
             ) {
-                return;
+                try {
+                    overlay.releasePointerCapture(gesture.pointerId);
+                } catch {
+                    // Pointer capture may already have been released by Safari.
+                }
             }
 
-            const currentSession = beginSeek(
-                "Media Chrome seek request",
-                event
-            );
-            if (!currentSession) return;
+            committedHoldRef.current = {
+                value: committedValue,
+                expiresAt: committedAt + 30000,
+            };
+            setOptimisticTime(committedValue);
+            setSeeking(false);
+            suppressCompatibilityUntilRef.current = committedAt + 900;
+            activeTouchIdRef.current = null;
 
-            const next = setOptimisticTime(
-                clamp(requested, 0, latest.duration)
+            gesture.pointerId = null;
+            gesture.inputType = "";
+
+            latest.onSeekCommit?.(
+                committedValue,
+                reason,
+                committedSession
             );
-            currentSession.latestValue = next;
-            currentSession.lastRequestAt = Date.now();
-            queueSeekChange(next);
-            scheduleCommit("Media Chrome seek inactivity commit");
+
+            return true;
+        }
+
+        function cancelOrCommitOnLifecycle(event) {
+            if (!gestureRef.current.active) return;
+            commitGesture(
+                event,
+                `Media Chrome scrub released by ${event?.type || "lifecycle"}`,
+                event?.type === "touchend" || event?.type === "touchcancel"
+            );
         }
 
         function handlePointerDown(event) {
-            const currentSession = beginSeek(
-                "Media Chrome pointer seek started",
-                event
-            );
-            const pointerTime = readPointerTime(event);
+            if (Date.now() < suppressCompatibilityUntilRef.current) return;
+            if (event.button !== undefined && event.button !== 0) return;
 
-            if (currentSession && Number.isFinite(pointerTime)) {
-                currentSession.latestValue = pointerTime;
-                currentSession.lastRequestAt = Date.now();
-                queueSeekChange(pointerTime);
+            preventGestureDefaults(event);
+            if (!beginGesture(event, "pointer", "Media Chrome pointer scrub started")) {
+                return;
+            }
+
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome pointer scrub changed");
             }
         }
 
         function handlePointerMove(event) {
-            const currentSession = seekSessionRef.current;
-
-            if (!currentSession.active) {
-                return;
-            }
-
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "pointer") return;
             if (
-                Number.isFinite(currentSession.pointerId) &&
-                Number.isFinite(event?.pointerId) &&
-                currentSession.pointerId !== event.pointerId
+                Number.isFinite(gesture.pointerId) &&
+                Number.isFinite(Number(event.pointerId)) &&
+                gesture.pointerId !== Number(event.pointerId)
             ) {
                 return;
             }
 
-            const pointerTime = readPointerTime(event);
-
-            if (Number.isFinite(pointerTime)) {
-                currentSession.latestValue = pointerTime;
-                currentSession.lastRequestAt = Date.now();
-                queueSeekChange(pointerTime);
-                scheduleCommit("Media Chrome pointer-move inactivity commit");
+            preventGestureDefaults(event);
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome pointer scrub changed");
             }
         }
 
         function handlePointerRelease(event) {
-            const currentSession = seekSessionRef.current;
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "pointer") return;
             if (
-                Number.isFinite(currentSession.pointerId) &&
-                Number.isFinite(event?.pointerId) &&
-                currentSession.pointerId !== event.pointerId
+                Number.isFinite(gesture.pointerId) &&
+                Number.isFinite(Number(event?.pointerId)) &&
+                gesture.pointerId !== Number(event.pointerId)
             ) {
                 return;
             }
 
-            const pointerTime = readPointerTime(event);
-            if (currentSession.active && Number.isFinite(pointerTime)) {
-                currentSession.latestValue = pointerTime;
-                currentSession.lastRequestAt = Date.now();
-                queueSeekChange(pointerTime);
+            preventGestureDefaults(event);
+            commitGesture(
+                event,
+                `Media Chrome ${event?.type || "pointerup"} scrub released`
+            );
+        }
+
+        function handleTouchStart(event) {
+            if (gestureRef.current.active) return;
+
+            preventGestureDefaults(event);
+            const touch = event?.changedTouches?.[0] || event?.touches?.[0];
+            activeTouchIdRef.current = Number.isFinite(Number(touch?.identifier))
+                ? Number(touch.identifier)
+                : null;
+            suppressCompatibilityUntilRef.current = Date.now() + 1000;
+
+            if (!beginGesture(event, "touch", "Media Chrome Safari touch scrub started")) {
+                return;
             }
 
-            commitSeek(`Media Chrome ${event?.type || "pointer"} seek released`);
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome Safari touch scrub changed");
+            }
+        }
+
+        function handleTouchMove(event) {
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "touch") return;
+
+            preventGestureDefaults(event);
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome Safari touch scrub changed");
+            }
+        }
+
+        function handleTouchRelease(event) {
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "touch") return;
+
+            preventGestureDefaults(event);
+            commitGesture(
+                event,
+                `Media Chrome Safari ${event?.type || "touchend"} scrub released`,
+                true
+            );
+        }
+
+        function handleMouseDown(event) {
+            if (supportsPointerEvents) return;
+            if (Date.now() < suppressCompatibilityUntilRef.current) return;
+            if (event.button !== 0) return;
+
+            preventGestureDefaults(event);
+            if (!beginGesture(event, "mouse", "Media Chrome mouse scrub started")) {
+                return;
+            }
+
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome mouse scrub changed");
+            }
+        }
+
+        function handleMouseMove(event) {
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "mouse") return;
+
+            preventGestureDefaults(event);
+            const nextValue = readTimelineValue(event);
+            if (Number.isFinite(nextValue)) {
+                publishChange(nextValue, "Media Chrome mouse scrub changed");
+            }
+        }
+
+        function handleMouseUp(event) {
+            const gesture = gestureRef.current;
+            if (!gesture.active || gesture.inputType !== "mouse") return;
+
+            preventGestureDefaults(event);
+            commitGesture(event, "Media Chrome mouseup scrub released");
         }
 
         function handleKeyDown(event) {
             if (
-                [
+                ![
                     "ArrowLeft",
                     "ArrowRight",
                     "Home",
@@ -4607,12 +4625,41 @@ function LegacyMediaChromeTimeRange({
                     "PageUp",
                 ].includes(event.key)
             ) {
-                beginSeek("Media Chrome keyboard seek started", event);
+                return;
             }
+
+            preventGestureDefaults(event);
+            const latest = latestRef.current;
+            if (!latest || latest.disabled || latest.duration <= 0) return;
+
+            if (!gestureRef.current.active) {
+                beginGesture(event, "keyboard", "Media Chrome keyboard scrub started");
+            }
+
+            const currentValue = numberOrDefault(
+                gestureRef.current.value,
+                optimisticTimeRef.current
+            );
+            const step = event.shiftKey ? 30 : 5;
+            let nextValue = currentValue;
+
+            if (event.key === "ArrowLeft") nextValue -= step;
+            if (event.key === "ArrowRight") nextValue += step;
+            if (event.key === "PageDown") nextValue -= 30;
+            if (event.key === "PageUp") nextValue += 30;
+            if (event.key === "Home") nextValue = 0;
+            if (event.key === "End") nextValue = latest.duration;
+
+            publishChange(
+                clamp(nextValue, 0, latest.duration),
+                "Media Chrome keyboard scrub changed"
+            );
         }
 
         function handleKeyUp(event) {
             if (
+                gestureRef.current.active &&
+                gestureRef.current.inputType === "keyboard" &&
                 [
                     "ArrowLeft",
                     "ArrowRight",
@@ -4622,100 +4669,65 @@ function LegacyMediaChromeTimeRange({
                     "PageUp",
                 ].includes(event.key)
             ) {
-                commitSeek("Media Chrome keyboard seek released");
+                preventGestureDefaults(event);
+                commitGesture(event, "Media Chrome keyboard scrub released");
             }
         }
 
-        function handleLifecycleRelease(event) {
-            const hidden =
-                event?.type === "pagehide" ||
-                event?.type === "freeze" ||
-                (event?.type === "visibilitychange" &&
-                    document.visibilityState !== "visible");
+        overlay.addEventListener("pointerdown", handlePointerDown, nonPassiveCapture);
+        overlay.addEventListener("pointermove", handlePointerMove, nonPassiveCapture);
+        overlay.addEventListener("pointerup", handlePointerRelease, nonPassiveCapture);
+        overlay.addEventListener("pointercancel", handlePointerRelease, nonPassiveCapture);
+        overlay.addEventListener("lostpointercapture", handlePointerRelease, true);
+        overlay.addEventListener("touchstart", handleTouchStart, nonPassiveCapture);
+        overlay.addEventListener("touchmove", handleTouchMove, nonPassiveCapture);
+        overlay.addEventListener("touchend", handleTouchRelease, nonPassiveCapture);
+        overlay.addEventListener("touchcancel", handleTouchRelease, nonPassiveCapture);
+        overlay.addEventListener("mousedown", handleMouseDown, nonPassiveCapture);
+        overlay.addEventListener("keydown", handleKeyDown, nonPassiveCapture);
+        overlay.addEventListener("keyup", handleKeyUp, nonPassiveCapture);
 
-            if (seekSessionRef.current.active) {
-                commitSeek(
-                    hidden
-                        ? `Media Chrome seek committed before ${event?.type || "background"}`
-                        : `Media Chrome seek released by ${event?.type || "lifecycle"}`
-                );
-            }
-        }
-
-        range.addEventListener("mediaseekrequest", handleSeekRequest);
-        range.addEventListener("pointerdown", handlePointerDown);
-        range.addEventListener("pointermove", handlePointerMove);
-        range.addEventListener("pointerup", handlePointerRelease);
-        range.addEventListener("pointercancel", handlePointerRelease);
-        range.addEventListener("lostpointercapture", handlePointerRelease);
-        range.addEventListener("keydown", handleKeyDown);
-        range.addEventListener("keyup", handleKeyUp);
-        range.addEventListener("blur", handleLifecycleRelease);
-        window.addEventListener("pointerup", handlePointerRelease, true);
-        window.addEventListener("pointercancel", handlePointerRelease, true);
-        window.addEventListener("mouseup", handlePointerRelease, true);
-        window.addEventListener("touchend", handlePointerRelease, true);
-        window.addEventListener("touchcancel", handlePointerRelease, true);
-        window.addEventListener("blur", handleLifecycleRelease, true);
-        window.addEventListener("pagehide", handleLifecycleRelease, true);
-        document.addEventListener(
-            "visibilitychange",
-            handleLifecycleRelease,
-            true
-        );
-        document.addEventListener("freeze", handleLifecycleRelease, true);
+        window.addEventListener("pointermove", handlePointerMove, nonPassiveCapture);
+        window.addEventListener("pointerup", handlePointerRelease, nonPassiveCapture);
+        window.addEventListener("pointercancel", handlePointerRelease, nonPassiveCapture);
+        window.addEventListener("touchmove", handleTouchMove, nonPassiveCapture);
+        window.addEventListener("touchend", handleTouchRelease, nonPassiveCapture);
+        window.addEventListener("touchcancel", handleTouchRelease, nonPassiveCapture);
+        window.addEventListener("mousemove", handleMouseMove, nonPassiveCapture);
+        window.addEventListener("mouseup", handleMouseUp, nonPassiveCapture);
+        window.addEventListener("blur", cancelOrCommitOnLifecycle, true);
+        window.addEventListener("pagehide", cancelOrCommitOnLifecycle, true);
+        document.addEventListener("visibilitychange", cancelOrCommitOnLifecycle, true);
 
         return () => {
-            clearCommitTimer();
-            clearParentSyncTimer();
-            clearChangeFrame();
-            seekSessionRef.current.active = false;
-            awaitingParentSyncRef.current = null;
-            range.removeEventListener("mediaseekrequest", handleSeekRequest);
-            range.removeEventListener("pointerdown", handlePointerDown);
-            range.removeEventListener("pointermove", handlePointerMove);
-            range.removeEventListener("pointerup", handlePointerRelease);
-            range.removeEventListener("pointercancel", handlePointerRelease);
-            range.removeEventListener(
-                "lostpointercapture",
-                handlePointerRelease
-            );
-            range.removeEventListener("keydown", handleKeyDown);
-            range.removeEventListener("keyup", handleKeyUp);
-            range.removeEventListener("blur", handleLifecycleRelease);
-            window.removeEventListener(
-                "pointerup",
-                handlePointerRelease,
-                true
-            );
-            window.removeEventListener(
-                "pointercancel",
-                handlePointerRelease,
-                true
-            );
-            window.removeEventListener("mouseup", handlePointerRelease, true);
-            window.removeEventListener("touchend", handlePointerRelease, true);
-            window.removeEventListener(
-                "touchcancel",
-                handlePointerRelease,
-                true
-            );
-            window.removeEventListener("blur", handleLifecycleRelease, true);
-            window.removeEventListener(
-                "pagehide",
-                handleLifecycleRelease,
-                true
-            );
-            document.removeEventListener(
-                "visibilitychange",
-                handleLifecycleRelease,
-                true
-            );
-            document.removeEventListener(
-                "freeze",
-                handleLifecycleRelease,
-                true
-            );
+            gestureRef.current.active = false;
+            gestureRef.current.committed = true;
+            activeTouchIdRef.current = null;
+
+            overlay.removeEventListener("pointerdown", handlePointerDown, nonPassiveCapture);
+            overlay.removeEventListener("pointermove", handlePointerMove, nonPassiveCapture);
+            overlay.removeEventListener("pointerup", handlePointerRelease, nonPassiveCapture);
+            overlay.removeEventListener("pointercancel", handlePointerRelease, nonPassiveCapture);
+            overlay.removeEventListener("lostpointercapture", handlePointerRelease, true);
+            overlay.removeEventListener("touchstart", handleTouchStart, nonPassiveCapture);
+            overlay.removeEventListener("touchmove", handleTouchMove, nonPassiveCapture);
+            overlay.removeEventListener("touchend", handleTouchRelease, nonPassiveCapture);
+            overlay.removeEventListener("touchcancel", handleTouchRelease, nonPassiveCapture);
+            overlay.removeEventListener("mousedown", handleMouseDown, nonPassiveCapture);
+            overlay.removeEventListener("keydown", handleKeyDown, nonPassiveCapture);
+            overlay.removeEventListener("keyup", handleKeyUp, nonPassiveCapture);
+
+            window.removeEventListener("pointermove", handlePointerMove, nonPassiveCapture);
+            window.removeEventListener("pointerup", handlePointerRelease, nonPassiveCapture);
+            window.removeEventListener("pointercancel", handlePointerRelease, nonPassiveCapture);
+            window.removeEventListener("touchmove", handleTouchMove, nonPassiveCapture);
+            window.removeEventListener("touchend", handleTouchRelease, nonPassiveCapture);
+            window.removeEventListener("touchcancel", handleTouchRelease, nonPassiveCapture);
+            window.removeEventListener("mousemove", handleMouseMove, nonPassiveCapture);
+            window.removeEventListener("mouseup", handleMouseUp, nonPassiveCapture);
+            window.removeEventListener("blur", cancelOrCommitOnLifecycle, true);
+            window.removeEventListener("pagehide", cancelOrCommitOnLifecycle, true);
+            document.removeEventListener("visibilitychange", cancelOrCommitOnLifecycle, true);
         };
     }, []);
 
@@ -4724,70 +4736,107 @@ function LegacyMediaChromeTimeRange({
         : 0;
 
     return (
-        <MediaTimeRange
-            ref={rangeRef}
-            mediaCurrentTime={displayedTime}
-            mediaDuration={safeDuration}
-            mediaSeekable={[0, safeDuration]}
-            mediaBuffered={safeDuration ? [[0, safeDuration]] : []}
-            mediaPaused={!isPlaying || seeking}
-            mediaPlaybackRate={Math.max(
-                0.0625,
-                numberOrDefault(playbackRate, 1)
-            )}
-            mediaLoading={false}
-            mediaEnded={Boolean(
-                safeDuration > 0 && displayedTime >= safeDuration - 0.015
-            )}
-            disabled={disabled}
-            aria-label="Seek through processed audio"
-            style={{
+        <Box
+            sx={{
+                position: "relative",
                 width: "100%",
                 minWidth: 0,
-                height: "42px",
-                touchAction: "none",
-                userSelect: "none",
-                background: "transparent",
-                color: "#67e8f9",
-                "--media-primary-color": "#67e8f9",
-                "--media-secondary-color": "rgba(255,255,255,0.18)",
-                "--media-control-height": "42px",
-                "--media-control-background": "transparent",
-                "--media-control-hover-background": "transparent",
-                "--media-control-padding": "0px",
-                "--media-range-padding": "0px",
-                "--media-range-track-height": "4px",
-                "--media-range-track-border-radius": "999px",
-                "--media-range-track-background":
-                    "rgba(255,255,255,0.18)",
-                "--media-range-bar-color": "#67e8f9",
-                "--media-range-thumb-background": "#67e8f9",
-                "--media-range-thumb-width": "20px",
-                "--media-range-thumb-height": "20px",
-                "--media-range-thumb-border-radius": "50%",
-                "--media-range-thumb-box-shadow":
-                    "0 0 0 8px rgba(103,232,249,0.08)",
-                "--media-time-range-buffered-color":
-                    "rgba(255,255,255,0.18)",
-                "--media-box-border-radius": "8px",
-                "--media-box-background": "rgba(7,10,19,0.94)",
-                "--media-box-padding-left": "8px",
-                "--media-box-padding-right": "8px",
+                height: 42,
             }}
         >
-            <span
-                slot="thumb"
+            <MediaTimeRange
+                mediaCurrentTime={displayedTime}
+                mediaDuration={safeDuration}
+                mediaSeekable={[0, safeDuration]}
+                mediaBuffered={safeDuration ? [[0, safeDuration]] : []}
+                mediaPaused={!isPlaying || seeking}
+                mediaPlaybackRate={Math.max(
+                    0.0625,
+                    numberOrDefault(playbackRate, 1)
+                )}
+                mediaLoading={false}
+                mediaEnded={Boolean(
+                    safeDuration > 0 && displayedTime >= safeDuration - 0.015
+                )}
+                disabled={disabled}
+                aria-hidden="true"
+                tabIndex={-1}
                 style={{
-                    display: "block",
-                    width: 20,
-                    height: 20,
-                    borderRadius: "50%",
-                    background: "#67e8f9",
-                    boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
+                    width: "100%",
+                    minWidth: 0,
+                    height: "42px",
                     pointerEvents: "none",
+                    background: "transparent",
+                    color: "#67e8f9",
+                    "--media-primary-color": "#67e8f9",
+                    "--media-secondary-color": "rgba(255,255,255,0.18)",
+                    "--media-control-height": "42px",
+                    "--media-control-background": "transparent",
+                    "--media-control-hover-background": "transparent",
+                    "--media-control-padding": "0px",
+                    "--media-range-padding": "0px",
+                    "--media-range-track-height": "4px",
+                    "--media-range-track-border-radius": "999px",
+                    "--media-range-track-background":
+                        "rgba(255,255,255,0.18)",
+                    "--media-range-bar-color": "#67e8f9",
+                    "--media-range-thumb-background": "#67e8f9",
+                    "--media-range-thumb-width": "20px",
+                    "--media-range-thumb-height": "20px",
+                    "--media-range-thumb-border-radius": "50%",
+                    "--media-range-thumb-box-shadow":
+                        "0 0 0 8px rgba(103,232,249,0.08)",
+                    "--media-time-range-buffered-color":
+                        "rgba(255,255,255,0.18)",
+                    "--media-box-border-radius": "8px",
+                    "--media-box-background": "rgba(7,10,19,0.94)",
+                    "--media-box-padding-left": "8px",
+                    "--media-box-padding-right": "8px",
+                }}
+            >
+                <span
+                    slot="thumb"
+                    style={{
+                        display: "block",
+                        width: 20,
+                        height: 20,
+                        borderRadius: "50%",
+                        background: "#67e8f9",
+                        boxShadow: "0 0 0 8px rgba(103,232,249,0.08)",
+                        pointerEvents: "none",
+                    }}
+                />
+            </MediaTimeRange>
+
+            <Box
+                ref={overlayRef}
+                role="slider"
+                tabIndex={disabled ? -1 : 0}
+                aria-label="Seek through processed audio"
+                aria-disabled={Boolean(disabled)}
+                aria-valuemin={0}
+                aria-valuemax={safeDuration}
+                aria-valuenow={displayedTime}
+                aria-valuetext={`${formatTime(displayedTime)} of ${formatTime(safeDuration)}`}
+                sx={{
+                    position: "absolute",
+                    inset: 0,
+                    zIndex: 2,
+                    cursor: disabled ? "not-allowed" : "pointer",
+                    touchAction: "none",
+                    WebkitUserSelect: "none",
+                    WebkitTouchCallout: "none",
+                    WebkitTapHighlightColor: "transparent",
+                    userSelect: "none",
+                    overscrollBehavior: "contain",
+                    outline: "none",
+                    borderRadius: 2,
+                    "&:focus-visible": {
+                        boxShadow: "0 0 0 3px rgba(103,232,249,0.28)",
+                    },
                 }}
             />
-        </MediaTimeRange>
+        </Box>
     );
 }
 
@@ -5711,33 +5760,8 @@ export default function Audio() {
     }, [isPlaying, position, duration]);
 
     useEffect(() => {
-        const finishScrubFromGlobalRelease = (event) => {
-            const eventType = event?.type || "global-release";
-            const isPhysicalRelease = [
-                "pointerup",
-                "pointercancel",
-                "lostpointercapture",
-                "mouseup",
-                "touchend",
-                "touchcancel",
-                "dragend",
-                "keyup",
-            ].includes(eventType);
-
-            // Media Chrome owns the gesture-level seek session. The page-wide
-            // capture listener is only a fallback, so defer physical releases by
-            // one task and let MediaTimeRange commit first. This avoids two seeks
-            // racing each other after a long backgrounded session.
-            if (isPhysicalRelease && !event?.__audioMasterDeferredRelease) {
-                window.setTimeout(() => {
-                    finishScrubFromGlobalRelease({
-                        type: eventType,
-                        __audioMasterDeferredRelease: true,
-                    });
-                }, 0);
-                return;
-            }
-
+        const recoverScrubForLifecycle = (event) => {
+            const eventType = event?.type || "lifecycle";
             const hiddenNow = Boolean(
                 eventType === "pagehide" ||
                 eventType === "blur" ||
@@ -5757,6 +5781,10 @@ export default function Audio() {
                 )
             );
 
+            // Physical pointer/touch/mouse release is owned exclusively by
+            // LegacyMediaChromeTimeRange. Keeping it out of this page-wide
+            // listener prevents a second asynchronous commit from racing the
+            // first release and making the scrubber appear to need another click.
             if (hiddenNow) {
                 const committed = commitPendingScrubForBackgroundControl(
                     `Background-safe scrub commit: ${eventType}`
@@ -5770,9 +5798,10 @@ export default function Audio() {
                     });
                 }
 
-                updateMediaSessionState(getScrubResumeIntent() ? "playing" : "paused", {
-                    forcePosition: true,
-                });
+                updateMediaSessionState(
+                    getScrubResumeIntent() ? "playing" : "paused",
+                    { forcePosition: true }
+                );
                 return;
             }
 
@@ -5781,54 +5810,29 @@ export default function Audio() {
                 unlockScrubControlsAfterFocusReturn(eventType);
             }
 
-            if (scrubbingRef.current) {
-                commitCurrentScrubTarget(`Global scrub release: ${eventType}`, {
-                    quietStatus: true,
-                    preserveUnlockedOutput: isIOSAudioDevice(),
-                    forceIPhoneOutputPostStart: isIOSAudioDevice() && getScrubResumeIntent(),
-                    keepPlayingUiDuringSeek: getScrubResumeIntent(),
-                }).catch(() => {
-                    scrubGestureActiveRef.current = false;
-                    scrubbingRef.current = false;
-                    wasPlayingBeforeScrubRef.current = false;
-                    browserScrubResumeIntentRef.current = false;
-                    setIsScrubbing(false);
-                    syncVisiblePlaybackUiWithAudioRoute(`failed global scrub release: ${eventType}`);
-                });
-                return;
-            }
-
             repairLongRunningPlaybackState(`global page event: ${eventType}`);
         };
 
-        window.addEventListener("pointerup", finishScrubFromGlobalRelease, true);
-        window.addEventListener("pointercancel", finishScrubFromGlobalRelease, true);
-        window.addEventListener("lostpointercapture", finishScrubFromGlobalRelease, true);
-        window.addEventListener("mouseup", finishScrubFromGlobalRelease, true);
-        window.addEventListener("touchend", finishScrubFromGlobalRelease, true);
-        window.addEventListener("touchcancel", finishScrubFromGlobalRelease, true);
-        window.addEventListener("dragend", finishScrubFromGlobalRelease, true);
-        window.addEventListener("keyup", finishScrubFromGlobalRelease, true);
-        window.addEventListener("blur", finishScrubFromGlobalRelease, true);
-        window.addEventListener("focus", finishScrubFromGlobalRelease, true);
-        window.addEventListener("pagehide", finishScrubFromGlobalRelease, true);
-        window.addEventListener("pageshow", finishScrubFromGlobalRelease, true);
-        document.addEventListener("visibilitychange", finishScrubFromGlobalRelease, true);
+        window.addEventListener("blur", recoverScrubForLifecycle, true);
+        window.addEventListener("focus", recoverScrubForLifecycle, true);
+        window.addEventListener("pagehide", recoverScrubForLifecycle, true);
+        window.addEventListener("pageshow", recoverScrubForLifecycle, true);
+        document.addEventListener(
+            "visibilitychange",
+            recoverScrubForLifecycle,
+            true
+        );
 
         return () => {
-            window.removeEventListener("pointerup", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("pointercancel", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("lostpointercapture", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("mouseup", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("touchend", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("touchcancel", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("dragend", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("keyup", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("blur", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("focus", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("pagehide", finishScrubFromGlobalRelease, true);
-            window.removeEventListener("pageshow", finishScrubFromGlobalRelease, true);
-            document.removeEventListener("visibilitychange", finishScrubFromGlobalRelease, true);
+            window.removeEventListener("blur", recoverScrubForLifecycle, true);
+            window.removeEventListener("focus", recoverScrubForLifecycle, true);
+            window.removeEventListener("pagehide", recoverScrubForLifecycle, true);
+            window.removeEventListener("pageshow", recoverScrubForLifecycle, true);
+            document.removeEventListener(
+                "visibilitychange",
+                recoverScrubForLifecycle,
+                true
+            );
             clearBackgroundScrubCommitTimer();
             clearFocusReturnScrubUnlockTimer();
         };
@@ -14356,7 +14360,9 @@ export default function Audio() {
 
         if (isRendering || timelineDuration <= 0) return;
         mediaDurationRef.current = timelineDuration;
-        if (buffer && isLoading) return;
+        // Safari/iOS must be able to choose a paused start position even while
+        // playlist artwork/metadata is still finishing. A decoded buffer is
+        // already seekable, so do not block the gesture on the UI loading flag.
         if (scrubbingRef.current && scrubGestureActiveRef.current) return;
 
         const currentOffset = getCurrentOffset();
@@ -14374,8 +14380,7 @@ export default function Audio() {
             (capturedMediaChromeResumeIntent ??
                 Boolean(
                     playingRef.current ||
-                    isPlayingStateRef.current ||
-                    activeSourceRef.current
+                    isPlayingStateRef.current
                 )) &&
             !pauseActionInFlightRef.current &&
             !isPauseUiSettlingRef.current
@@ -14761,6 +14766,97 @@ export default function Audio() {
         const shouldResume = Boolean(
             shouldResumeFromGesture && nextOffset < buffer.duration
         );
+
+        if (!shouldResume) {
+            // Paused Safari/iOS seeking must not touch autoplay-sensitive output
+            // APIs. Commit the new source offset synchronously, keep the hidden
+            // route silent, and let the next explicit Play gesture resume from
+            // this exact point.
+            manualStopRef.current = true;
+            stopActiveSource();
+            stopPositionTimer();
+            stopVisualizer();
+            clearRuntimePlayerSessionHeartbeat();
+
+            scrubbingRef.current = false;
+            scrubGestureActiveRef.current = false;
+            wasPlayingBeforeScrubRef.current = false;
+            browserScrubResumeIntentRef.current = false;
+            scrubPlaybackIntentRef.current = false;
+            setIsScrubbing(false);
+
+            committedPlaybackOffsetRef.current = nextOffset;
+            startedOffsetRef.current = nextOffset;
+            startedAtContextTimeRef.current = 0;
+            mediaPositionRef.current = nextOffset;
+            browserScrubLastValueRef.current = nextOffset;
+            lastKnownGoodOffsetRef.current = nextOffset;
+            pendingMediaSessionSeekRef.current = null;
+
+            if (isIOSAudioDevice()) {
+                iPhoneLockScreenOutputArmedRef.current = false;
+                holdIPhonePauseSilence(
+                    "Safari/iOS paused scrub committed without autoplay"
+                );
+            }
+
+            setPlayingState(false);
+            syncPlaybackPosition(nextOffset, {
+                forceMediaSession: true,
+                commitStartOffset: true,
+                clearPendingMediaSessionSeek: true,
+                forceSessionPersist: true,
+            });
+            updateMediaSessionState("paused", { forcePosition: true });
+
+            lastCompletedScrubCommitRef.current = {
+                at: Date.now(),
+                position: nextOffset,
+                resume: false,
+            };
+            recentScrubResumeIntentRef.current = {
+                at: Date.now(),
+                position: nextOffset,
+                resume: false,
+            };
+
+            updateRuntimePlayerSession(
+                "Safari/iOS paused Media Chrome scrub committed",
+                {
+                    lifecycle: "active",
+                    wasPlaying: false,
+                    explicitlyPaused: true,
+                    position: nextOffset,
+                    duration: buffer.duration,
+                    scrubActive: false,
+                    scrubPosition: nextOffset,
+                    scrubResume: false,
+                    mediaChromeSeekId:
+                        mediaChromeCommit?.seekSession?.id || 0,
+                    mediaChromeOwnerSessionId:
+                        mediaChromeCommit?.seekSession?.ownerSessionId || "",
+                    heartbeatAt: Date.now(),
+                    playbackClockEpoch: finalSeekClock.epoch,
+                    lastCommittedSeekAt: finalSeekClock.at,
+                    lastCommittedSeekPosition: nextOffset,
+                    lastCommittedSeekDirection: finalSeekClock.direction,
+                },
+                { forcePersist: true }
+            );
+            persistPlaybackSessionSnapshot(
+                "Safari/iOS paused scrub position committed",
+                {
+                    force: true,
+                    position: nextOffset,
+                    playing: false,
+                }
+            );
+            setInfo(
+                `Scrubbed to ${formatTimelineOffset(nextOffset, settingsView)} while paused. Play will start from this position.`
+            );
+            return;
+        }
+
         let outputAlreadyRestarted = false;
 
         markScrubResumeIntent(shouldResume, nextOffset);
@@ -16629,8 +16725,8 @@ export default function Audio() {
                                                     onSeekStart={(seekSession) =>
                                                         handleScrubStart(seekSession)
                                                     }
-                                                    onSeekChange={(value) =>
-                                                        handleScrubChange(null, value)
+                                                    onSeekChange={(value, seekSession) =>
+                                                        handleScrubChange(null, value, seekSession)
                                                     }
                                                     onSeekCommit={(value, reason, seekSession) =>
                                                         handleScrubCommit(null, value, {
