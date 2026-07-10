@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Helmet } from "react-helmet-async";
 import {
     Alert,
@@ -69,6 +69,13 @@ const DEFAULT_SETTINGS = {
     showSpectrum: true,
     mirrorWaveform: true,
 };
+
+function isReactSnapRun() {
+    return (
+        typeof navigator !== "undefined" &&
+        navigator.userAgent.includes("ReactSnap")
+    );
+}
 
 function clamp(value, min, max) {
     const number = Number(value);
@@ -487,6 +494,8 @@ function buildAnimatedVisualizerScene(THREE, frames, settings, sourceName) {
 }
 
 export default function Visualizer() {
+    const reactSnapRun = isReactSnapRun();
+
     const audioRef = useRef(null);
     const objectUrlRef = useRef(null);
     const sourceKindRef = useRef("none");
@@ -546,12 +555,12 @@ export default function Visualizer() {
         });
     }
 
-    function clearObjectUrl() {
+    const clearObjectUrl = useCallback(() => {
         if (objectUrlRef.current) {
             URL.revokeObjectURL(objectUrlRef.current);
             objectUrlRef.current = null;
         }
-    }
+    }, []);
 
     function resetExportFrames() {
         exportFramesRef.current = [];
@@ -559,7 +568,7 @@ export default function Visualizer() {
         setExportFrameCount(0);
     }
 
-    function captureExportFrame(frequencyData) {
+    const captureExportFrame = useCallback((frequencyData) => {
         const audio = audioRef.current;
 
         if (!audio || audio.paused || !frequencyData?.length) return;
@@ -593,13 +602,16 @@ export default function Visualizer() {
         const maxFrames = fps * 45;
 
         if (exportFramesRef.current.length > maxFrames) {
-            exportFramesRef.current.splice(0, exportFramesRef.current.length - maxFrames);
+            exportFramesRef.current.splice(
+                0,
+                exportFramesRef.current.length - maxFrames
+            );
         }
 
         if (exportFramesRef.current.length % 6 === 0) {
             setExportFrameCount(exportFramesRef.current.length);
         }
-    }
+    }, [settings.barCount]);
 
     async function exportAnimatedFbx() {
         try {
@@ -1008,6 +1020,26 @@ export default function Visualizer() {
     }, []);
 
     useEffect(() => {
+        let disposed = false;
+
+        if (reactSnapRun) {
+            drawEmptyCanvas(
+                waveformCanvasRef.current,
+                "Load audio to display waveform."
+            );
+            drawEmptyCanvas(
+                spectrumCanvasRef.current,
+                "Load audio to display spectrum."
+            );
+            return undefined;
+        }
+
+        function scheduleNextFrame() {
+            if (!disposed) {
+                raf2dRef.current = requestAnimationFrame(draw2d);
+            }
+        }
+
         function draw2d() {
             const analyser = analyserRef.current;
             const frequencyData = frequencyDataRef.current;
@@ -1016,7 +1048,7 @@ export default function Visualizer() {
             if (!analyser || !frequencyData?.length || !timeData?.length || !audioReady) {
                 drawEmptyCanvas(waveformCanvasRef.current, "Load audio to display waveform.");
                 drawEmptyCanvas(spectrumCanvasRef.current, "Load audio to display spectrum.");
-                raf2dRef.current = requestAnimationFrame(draw2d);
+                scheduleNextFrame();
                 return;
             }
 
@@ -1159,26 +1191,35 @@ export default function Visualizer() {
                 drawEmptyCanvas(spectrumCanvasRef.current, "Spectrum panel disabled.");
             }
 
-            raf2dRef.current = requestAnimationFrame(draw2d);
+
+            scheduleNextFrame();
         }
 
-        raf2dRef.current = requestAnimationFrame(draw2d);
+        scheduleNextFrame();
 
         return () => {
-            if (raf2dRef.current) {
+            disposed = true;
+
+            if (raf2dRef.current !== null) {
                 cancelAnimationFrame(raf2dRef.current);
+                raf2dRef.current = null;
             }
         };
     }, [
+        reactSnapRun,
         audioReady,
         settings.showWaveform,
         settings.showSpectrum,
         settings.mirrorWaveform,
         settings.sensitivity,
-        settings.barCount,
+        captureExportFrame,
     ]);
 
     useEffect(() => {
+        if (reactSnapRun) {
+            return undefined;
+        }
+
         let disposed = false;
         let renderer = null;
         let scene = null;
@@ -1442,7 +1483,15 @@ export default function Visualizer() {
             renderer.setAnimationLoop(render);
         }
 
-        initThree();
+        void initThree().catch((error) => {
+            if (disposed) return;
+
+            console.warn("Visualizer WebGL initialization failed:", error);
+            setStatus(
+                "The 3D renderer could not initialize, but the audio and 2D visualizer tools remain available."
+            );
+            setStatusTone("error");
+        });
 
         return () => {
             disposed = true;
@@ -1462,8 +1511,18 @@ export default function Visualizer() {
             }
 
             renderer?.dispose?.();
+            renderer?.forceContextLoss?.();
+
+            meshes = [];
+            terrainHistory = [];
+            terrainMesh = null;
+            group = null;
+            scene = null;
+            camera = null;
+            renderer = null;
         };
     }, [
+        reactSnapRun,
         settings.mode,
         settings.barCount,
         settings.terrainDepth,
@@ -1476,15 +1535,16 @@ export default function Visualizer() {
         return () => {
             clearObjectUrl();
 
-            if (raf2dRef.current) {
+            if (raf2dRef.current !== null) {
                 cancelAnimationFrame(raf2dRef.current);
+                raf2dRef.current = null;
             }
 
             if (audioContextRef.current) {
                 audioContextRef.current.close().catch(() => {});
             }
         };
-    }, []);
+    }, [clearObjectUrl]);
 
     return (
         <PageShell>

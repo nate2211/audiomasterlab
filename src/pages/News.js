@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Helmet } from "react-helmet-async";
 import {
     Box,
@@ -39,6 +39,108 @@ const FALLBACK_IMAGE = `${SITE_ROOT}/social-preview.png`;
 const NPR_FALLBACK_IMAGE =
     "https://media.npr.org/images/podcasts/primary/npr_generic_image_300.jpg?s=600";
 const MAX_DATA_IMAGE_CHARS = 1400000;
+
+const NEWS_BOOTSTRAP_ID = "audiomasterlab-news-bootstrap";
+
+function isReactSnapRun() {
+    return (
+        typeof navigator !== "undefined" &&
+        navigator.userAgent.includes("ReactSnap")
+    );
+}
+
+function useExternalMediaAfterHydration() {
+    const [enabled, setEnabled] = useState(false);
+
+    useEffect(() => {
+        if (!isReactSnapRun()) {
+            setEnabled(true);
+        }
+    }, []);
+
+    return enabled;
+}
+
+function safeJsonForHtml(value) {
+    return JSON.stringify(value)
+        .replace(/</g, "\\u003c")
+        .replace(/>/g, "\\u003e")
+        .replace(/&/g, "\\u0026")
+        .replace(/\u2028/g, "\\u2028")
+        .replace(/\u2029/g, "\\u2029");
+}
+
+function sanitizeSnapshotImage(value) {
+    const image = String(value || "");
+    return image.startsWith("data:") ? FALLBACK_IMAGE : image;
+}
+
+function sanitizeSnapshotItem(item) {
+    if (!item || typeof item !== "object") return item;
+
+    return {
+        ...item,
+        image: sanitizeSnapshotImage(item.image),
+        imageViaProxy: sanitizeSnapshotImage(item.imageViaProxy),
+        thumbnail: sanitizeSnapshotImage(item.thumbnail),
+        thumbnail_url: sanitizeSnapshotImage(item.thumbnail_url),
+    };
+}
+
+function makeNewsSnapshot({
+                              rssArticles,
+                              hypebeastArticles,
+                              videos,
+                              embeds,
+                              statuses,
+                              generatedAt,
+                          }) {
+    return {
+        version: 1,
+        generatedAt,
+        rssArticles: rssArticles.map(sanitizeSnapshotItem),
+        hypebeastArticles: hypebeastArticles.map(sanitizeSnapshotItem),
+        videos: videos.map(sanitizeSnapshotItem),
+        embeds: embeds.map(sanitizeSnapshotItem),
+        statuses,
+    };
+}
+
+function readEmbeddedNewsSnapshot() {
+    if (typeof document === "undefined") return null;
+
+    const node = document.getElementById(NEWS_BOOTSTRAP_ID);
+    const text = node?.textContent?.trim();
+
+    if (!text) return null;
+
+    try {
+        const parsed = JSON.parse(text);
+        return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (error) {
+        console.warn("Could not read embedded AudioMaster Lab news state:", error);
+        return null;
+    }
+}
+
+function formatGeneratedAt(value) {
+    const date = new Date(value || 0);
+
+    if (Number.isNaN(date.getTime())) {
+        return "recently";
+    }
+
+    return new Intl.DateTimeFormat("en-US", {
+        timeZone: "UTC",
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        timeZoneName: "short",
+    }).format(date);
+}
 
 const NPR_FEEDS = [
     {
@@ -746,29 +848,39 @@ async function fetchJson(url, signal) {
     const response = await fetch(url, {
         method: "GET",
         headers: {
-            Accept: "application/json, text/plain, */*",
+            Accept: "application/json",
         },
         signal,
+        cache: "no-store",
     });
 
-    const text = await response.text();
+    const contentType = response.headers.get("content-type") || "";
+    const rawText = await response.text();
+    const text = rawText.replace(/^\uFEFF/, "").trim();
 
     if (isReactShellHtml(text)) {
-        throw new Error(`Proxy route returned the React app shell for ${url}.`);
+        throw new Error(`JSON proxy returned the React app shell: ${url}`);
     }
 
     if (!response.ok) {
         throw new Error(
-            `${response.status} ${response.statusText}: ${text
-                .slice(0, 180)
-                .replace(/\s+/g, " ")}`
+            `${url} returned HTTP ${response.status} ${response.statusText}: ${
+                text.slice(0, 240).replace(/\s+/g, " ") || "<empty response>"
+            }`
+        );
+    }
+
+    if (!text || text === ".") {
+        throw new Error(
+            `${url} returned an empty or placeholder response instead of JSON. ` +
+            `Content-Type: ${contentType || "<missing>"}`
         );
     }
 
     if (isHtmlResponse(text)) {
         throw new Error(
-            `Upstream returned HTML instead of JSON: ${text
-                .slice(0, 120)
+            `${url} returned HTML instead of JSON: ${text
+                .slice(0, 180)
                 .replace(/\s+/g, " ")}`
         );
     }
@@ -777,9 +889,9 @@ async function fetchJson(url, signal) {
         return JSON.parse(text);
     } catch {
         throw new Error(
-            `Invalid JSON returned from upstream: ${text
-                .slice(0, 140)
-                .replace(/\s+/g, " ")}`
+            `${url} returned invalid JSON. Content-Type: ${
+                contentType || "<missing>"
+            }. Response preview: ${text.slice(0, 240).replace(/\s+/g, " ")}`
         );
     }
 }
@@ -1011,13 +1123,15 @@ function SourceChip({ icon, label }) {
 }
 
 function NewsCard({ item }) {
+    const externalMediaEnabled = useExternalMediaAfterHydration();
     const isVideo = item.type === "video";
     const isHypebeast = item.type === "hypebeast";
-    const [imgSrc, setImgSrc] = useState(item.imageViaProxy || item.image || FALLBACK_IMAGE);
+    const preferredImage = item.imageViaProxy || item.image || FALLBACK_IMAGE;
+    const [imgSrc, setImgSrc] = useState(FALLBACK_IMAGE);
 
     useEffect(() => {
-        setImgSrc(item.imageViaProxy || item.image || FALLBACK_IMAGE);
-    }, [item.image, item.imageViaProxy]);
+        setImgSrc(externalMediaEnabled ? preferredImage : FALLBACK_IMAGE);
+    }, [externalMediaEnabled, preferredImage]);
 
     const fallbackImage = item.source?.toLowerCase().includes("npr")
         ? NPR_FALLBACK_IMAGE
@@ -1039,7 +1153,8 @@ function NewsCard({ item }) {
             <Box sx={{ position: "relative" }}>
                 <CardMedia
                     component="img"
-                    height="198"
+                    width="640"
+                    height="360"
                     image={imgSrc || fallbackImage}
                     alt={item.title}
                     loading="lazy"
@@ -1055,6 +1170,7 @@ function NewsCard({ item }) {
                         }
                     }}
                     sx={{
+                        height: 230,
                         objectFit: "cover",
                         background: "#111827",
                     }}
@@ -1153,7 +1269,13 @@ function NewsCard({ item }) {
 }
 
 function EmbedCard({ item }) {
-    const iframeSrc = getAllowedIframeSrcFromHtml(item.html);
+    const externalMediaEnabled = useExternalMediaAfterHydration();
+    const iframeSrc = externalMediaEnabled
+        ? getAllowedIframeSrcFromHtml(item.html)
+        : "";
+    const previewImage = externalMediaEnabled
+        ? item.thumbnail_url || item.thumbnail || FALLBACK_IMAGE
+        : FALLBACK_IMAGE;
 
     return (
         <Card
@@ -1172,7 +1294,7 @@ function EmbedCard({ item }) {
                     title={item.title || item.label}
                     src={iframeSrc}
                     loading="lazy"
-                    allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                    allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
                     sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-presentation"
                     sx={{
                         width: "100%",
@@ -1185,8 +1307,9 @@ function EmbedCard({ item }) {
             ) : (
                 <CardMedia
                     component="img"
-                    height="230"
-                    image={item.thumbnail_url || item.thumbnail || FALLBACK_IMAGE}
+                    width="640"
+                    height="360"
+                    image={previewImage}
                     alt={item.title || item.label}
                     loading="lazy"
                     referrerPolicy="no-referrer"
@@ -1492,18 +1615,60 @@ function SeoBlock({ articles, hypebeastArticles, videos }) {
 }
 
 export default function NewsPage() {
-    const [rssArticles, setRssArticles] = useState([]);
-    const [hypebeastArticles, setHypebeastArticles] = useState([]);
-    const [videos, setVideos] = useState([]);
-    const [embeds, setEmbeds] = useState([]);
-    const [statuses, setStatuses] = useState([]);
-    const [loading, setLoading] = useState(true);
+    const initialSnapshot = useMemo(() => readEmbeddedNewsSnapshot(), []);
+    const requestControllerRef = useRef(null);
 
-    const generatedAt = useMemo(() => new Date(), []);
+    const [rssArticles, setRssArticles] = useState(
+        () => initialSnapshot?.rssArticles || []
+    );
+    const [hypebeastArticles, setHypebeastArticles] = useState(
+        () => initialSnapshot?.hypebeastArticles || []
+    );
+    const [videos, setVideos] = useState(
+        () => initialSnapshot?.videos || []
+    );
+    const [embeds, setEmbeds] = useState(
+        () => initialSnapshot?.embeds || []
+    );
+    const [statuses, setStatuses] = useState(
+        () => initialSnapshot?.statuses || []
+    );
+    const [generatedAt, setGeneratedAt] = useState(
+        () => initialSnapshot?.generatedAt || new Date().toISOString()
+    );
+    const [loading, setLoading] = useState(() => !initialSnapshot);
+
+    const bootstrapSnapshot = useMemo(
+        () =>
+            makeNewsSnapshot({
+                rssArticles,
+                hypebeastArticles,
+                videos,
+                embeds,
+                statuses,
+                generatedAt,
+            }),
+        [
+            rssArticles,
+            hypebeastArticles,
+            videos,
+            embeds,
+            statuses,
+            generatedAt,
+        ]
+    );
 
     const loadNews = useCallback(async () => {
+        requestControllerRef.current?.abort();
+
         const controller = new AbortController();
+        requestControllerRef.current = controller;
+
         const { signal } = controller;
+        const timeoutId = window.setTimeout(
+            () => controller.abort(),
+            isReactSnapRun() ? 12000 : 25000
+        );
 
         setLoading(true);
 
@@ -1560,9 +1725,9 @@ export default function NewsPage() {
                 };
             });
 
-            const embedJobs = FEATURED_OEMBEDS.map(async (item) => {
-                return fetchOembedCard(item, signal);
-            });
+            const embedJobs = FEATURED_OEMBEDS.map((item) =>
+                fetchOembedCard(item, signal)
+            );
 
             const [nprSettled, hypebeastSettled, videoSettled, embedSettled] =
                 await Promise.all([
@@ -1576,10 +1741,14 @@ export default function NewsPage() {
                 .filter((result) => result.status === "fulfilled")
                 .flatMap((result) => result.value.items)
                 .filter((item) => item.title)
-                .filter((item, index, array) => {
-                    return array.findIndex((other) => other.link === item.link) === index;
-                })
-                .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
+                .filter((item, index, array) =>
+                    array.findIndex((other) => other.link === item.link) === index
+                )
+                .sort(
+                    (a, b) =>
+                        new Date(b.publishedAt || 0) -
+                        new Date(a.publishedAt || 0)
+                )
                 .slice(0, 18);
 
             const nextHypebeastArticles = hypebeastSettled
@@ -1588,17 +1757,25 @@ export default function NewsPage() {
                 .filter((item) => item.title)
                 .filter((item) => !isBadHypebeastTitle(item.title))
                 .filter((item) => !isBadHypebeastCard(item))
-                .filter((item, index, array) => {
-                    return array.findIndex((other) => other.link === item.link) === index;
-                })
-                .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
+                .filter((item, index, array) =>
+                    array.findIndex((other) => other.link === item.link) === index
+                )
+                .sort(
+                    (a, b) =>
+                        new Date(b.publishedAt || 0) -
+                        new Date(a.publishedAt || 0)
+                )
                 .slice(0, 15);
 
             const nextVideos = videoSettled
                 .filter((result) => result.status === "fulfilled")
                 .flatMap((result) => result.value.items)
                 .filter((item) => item.title)
-                .sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0))
+                .sort(
+                    (a, b) =>
+                        new Date(b.publishedAt || 0) -
+                        new Date(a.publishedAt || 0)
+                )
                 .slice(0, 10);
 
             const nextEmbeds = embedSettled
@@ -1653,28 +1830,35 @@ export default function NewsPage() {
             setVideos(nextVideos);
             setEmbeds(nextEmbeds);
             setStatuses(nextStatuses);
+            setGeneratedAt(new Date().toISOString());
         } catch (error) {
-            setRssArticles([]);
-            setHypebeastArticles([]);
-            setVideos([]);
-            setEmbeds([]);
-            setStatuses([
-                {
-                    label: "News page",
-                    kind: "page",
-                    state: "failed",
-                    message: error?.message || "News page failed to load.",
-                },
-            ]);
+            if (error?.name !== "AbortError") {
+                setStatuses([
+                    {
+                        label: "News page",
+                        kind: "page",
+                        state: "failed",
+                        message: error?.message || "News page failed to load.",
+                    },
+                ]);
+            }
         } finally {
-            setLoading(false);
-        }
+            window.clearTimeout(timeoutId);
 
-        return () => controller.abort();
+            if (requestControllerRef.current === controller) {
+                requestControllerRef.current = null;
+                setLoading(false);
+            }
+        }
     }, []);
 
     useEffect(() => {
-        loadNews();
+        void loadNews();
+
+        return () => {
+            requestControllerRef.current?.abort();
+            requestControllerRef.current = null;
+        };
     }, [loadNews]);
 
     return (
@@ -1692,6 +1876,14 @@ export default function NewsPage() {
                 articles={rssArticles}
                 hypebeastArticles={hypebeastArticles}
                 videos={videos}
+            />
+
+            <script
+                id={NEWS_BOOTSTRAP_ID}
+                type="application/json"
+                dangerouslySetInnerHTML={{
+                    __html: safeJsonForHtml(bootstrapSnapshot),
+                }}
             />
 
             <Container maxWidth="xl" sx={{ py: { xs: 4, md: 6 } }}>
@@ -1791,7 +1983,7 @@ export default function NewsPage() {
                         </Stack>
 
                         <Typography variant="caption" sx={{ color: "rgba(255,255,255,.52)" }}>
-                            Loaded in browser at {generatedAt.toLocaleString()}.
+                            Feed snapshot generated {formatGeneratedAt(generatedAt)}.
                         </Typography>
                     </Stack>
                 </Paper>

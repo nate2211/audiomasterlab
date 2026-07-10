@@ -57,7 +57,7 @@
     ],
     "crawl": false,
     "concurrency": 1,
-    "skipThirdPartyRequests": true,
+    "skipThirdPartyRequests": false,
     "cacheAjaxRequests": false,
     "inlineCss": false,
     "minifyHtml": false,
