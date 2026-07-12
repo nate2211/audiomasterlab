@@ -261,7 +261,22 @@ const SAFE_COLLECTION_OPTIONS = [
 ];
 
 const DEFAULT_SELECTED_COLLECTIONS = ["opensource_audio"];
+
+// The new Audio player stores multiple named playlists in playlistLibrary.v1.
+// Keep the legacy active-queue key synchronized so older builds, Redux/Dexie
+// snapshots, and the new player can all recover the same active playlist.
 const AUDIO_PLAYLIST_STORAGE_KEY = "audiomasterlab.audio.playlist.v4";
+const AUDIO_PLAYLIST_LIBRARY_STORAGE_KEY =
+    "audiomasterlab.audio.playlistLibrary.v1";
+const AUDIO_ACTIVE_PLAYLIST_ID_STORAGE_KEY =
+    "audiomasterlab.audio.activePlaylistId.v1";
+const AUDIO_ACTIVE_PLAYLIST_INDEX_STORAGE_KEY =
+    "audiomasterlab.audio.activePlaylistIndex.v4";
+const AUDIO_DIRECT_LINK_STORAGE_KEY = "audiomasterlab.audio.directLink.v4";
+const AUDIO_LAST_MEDIA_STORAGE_KEY = "audiomasterlab.audio.lastMedia.v4";
+const DEFAULT_AUDIO_PLAYLIST_NAME = "My Playlist";
+const AUDIO_PLAYER_ROUTE = "/audio";
+
 const SCRAPEWEBSITE_ARCHIVE_PROXY_URL = "https://scrapewebsite.pages.dev/api/archiveproxy";
 const ARCHIVE_PROXY_STORAGE_KEY = "audiomasterlab.archive.useProxy.v1";
 const ARCHIVE_BROWSER_STORAGE_KEY = "audiomasterlab.archive.browser.session.v3";
@@ -435,7 +450,220 @@ function readAudioPlaylistFromStorage() {
 }
 
 function writeAudioPlaylistToStorage(playlist) {
-    return writeJsonStorage(AUDIO_PLAYLIST_STORAGE_KEY, playlist);
+    return writeJsonStorage(
+        AUDIO_PLAYLIST_STORAGE_KEY,
+        Array.isArray(playlist) ? playlist : []
+    );
+}
+
+function makeAudioPlaylistCollectionId() {
+    if (
+        typeof crypto !== "undefined" &&
+        typeof crypto.randomUUID === "function"
+    ) {
+        return `playlist-${crypto.randomUUID()}`;
+    }
+
+    return `playlist-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function normalizeAudioPlaylistCollectionName(value, fallback = DEFAULT_AUDIO_PLAYLIST_NAME) {
+    const name = normalizeText(value).slice(0, 80);
+    return name || fallback;
+}
+
+function normalizeAudioPlaylistCollection(collection, index = 0) {
+    if (!collection || typeof collection !== "object") return null;
+
+    const items = Array.isArray(collection.items)
+        ? collection.items.filter(Boolean)
+        : [];
+    const lastActiveIndex = Number.isFinite(Number(collection.lastActiveIndex))
+        ? Math.max(-1, Math.min(Number(collection.lastActiveIndex), items.length - 1))
+        : -1;
+    const now = new Date().toISOString();
+
+    return {
+        ...collection,
+        id: String(collection.id || makeAudioPlaylistCollectionId()),
+        name: normalizeAudioPlaylistCollectionName(
+            collection.name,
+            index === 0 ? DEFAULT_AUDIO_PLAYLIST_NAME : `Playlist ${index + 1}`
+        ),
+        description: normalizeText(collection.description).slice(0, 280),
+        items,
+        lastActiveIndex,
+        createdAt: collection.createdAt || now,
+        updatedAt: collection.updatedAt || now,
+    };
+}
+
+function readAudioPlaylistLibraryState() {
+    const storedLibrary = readJsonStorage(
+        AUDIO_PLAYLIST_LIBRARY_STORAGE_KEY,
+        null
+    );
+    const legacyPlaylist = readAudioPlaylistFromStorage();
+    let library = Array.isArray(storedLibrary)
+        ? storedLibrary
+            .map(normalizeAudioPlaylistCollection)
+            .filter(Boolean)
+        : [];
+
+    if (!library.length) {
+        const now = new Date().toISOString();
+        const storedActiveId =
+            typeof window !== "undefined" && window.localStorage
+                ? window.localStorage.getItem(AUDIO_ACTIVE_PLAYLIST_ID_STORAGE_KEY) || ""
+                : "";
+
+        library = [
+            normalizeAudioPlaylistCollection({
+                id: storedActiveId || "playlist-default",
+                name: DEFAULT_AUDIO_PLAYLIST_NAME,
+                description: legacyPlaylist.length
+                    ? "Migrated from the original AudioMaster Lab playlist."
+                    : "",
+                items: legacyPlaylist,
+                lastActiveIndex: Number(
+                    typeof window !== "undefined" && window.localStorage
+                        ? window.localStorage.getItem(
+                        AUDIO_ACTIVE_PLAYLIST_INDEX_STORAGE_KEY
+                    ) || -1
+                        : -1
+                ),
+                createdAt: now,
+                updatedAt: now,
+            }),
+        ].filter(Boolean);
+    }
+
+    let activePlaylistId = "";
+
+    if (typeof window !== "undefined" && window.localStorage) {
+        try {
+            activePlaylistId =
+                window.localStorage.getItem(AUDIO_ACTIVE_PLAYLIST_ID_STORAGE_KEY) || "";
+        } catch {
+            activePlaylistId = "";
+        }
+    }
+
+    let activePlaylistIndex = library.findIndex(
+        (collection) => collection.id === activePlaylistId
+    );
+
+    if (activePlaylistIndex < 0) {
+        activePlaylistIndex = 0;
+        activePlaylistId = library[0]?.id || "";
+    }
+
+    return {
+        library,
+        activePlaylistId,
+        activePlaylistIndex,
+        activePlaylist: library[activePlaylistIndex] || null,
+    };
+}
+
+function writeAudioPlaylistLibraryState({
+                                            library,
+                                            activePlaylistId,
+                                            activeTrackIndex,
+                                        }) {
+    const normalizedLibrary = (Array.isArray(library) ? library : [])
+        .map(normalizeAudioPlaylistCollection)
+        .filter(Boolean);
+
+    if (!normalizedLibrary.length) return false;
+
+    const selectedCollection =
+        normalizedLibrary.find(
+            (collection) => collection.id === activePlaylistId
+        ) || normalizedLibrary[0];
+    const selectedTrackIndex = Number.isFinite(Number(activeTrackIndex))
+        ? Math.max(
+            -1,
+            Math.min(
+                Number(activeTrackIndex),
+                Math.max(-1, selectedCollection.items.length - 1)
+            )
+        )
+        : selectedCollection.lastActiveIndex;
+    const nextLibrary = normalizedLibrary.map((collection) =>
+        collection.id === selectedCollection.id
+            ? {
+                ...collection,
+                lastActiveIndex: selectedTrackIndex,
+                updatedAt: new Date().toISOString(),
+            }
+            : collection
+    );
+    const nextActiveCollection =
+        nextLibrary.find(
+            (collection) => collection.id === selectedCollection.id
+        ) || nextLibrary[0];
+
+    const librarySaved = writeJsonStorage(
+        AUDIO_PLAYLIST_LIBRARY_STORAGE_KEY,
+        nextLibrary
+    );
+    const legacySaved = writeAudioPlaylistToStorage(
+        nextActiveCollection.items || []
+    );
+
+    if (typeof window !== "undefined" && window.localStorage) {
+        try {
+            window.localStorage.setItem(
+                AUDIO_ACTIVE_PLAYLIST_ID_STORAGE_KEY,
+                nextActiveCollection.id
+            );
+            window.localStorage.setItem(
+                AUDIO_ACTIVE_PLAYLIST_INDEX_STORAGE_KEY,
+                String(nextActiveCollection.lastActiveIndex)
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    return Boolean(librarySaved && legacySaved);
+}
+
+function getArchivePlaylistUrlKey(itemOrFile = {}) {
+    const value =
+        itemOrFile.directArchiveUrl ||
+        itemOrFile.directServeUrl ||
+        itemOrFile.archiveServeUrl ||
+        itemOrFile.serveUrl ||
+        itemOrFile.url ||
+        itemOrFile.downloadUrl ||
+        "";
+
+    try {
+        const parsed = new URL(value);
+
+        if (
+            parsed.origin === "https://scrapewebsite.pages.dev" &&
+            parsed.pathname === "/api/archiveproxy"
+        ) {
+            const target = parsed.searchParams.get("url");
+            return target ? decodeURIComponent(target) : value;
+        }
+
+        return parsed.toString();
+    } catch {
+        return String(value || "");
+    }
+}
+
+function findAudioPlaylistItemIndex(items = [], candidate = {}) {
+    const candidateKey = getArchivePlaylistUrlKey(candidate);
+
+    return (Array.isArray(items) ? items : []).findIndex((item) => {
+        if (!item || item.kind !== "url") return false;
+        return getArchivePlaylistUrlKey(item) === candidateKey;
+    });
 }
 
 function readCustomCollectionsFromStorage() {
@@ -1094,6 +1322,8 @@ function getPlayableFiles(identifier, files, allowZipInternalPaths, useArchivePr
             const downloadUrl = buildArchiveProxyUrl(directDownloadUrl, useArchiveProxy);
             const serveUrl = buildArchiveProxyUrl(directServeUrl, useArchiveProxy);
 
+            const archiveArtworkUrl = buildArchiveImageServiceUrl(identifier);
+
             return {
                 name: file.name,
                 format: file.format || "",
@@ -1105,6 +1335,11 @@ function getPlayableFiles(identifier, files, allowZipInternalPaths, useArchivePr
                 downloadUrl,
                 directServeUrl,
                 directDownloadUrl,
+                directArchiveUrl: directServeUrl,
+                proxiedArchiveUrl: useArchiveProxy ? serveUrl : "",
+                archiveIdentifier: identifier,
+                archiveArtworkUrl,
+                artworkUrl: archiveArtworkUrl,
                 proxied: Boolean(useArchiveProxy),
                 zipInternal: isZipInternalPath(file.name),
             };
@@ -1531,6 +1766,11 @@ async function loadDirectArchiveAudioLinks({
                 downloadUrl,
                 directServeUrl: target.serveUrl,
                 directDownloadUrl: target.downloadUrl,
+                directArchiveUrl: target.serveUrl,
+                proxiedArchiveUrl: useArchiveProxy ? serveUrl : "",
+                archiveIdentifier: target.identifier,
+                archiveArtworkUrl: buildArchiveImageServiceUrl(target.identifier),
+                artworkUrl: buildArchiveImageServiceUrl(target.identifier),
                 originalUrl: target.originalUrl,
                 proxied: Boolean(useArchiveProxy),
                 zipInternal: target.zipInternal,
@@ -1909,7 +2149,7 @@ const ArchiveFileRow = React.memo(function ArchiveFileRow({
                         onClick={() => onSendToAudioPage(file)}
                         startIcon={<AudiotrackRoundedIcon />}
                     >
-                        Save for Audio Page
+                        Play in Audio Player
                     </Button>
 
                     <Button
@@ -2567,6 +2807,29 @@ export default function ArchiveAudioBrowser() {
         const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
         if (!selectedUrl) return null;
 
+        const directArchiveUrl =
+            file?.directArchiveUrl ||
+            file?.directServeUrl ||
+            file?.archiveServeUrl ||
+            selectedUrl;
+        const proxiedArchiveUrl =
+            file?.proxiedArchiveUrl ||
+            (String(selectedUrl).startsWith(
+                `${SCRAPEWEBSITE_ARCHIVE_PROXY_URL}?`
+            )
+                ? selectedUrl
+                : "");
+        const archiveIdentifier =
+            file?.archiveIdentifier ||
+            parseArchiveTarget(directArchiveUrl)?.identifier ||
+            "";
+        const archiveArtworkUrl =
+            file?.archiveArtworkUrl ||
+            file?.artworkUrl ||
+            (archiveIdentifier
+                ? buildArchiveImageServiceUrl(archiveIdentifier)
+                : "");
+
         return {
             id: makeArchivePlaylistId(),
             kind: "url",
@@ -2577,92 +2840,157 @@ export default function ArchiveAudioBrowser() {
             addedAt: new Date().toISOString(),
             source: "archive.org",
             archiveFileName: file?.name || "",
-            archiveServeUrl: file?.serveUrl || "",
+            archiveServeUrl: file?.serveUrl || selectedUrl,
             archiveDownloadUrl: file?.downloadUrl || "",
+            directArchiveUrl,
+            proxiedArchiveUrl,
+            archiveIdentifier,
+            archiveArtworkUrl,
+            artworkUrl: archiveArtworkUrl,
+        };
+    }
+
+    function saveArchiveFilesToActiveAudioPlaylist(
+        files = [],
+        { selectFirst = false } = {}
+    ) {
+        const playableFiles = dedupeArchiveFiles(files).filter(
+            (file) => file?.serveUrl || file?.url || file?.downloadUrl
+        );
+
+        if (!playableFiles.length) {
+            return {
+                ok: false,
+                reason: "No playable Archive audio links were found.",
+                addedCount: 0,
+                existingCount: 0,
+            };
+        }
+
+        const state = readAudioPlaylistLibraryState();
+        const activeCollection = state.activePlaylist;
+
+        if (!activeCollection) {
+            return {
+                ok: false,
+                reason: "Could not find or create the active Audio playlist.",
+                addedCount: 0,
+                existingCount: 0,
+            };
+        }
+
+        const nextItems = [...activeCollection.items];
+        let addedCount = 0;
+        let existingCount = 0;
+        let selectedTrackIndex = -1;
+        let selectedPlaylistItem = null;
+
+        playableFiles.forEach((file, fileIndex) => {
+            const candidate = createPlaylistItemFromArchiveFile(file);
+            if (!candidate) return;
+
+            let itemIndex = findAudioPlaylistItemIndex(nextItems, candidate);
+
+            if (itemIndex < 0) {
+                nextItems.push(candidate);
+                itemIndex = nextItems.length - 1;
+                addedCount += 1;
+            } else {
+                existingCount += 1;
+            }
+
+            if (selectFirst && fileIndex === 0) {
+                selectedTrackIndex = itemIndex;
+                selectedPlaylistItem = nextItems[itemIndex];
+            }
+        });
+
+        const nextLibrary = state.library.map((collection) =>
+            collection.id === activeCollection.id
+                ? {
+                    ...collection,
+                    items: nextItems,
+                    lastActiveIndex:
+                        selectFirst && selectedTrackIndex >= 0
+                            ? selectedTrackIndex
+                            : collection.lastActiveIndex,
+                    updatedAt: new Date().toISOString(),
+                }
+                : collection
+        );
+        const saved = writeAudioPlaylistLibraryState({
+            library: nextLibrary,
+            activePlaylistId: activeCollection.id,
+            activeTrackIndex:
+                selectFirst && selectedTrackIndex >= 0
+                    ? selectedTrackIndex
+                    : activeCollection.lastActiveIndex,
+        });
+
+        return {
+            ok: saved,
+            reason: saved
+                ? ""
+                : "Could not save to the Audio playlist. Browser storage may be blocked.",
+            addedCount,
+            existingCount,
+            playableCount: playableFiles.length,
+            activePlaylistId: activeCollection.id,
+            activePlaylistName: activeCollection.name || DEFAULT_AUDIO_PLAYLIST_NAME,
+            selectedTrackIndex,
+            selectedPlaylistItem,
         };
     }
 
     function addArchiveFileToAudioPlaylist(file) {
-        const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
-
-        if (!selectedUrl) {
-            setError("No playable Archive audio link was found for this file.");
-            return;
-        }
-
         try {
-            const playlist = readAudioPlaylistFromStorage();
-            const alreadyExists = playlist.some(
-                (item) => item?.kind === "url" && item?.url === selectedUrl
-            );
+            const result = saveArchiveFilesToActiveAudioPlaylist([file]);
 
-            if (alreadyExists) {
-                setStatus("That Archive song is already in your Audio playlist.");
-                setError("");
-                return;
-            }
-
-            const nextItem = createPlaylistItemFromArchiveFile(file);
-
-            if (!nextItem) {
-                setError("No playable Archive audio link was found for this file.");
-                return;
-            }
-
-            const saved = writeAudioPlaylistToStorage([...playlist, nextItem]);
-
-            if (!saved) {
-                setError("Could not save to playlist. Browser storage may be blocked.");
+            if (!result.ok) {
+                setError(result.reason || "Could not add this Archive song to your Audio playlist.");
                 return;
             }
 
             setError("");
-            setStatus("Added Archive song to your Audio playlist without leaving this page.");
+
+            if (result.addedCount > 0) {
+                setStatus(
+                    `Added Archive song to "${result.activePlaylistName}" without leaving this page.`
+                );
+            } else {
+                setStatus(
+                    `That Archive song is already in "${result.activePlaylistName}".`
+                );
+            }
         } catch {
             setError("Could not add this Archive song to your Audio playlist.");
         }
     }
 
     function addArchiveFilesToAudioPlaylist(files = [], label = "Archive files") {
-        const playableFiles = dedupeArchiveFiles(files).filter(
-            (file) => file?.serveUrl || file?.url || file?.downloadUrl
-        );
-
-        if (!playableFiles.length) {
-            setError("No playable Archive audio links were found.");
-            return;
-        }
-
         try {
-            const playlist = readAudioPlaylistFromStorage();
-            const existingUrls = new Set(
-                playlist
-                    .filter((item) => item?.kind === "url" && item?.url)
-                    .map((item) => item.url)
-            );
-            const newItems = playableFiles
-                .filter((file) => {
-                    const selectedUrl = file?.serveUrl || file?.url || file?.downloadUrl;
-                    return selectedUrl && !existingUrls.has(selectedUrl);
-                })
-                .map(createPlaylistItemFromArchiveFile)
-                .filter(Boolean);
+            const result = saveArchiveFilesToActiveAudioPlaylist(files);
 
-            if (!newItems.length) {
-                setStatus(`All ${playableFiles.length} ${label} are already in your Audio playlist.`);
-                setError("");
-                return;
-            }
-
-            const saved = writeAudioPlaylistToStorage([...playlist, ...newItems]);
-
-            if (!saved) {
-                setError("Could not save to playlist. Browser storage may be blocked.");
+            if (!result.ok) {
+                setError(result.reason || `Could not add ${label} to your Audio playlist.`);
                 return;
             }
 
             setError("");
-            setStatus(`Added ${newItems.length} ${label} to your Audio playlist.`);
+
+            if (result.addedCount > 0) {
+                setStatus(
+                    `Added ${result.addedCount} ${label} to "${result.activePlaylistName}"${
+                        result.existingCount
+                            ? `; skipped ${result.existingCount} duplicate file(s).`
+                            : "."
+                    }`
+                );
+            } else {
+                setStatus(
+                    `All ${result.playableCount} ${label} are already in "${result.activePlaylistName}".`
+                );
+            }
         } catch {
             setError(`Could not add ${label} to your Audio playlist.`);
         }
@@ -2702,26 +3030,73 @@ export default function ArchiveAudioBrowser() {
             return;
         }
 
-        const title = file?.name || "Archive audio";
-
         try {
-            window.localStorage.setItem(
-                "audiomasterlab.audio.lastMedia.v4",
-                JSON.stringify({
-                    kind: "url",
-                    title,
-                    url: selectedUrl,
-                    savedAt: new Date().toISOString(),
-                })
+            const result = saveArchiveFilesToActiveAudioPlaylist([file], {
+                selectFirst: true,
+            });
+
+            if (!result.ok) {
+                setError(
+                    result.reason ||
+                    "Could not prepare this Archive song for the Audio player."
+                );
+                return;
+            }
+
+            const playlistItem =
+                result.selectedPlaylistItem ||
+                createPlaylistItemFromArchiveFile(file);
+            const title =
+                playlistItem?.title ||
+                file?.name ||
+                "Archive audio";
+
+            try {
+                window.localStorage.setItem(
+                    AUDIO_LAST_MEDIA_STORAGE_KEY,
+                    JSON.stringify({
+                        kind: "url",
+                        title,
+                        url: selectedUrl,
+                        archiveFileName: playlistItem?.archiveFileName || file?.name || "",
+                        archiveServeUrl: playlistItem?.archiveServeUrl || file?.serveUrl || selectedUrl,
+                        archiveDownloadUrl: playlistItem?.archiveDownloadUrl || file?.downloadUrl || "",
+                        directArchiveUrl: playlistItem?.directArchiveUrl || file?.directServeUrl || selectedUrl,
+                        proxiedArchiveUrl: playlistItem?.proxiedArchiveUrl || "",
+                        archiveIdentifier: playlistItem?.archiveIdentifier || file?.archiveIdentifier || "",
+                        archiveArtworkUrl: playlistItem?.archiveArtworkUrl || file?.archiveArtworkUrl || "",
+                        artworkUrl: playlistItem?.artworkUrl || file?.artworkUrl || "",
+                        savedAt: new Date().toISOString(),
+                    })
+                );
+                window.localStorage.setItem(
+                    AUDIO_DIRECT_LINK_STORAGE_KEY,
+                    selectedUrl
+                );
+                window.localStorage.setItem(
+                    AUDIO_ACTIVE_PLAYLIST_ID_STORAGE_KEY,
+                    result.activePlaylistId
+                );
+                window.localStorage.setItem(
+                    AUDIO_ACTIVE_PLAYLIST_INDEX_STORAGE_KEY,
+                    String(result.selectedTrackIndex)
+                );
+            } catch {
+                // The route URL remains a direct fallback when storage is blocked.
+            }
+
+            setError("");
+            setStatus(
+                `Opening "${title}" in the Audio player and keeping it selected in "${result.activePlaylistName}".`
             );
 
-            window.localStorage.setItem("audiomasterlab.audio.directLink.v4", selectedUrl);
+            const playerUrl = `${AUDIO_PLAYER_ROUTE}?url=${encodeURIComponent(
+                selectedUrl
+            )}`;
+            window.location.assign(playerUrl);
         } catch {
-            // Query-param fallback can still work in callers that support it.
+            setError("Could not open this Archive song in the Audio player.");
         }
-
-        setError("");
-        setStatus("Saved this Archive audio link for the Audio page without leaving or refreshing this page.");
     }
 
     async function runSearch(loadMore = false, options = {}) {
@@ -3061,7 +3436,7 @@ export default function ArchiveAudioBrowser() {
                 <title>Archive Audio Browser | AudioMaster Lab</title>
                 <meta
                     name="description"
-                    content="Search safe public Archive.org audio collections, load direct media links, build playlists, and play browser-supported audio files."
+                    content="Search safe public Archive.org audio collections, add files to the active AudioMaster Lab playlist, and open tracks in the new Audio player."
                 />
                 <link rel="canonical" href="https://audiomasterlab.com/archive" />
                 <meta property="og:title" content="Archive Audio Browser | AudioMaster Lab" />
