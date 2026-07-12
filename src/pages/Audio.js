@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
     Box,
     Button,
+    Checkbox,
     Chip,
     Divider,
     FormControl,
@@ -30,6 +31,14 @@ import EqualizerRoundedIcon from "@mui/icons-material/EqualizerRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import AudioFileRoundedIcon from "@mui/icons-material/AudioFileRounded";
 import DragIndicatorRoundedIcon from "@mui/icons-material/DragIndicatorRounded";
+import AddRoundedIcon from "@mui/icons-material/AddRounded";
+import EditRoundedIcon from "@mui/icons-material/EditRounded";
+import SaveRoundedIcon from "@mui/icons-material/SaveRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import DriveFileMoveRoundedIcon from "@mui/icons-material/DriveFileMoveRounded";
+import LibraryMusicRoundedIcon from "@mui/icons-material/LibraryMusicRounded";
+import Replay10RoundedIcon from "@mui/icons-material/Replay10Rounded";
+import Forward10RoundedIcon from "@mui/icons-material/Forward10Rounded";
 import { Helmet } from "react-helmet-async";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -507,6 +516,8 @@ const STORAGE_KEYS = {
     activePresetKey: "audiomasterlab.audio.activePresetKey.v4",
     repeatEnabled: "audiomasterlab.audio.repeatEnabled.v4",
     playlist: "audiomasterlab.audio.playlist.v4",
+    playlistLibrary: "audiomasterlab.audio.playlistLibrary.v1",
+    activePlaylistId: "audiomasterlab.audio.activePlaylistId.v1",
     activePlaylistIndex: "audiomasterlab.audio.activePlaylistIndex.v4",
     directLink: "audiomasterlab.audio.directLink.v4",
     playlistLinkDraft: "audiomasterlab.audio.playlistLinkDraft.v4",
@@ -531,6 +542,10 @@ const PLAYLIST_FILE_DB_NAME = "audiomasterlab-playlist-files-v1";
 const PLAYLIST_FILE_DB_VERSION = 1;
 const PLAYLIST_FILE_STORE_NAME = "uploadedPlaylistFiles";
 const PLAYLIST_FILE_INDEXEDDB_SAVE_LIMIT = 250 * 1024 * 1024;
+const DEFAULT_PLAYLIST_COLLECTION_NAME = "My Playlist";
+const MAX_PLAYLIST_COLLECTIONS = 100;
+const MAX_PLAYLIST_NAME_LENGTH = 80;
+const MAX_PLAYLIST_DESCRIPTION_LENGTH = 280;
 
 const PLAYLIST_RECOVERY_SETTINGS = {
     fetchTimeoutMs: 24000,
@@ -2018,6 +2033,266 @@ function persistPlaylistToBrowser(playlist) {
     return saved;
 }
 
+
+function makePlaylistCollectionId() {
+    if (
+        typeof crypto !== "undefined" &&
+        typeof crypto.randomUUID === "function"
+    ) {
+        return `playlist-${crypto.randomUUID()}`;
+    }
+
+    return `playlist-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function normalizePlaylistCollectionName(value, fallback = DEFAULT_PLAYLIST_COLLECTION_NAME) {
+    const cleanValue = String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, MAX_PLAYLIST_NAME_LENGTH);
+
+    return cleanValue || fallback;
+}
+
+function normalizePlaylistCollectionDescription(value) {
+    return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, MAX_PLAYLIST_DESCRIPTION_LENGTH);
+}
+
+function createPlaylistCollection({
+                                      id = "",
+                                      name = DEFAULT_PLAYLIST_COLLECTION_NAME,
+                                      description = "",
+                                      items = [],
+                                      lastActiveIndex = -1,
+                                      createdAt = "",
+                                      updatedAt = "",
+                                  } = {}) {
+    const now = new Date().toISOString();
+    const safeItems = Array.isArray(items) ? items.filter(Boolean) : [];
+    const safeLastActiveIndex = Number.isFinite(Number(lastActiveIndex))
+        ? clamp(Number(lastActiveIndex), -1, Math.max(-1, safeItems.length - 1))
+        : -1;
+
+    return {
+        id: String(id || makePlaylistCollectionId()),
+        name: normalizePlaylistCollectionName(name),
+        description: normalizePlaylistCollectionDescription(description),
+        items: safeItems,
+        lastActiveIndex: safeLastActiveIndex,
+        createdAt: createdAt || now,
+        updatedAt: updatedAt || now,
+    };
+}
+
+function sanitizePersistedPlaylistCollection(
+    collection,
+    index = 0,
+    preserveRuntimeItems = true
+) {
+    if (!collection || typeof collection !== "object") {
+        return null;
+    }
+
+    const items = Array.isArray(collection.items)
+        ? collection.items
+            .map((item) =>
+                preserveRuntimeItems &&
+                item?.id &&
+                (item.kind === "file" || item.kind === "url")
+                    ? { ...item }
+                    : sanitizePersistedPlaylistItem(item)
+            )
+            .filter(Boolean)
+        : [];
+
+    return createPlaylistCollection({
+        ...collection,
+        id: collection.id || `playlist-migrated-${index + 1}-${Date.now()}`,
+        name: normalizePlaylistCollectionName(
+            collection.name,
+            index === 0
+                ? DEFAULT_PLAYLIST_COLLECTION_NAME
+                : `Playlist ${index + 1}`
+        ),
+        items,
+    });
+}
+
+function ensurePlaylistLibrary(value) {
+    const seenIds = new Set();
+    const library = (Array.isArray(value) ? value : [])
+        .map((collection, index) =>
+            sanitizePersistedPlaylistCollection(collection, index, true)
+        )
+        .filter(Boolean)
+        .map((collection) => {
+            let id = String(collection.id || makePlaylistCollectionId());
+
+            while (seenIds.has(id)) {
+                id = makePlaylistCollectionId();
+            }
+
+            seenIds.add(id);
+            return {
+                ...collection,
+                id,
+            };
+        })
+        .slice(0, MAX_PLAYLIST_COLLECTIONS);
+
+    if (library.length) {
+        return library;
+    }
+
+    return [
+        createPlaylistCollection({
+            name: DEFAULT_PLAYLIST_COLLECTION_NAME,
+            items: [],
+        }),
+    ];
+}
+
+function readPersistedPlaylistLibrary() {
+    const storedLibrary = readStorageJson(STORAGE_KEYS.playlistLibrary, null);
+
+    if (Array.isArray(storedLibrary) && storedLibrary.length) {
+        return ensurePlaylistLibrary(
+            storedLibrary
+                .map((collection, index) =>
+                    sanitizePersistedPlaylistCollection(
+                        collection,
+                        index,
+                        false
+                    )
+                )
+                .filter(Boolean)
+        );
+    }
+
+    const legacyPlaylist = readPersistedPlaylist();
+
+    return ensurePlaylistLibrary([
+        createPlaylistCollection({
+            id: readStorageValue(STORAGE_KEYS.activePlaylistId, "") || "playlist-default",
+            name: DEFAULT_PLAYLIST_COLLECTION_NAME,
+            description: legacyPlaylist.length
+                ? "Migrated from the original saved AudioMaster Lab playlist."
+                : "",
+            items: legacyPlaylist,
+            lastActiveIndex: Number(
+                readStorageValue(STORAGE_KEYS.activePlaylistIndex, "-1")
+            ),
+        }),
+    ]);
+}
+
+function getPlaylistCollectionById(library, playlistId) {
+    const safeLibrary = Array.isArray(library) ? library : [];
+
+    return (
+        safeLibrary.find((collection) => collection.id === playlistId) ||
+        safeLibrary[0] ||
+        null
+    );
+}
+
+function resolvePersistedActivePlaylistId(library) {
+    const safeLibrary = ensurePlaylistLibrary(library);
+    const storedId = readStorageValue(STORAGE_KEYS.activePlaylistId, "");
+
+    return safeLibrary.some((collection) => collection.id === storedId)
+        ? storedId
+        : safeLibrary[0].id;
+}
+
+function serializePlaylistLibraryForStorage(library) {
+    return ensurePlaylistLibrary(library).map((collection) => ({
+        id: collection.id,
+        name: normalizePlaylistCollectionName(collection.name),
+        description: normalizePlaylistCollectionDescription(collection.description),
+        items: serializePlaylistForStorage(collection.items),
+        lastActiveIndex: Number.isFinite(Number(collection.lastActiveIndex))
+            ? Number(collection.lastActiveIndex)
+            : -1,
+        createdAt: collection.createdAt || new Date().toISOString(),
+        updatedAt: collection.updatedAt || new Date().toISOString(),
+    }));
+}
+
+function persistPlaylistLibraryToBrowser(library, activePlaylistId) {
+    const serializable = serializePlaylistLibraryForStorage(library);
+    const activeCollection =
+        serializable.find((collection) => collection.id === activePlaylistId) ||
+        serializable[0];
+
+    const saved = writeStorageJson(STORAGE_KEYS.playlistLibrary, serializable);
+
+    writeStorageValue(STORAGE_KEYS.activePlaylistId, activeCollection?.id || "");
+
+    // Continue writing the active queue to the old key so existing Redux/Dexie
+    // snapshots and older deployed builds can still recover the active playlist.
+    persistPlaylistToBrowser(activeCollection?.items || []);
+
+    setCookieJson(COOKIE_NAMES.playlistSummary, {
+        collectionCount: serializable.length,
+        activePlaylistId: activeCollection?.id || "",
+        activePlaylistName: activeCollection?.name || DEFAULT_PLAYLIST_COLLECTION_NAME,
+        count: activeCollection?.items?.length || 0,
+        totalTrackCount: serializable.reduce(
+            (total, collection) => total + (collection.items?.length || 0),
+            0
+        ),
+        updatedAt: new Date().toISOString(),
+    });
+
+    return saved;
+}
+
+async function hydratePlaylistLibraryFilesFromBrowserStorage(library) {
+    const safeLibrary = ensurePlaylistLibrary(library);
+    let restoredCount = 0;
+    let missingCount = 0;
+
+    const hydratedLibrary = await Promise.all(
+        safeLibrary.map(async (collection) => {
+            const result = await hydratePlaylistFilesFromBrowserStorage(collection.items);
+            restoredCount += result.restoredCount;
+            missingCount += result.missingCount;
+
+            return {
+                ...collection,
+                items: result.playlist,
+            };
+        })
+    );
+
+    return {
+        library: hydratedLibrary,
+        restoredCount,
+        missingCount,
+    };
+}
+
+function getPlaylistFileKeyUsageCount(library, storageKey, excludedItemId = "") {
+    if (!storageKey) {
+        return 0;
+    }
+
+    return ensurePlaylistLibrary(library).reduce(
+        (count, collection) =>
+            count +
+            collection.items.filter(
+                (item) =>
+                    item?.indexedDbFileKey === storageKey &&
+                    (!excludedItemId || item.id !== excludedItemId)
+            ).length,
+        0
+    );
+}
+
 function clearPersistedBrowserSession() {
     Object.values(STORAGE_KEYS).forEach(removeStorageValue);
     Object.values(COOKIE_NAMES).forEach(deleteCookie);
@@ -2026,33 +2301,38 @@ function clearPersistedBrowserSession() {
 
 function buildPersistenceInfo() {
     const playlist = readStorageJson(STORAGE_KEYS.playlist, []);
+    const storedLibrary = readStorageJson(STORAGE_KEYS.playlistLibrary, []);
+    const library = Array.isArray(storedLibrary) ? storedLibrary : [];
+    const allPlaylistItems = library.length
+        ? library.flatMap((collection) =>
+            Array.isArray(collection?.items) ? collection.items : []
+        )
+        : Array.isArray(playlist)
+            ? playlist
+            : [];
     const lastMedia = readPersistedLastMedia();
     const settings = readStorageJson(STORAGE_KEYS.settings, null);
 
     return {
         localStorageEnabled: storageAvailable(),
         settingsSaved: Boolean(settings),
+        playlistCollectionCount: library.length || 1,
+        totalPlaylistTrackCount: allPlaylistItems.length,
         playlistCount: Array.isArray(playlist) ? playlist.length : 0,
-        savedPlaylistFiles: Array.isArray(playlist)
-            ? playlist.filter(
-                (item) =>
-                    item.kind === "file" &&
-                    Boolean(item.indexedDbFileKey || item.dataUrl)
-            ).length
-            : 0,
-        savedIndexedDbPlaylistFiles: Array.isArray(playlist)
-            ? playlist.filter(
-                (item) => item.kind === "file" && Boolean(item.indexedDbFileKey)
-            ).length
-            : 0,
-        placeholderPlaylistFiles: Array.isArray(playlist)
-            ? playlist.filter(
-                (item) =>
-                    item.kind === "file" &&
-                    !item.indexedDbFileKey &&
-                    !item.dataUrl
-            ).length
-            : 0,
+        savedPlaylistFiles: allPlaylistItems.filter(
+            (item) =>
+                item.kind === "file" &&
+                Boolean(item.indexedDbFileKey || item.dataUrl)
+        ).length,
+        savedIndexedDbPlaylistFiles: allPlaylistItems.filter(
+            (item) => item.kind === "file" && Boolean(item.indexedDbFileKey)
+        ).length,
+        placeholderPlaylistFiles: allPlaylistItems.filter(
+            (item) =>
+                item.kind === "file" &&
+                !item.indexedDbFileKey &&
+                !item.dataUrl
+        ).length,
         hasSavedCurrentAudio: Boolean(lastMedia?.dataUrl || lastMedia?.url),
         carPlaySafeMode: readPersistedCarPlaySafeMode(),
         smartCarResumeEnabled: readPersistedSmartCarResumeEnabled(),
@@ -2062,6 +2342,7 @@ function buildPersistenceInfo() {
         storageBytes: getStoredItemSizeEstimate({
             settings,
             playlist,
+            library,
             lastMedia,
         }),
     };
@@ -5044,6 +5325,33 @@ export default function Audio() {
     const latestSettingsRef = useRef(DEFAULT_SETTINGS);
     const repeatEnabledRef = useRef(false);
     const playlistRef = useRef([]);
+    const playlistLibraryRef = useRef([]);
+    const activePlaylistIdRef = useRef("");
+    const activePlaylistNameRef = useRef(DEFAULT_PLAYLIST_COLLECTION_NAME);
+    const playlistLibraryRuntimeInitializedRef = useRef(false);
+    const initialPlaylistLibraryRef = useRef(null);
+
+    if (!initialPlaylistLibraryRef.current) {
+        initialPlaylistLibraryRef.current = readPersistedPlaylistLibrary();
+    }
+
+    const initialActivePlaylistId = resolvePersistedActivePlaylistId(
+        initialPlaylistLibraryRef.current
+    );
+    const initialActivePlaylistCollection = getPlaylistCollectionById(
+        initialPlaylistLibraryRef.current,
+        initialActivePlaylistId
+    );
+
+    if (!playlistLibraryRuntimeInitializedRef.current) {
+        playlistLibraryRuntimeInitializedRef.current = true;
+        playlistLibraryRef.current = initialPlaylistLibraryRef.current;
+        activePlaylistIdRef.current = initialActivePlaylistId;
+        activePlaylistNameRef.current =
+            initialActivePlaylistCollection?.name || DEFAULT_PLAYLIST_COLLECTION_NAME;
+        playlistRef.current = initialActivePlaylistCollection?.items || [];
+    }
+
     const activePlaylistIndexRef = useRef(-1);
     const playlistLoadTokenRef = useRef(0);
     const playlistAdvanceTokenRef = useRef(0);
@@ -5186,7 +5494,31 @@ export default function Audio() {
     const [position, setPosition] = useState(0);
     const [duration, setDuration] = useState(0);
     const [mediaInfo, setMediaInfo] = useState("");
-    const [playlist, setPlaylist] = useState(() => readPersistedPlaylist());
+    const [playlistLibrary, setPlaylistLibraryState] = useState(
+        () => initialPlaylistLibraryRef.current
+    );
+    const [activePlaylistId, setActivePlaylistIdState] = useState(
+        () => initialActivePlaylistId
+    );
+    const [playlist, setPlaylistState] = useState(
+        () => initialActivePlaylistCollection?.items || []
+    );
+    const [newPlaylistName, setNewPlaylistName] = useState("");
+    const [playlistNameDraft, setPlaylistNameDraft] = useState(
+        () => initialActivePlaylistCollection?.name || DEFAULT_PLAYLIST_COLLECTION_NAME
+    );
+    const [playlistDescriptionDraft, setPlaylistDescriptionDraft] = useState(
+        () => initialActivePlaylistCollection?.description || ""
+    );
+    const [transferTargetPlaylistId, setTransferTargetPlaylistId] = useState(
+        () =>
+            initialPlaylistLibraryRef.current.find(
+                (collection) => collection.id !== initialActivePlaylistId
+            )?.id || ""
+    );
+    const [selectedPlaylistItemIds, setSelectedPlaylistItemIds] = useState([]);
+    const [editingPlaylistItemId, setEditingPlaylistItemId] = useState("");
+    const [editingPlaylistItemTitle, setEditingPlaylistItemTitle] = useState("");
     const [playlistDragState, setPlaylistDragState] = useState({
         fromIndex: -1,
         overIndex: -1,
@@ -5210,6 +5542,72 @@ export default function Audio() {
     const [expandedArtwork, setExpandedArtwork] = useState(null);
     const [, setOfflinePlaylistNotice] = useState("");
 
+    function commitPlaylistLibrary(nextLibraryValue, options = {}) {
+        const nextLibrary = ensurePlaylistLibrary(nextLibraryValue);
+        const requestedActiveId = String(
+            options.activePlaylistId || activePlaylistIdRef.current || ""
+        );
+        const nextActiveCollection =
+            getPlaylistCollectionById(nextLibrary, requestedActiveId) || nextLibrary[0];
+        const shouldSyncActiveItems = options.syncActiveItems !== false;
+
+        playlistLibraryRef.current = nextLibrary;
+        activePlaylistIdRef.current = nextActiveCollection.id;
+        activePlaylistNameRef.current = nextActiveCollection.name;
+
+        setPlaylistLibraryState(nextLibrary);
+        setActivePlaylistIdState(nextActiveCollection.id);
+
+        if (shouldSyncActiveItems) {
+            const nextItems = Array.isArray(nextActiveCollection.items)
+                ? nextActiveCollection.items
+                : [];
+
+            playlistRef.current = nextItems;
+            setPlaylistState(nextItems);
+        }
+
+        return nextActiveCollection;
+    }
+
+    // Keep the rest of the existing Audio.js playback code working with a
+    // familiar setPlaylist API. Every queue edit is also written into the
+    // currently selected playlist collection in the browser-saved library.
+    function setPlaylist(updater) {
+        const currentItems = Array.isArray(playlistRef.current)
+            ? playlistRef.current
+            : [];
+        const nextItemsValue =
+            typeof updater === "function" ? updater(currentItems) : updater;
+        const nextItems = Array.isArray(nextItemsValue) ? nextItemsValue : [];
+        const activeId = activePlaylistIdRef.current;
+        const now = new Date().toISOString();
+
+        playlistRef.current = nextItems;
+        setPlaylistState(nextItems);
+
+        const nextLibrary = ensurePlaylistLibrary(
+            playlistLibraryRef.current
+        ).map((collection) =>
+            collection.id === activeId
+                ? {
+                    ...collection,
+                    items: nextItems,
+                    lastActiveIndex: clamp(
+                        Number(collection.lastActiveIndex || -1),
+                        -1,
+                        Math.max(-1, nextItems.length - 1)
+                    ),
+                    updatedAt: now,
+                }
+                : collection
+        );
+
+        playlistLibraryRef.current = nextLibrary;
+        setPlaylistLibraryState(nextLibrary);
+        return nextItems;
+    }
+
     const dispatch = useDispatch();
     const offlineCacheObjectUrlRef = useRef("");
 
@@ -5227,6 +5625,26 @@ export default function Audio() {
     const showPauseForMainControls = Boolean(isPlaying);
     const showPauseForPlaylistControls = Boolean(
         isPlaying && activePlaylistIndex >= 0
+    );
+    const activePlaylistCollection = useMemo(
+        () =>
+            getPlaylistCollectionById(playlistLibrary, activePlaylistId) ||
+            playlistLibrary[0] ||
+            null,
+        [playlistLibrary, activePlaylistId]
+    );
+    const activePlaylistName =
+        activePlaylistCollection?.name || DEFAULT_PLAYLIST_COLLECTION_NAME;
+    const transferPlaylistOptions = useMemo(
+        () =>
+            playlistLibrary.filter(
+                (collection) => collection.id !== activePlaylistId
+            ),
+        [playlistLibrary, activePlaylistId]
+    );
+    const selectedPlaylistItemIdSet = useMemo(
+        () => new Set(selectedPlaylistItemIds),
+        [selectedPlaylistItemIds]
     );
     const activePlaylistItem =
         activePlaylistIndex >= 0 ? playlist[activePlaylistIndex] : null;
@@ -5589,9 +6007,9 @@ export default function Audio() {
     }, [smartCarResumeEnabled]);
 
     useEffect(() => {
-        persistPlaylistToBrowser(playlist);
+        persistPlaylistLibraryToBrowser(playlistLibrary, activePlaylistId);
         setStorageInfo(buildPersistenceInfo());
-    }, [playlist]);
+    }, [playlistLibrary, activePlaylistId]);
 
     useEffect(() => {
         persistPlaybackSessionSnapshot("React session state changed", { force: true });
@@ -5600,6 +6018,8 @@ export default function Audio() {
         repeatEnabled,
         directLink,
         playlistLink,
+        activePlaylistId,
+        activePlaylistName,
         activePlaylistIndex,
         playlist.length,
         hasMedia,
@@ -5610,6 +6030,9 @@ export default function Audio() {
 
     useEffect(() => {
         playlistRef.current = playlist;
+        playlistLibraryRef.current = playlistLibrary;
+        activePlaylistIdRef.current = activePlaylistId;
+        activePlaylistNameRef.current = activePlaylistName;
 
         const activeCacheKeys = new Set(
             playlist.map((item) => getPlaylistPreloadCacheKey(item)).filter(Boolean)
@@ -5620,7 +6043,47 @@ export default function Audio() {
                 playlistPreloadCacheRef.current.delete(cacheKey);
             }
         }
-    }, [playlist]);
+    }, [playlist, playlistLibrary, activePlaylistId, activePlaylistName]);
+
+    useEffect(() => {
+        const activeCollection = getPlaylistCollectionById(
+            playlistLibraryRef.current,
+            activePlaylistId
+        );
+
+        setPlaylistNameDraft(
+            activeCollection?.name || DEFAULT_PLAYLIST_COLLECTION_NAME
+        );
+        setPlaylistDescriptionDraft(activeCollection?.description || "");
+        setSelectedPlaylistItemIds([]);
+        setEditingPlaylistItemId("");
+        setEditingPlaylistItemTitle("");
+
+        const availableTarget = playlistLibraryRef.current.find(
+            (collection) => collection.id !== activePlaylistId
+        );
+
+        setTransferTargetPlaylistId((currentTarget) => {
+            if (
+                currentTarget &&
+                playlistLibraryRef.current.some(
+                    (collection) =>
+                        collection.id === currentTarget &&
+                        collection.id !== activePlaylistId
+                )
+            ) {
+                return currentTarget;
+            }
+
+            return availableTarget?.id || "";
+        });
+
+        updateMediaSessionMetadata();
+        updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+            forcePosition: true,
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activePlaylistId, activePlaylistName, playlistLibrary.length]);
 
     useEffect(() => {
         if (playlistFilesHydratedRef.current) {
@@ -5631,28 +6094,41 @@ export default function Audio() {
         let cancelled = false;
 
         async function hydrateUploadedPlaylistFiles() {
-            const currentPlaylist = playlistRef.current;
+            const currentLibrary = playlistLibraryRef.current;
+            const hasStoredFiles = ensurePlaylistLibrary(currentLibrary).some(
+                (collection) =>
+                    collection.items.some(
+                        (item) =>
+                            item?.kind === "file" &&
+                            !item.file &&
+                            (item.indexedDbFileKey || item.dataUrl)
+                    )
+            );
 
-            if (
-                !Array.isArray(currentPlaylist) ||
-                !currentPlaylist.some(
-                    (item) => item?.kind === "file" && !item.file && (item.indexedDbFileKey || item.dataUrl)
-                )
-            ) {
+            if (!hasStoredFiles) {
                 return;
             }
 
-            const result = await hydratePlaylistFilesFromBrowserStorage(currentPlaylist);
+            const result = await hydratePlaylistLibraryFilesFromBrowserStorage(
+                currentLibrary
+            );
 
             if (cancelled || !result.restoredCount) {
                 return;
             }
 
-            setPlaylist(result.playlist);
+            const activeCollection = commitPlaylistLibrary(result.library, {
+                activePlaylistId: activePlaylistIdRef.current,
+                syncActiveItems: true,
+            });
+
+            playlistRef.current = activeCollection?.items || [];
             setInfo(
                 `Restored ${result.restoredCount} uploaded playlist file${
                     result.restoredCount === 1 ? "" : "s"
-                } from browser storage after refresh.`
+                } across ${result.library.length} browser-saved playlist${
+                    result.library.length === 1 ? "" : "s"
+                } after refresh.`
             );
             refreshStorageInfo();
         }
@@ -5683,6 +6159,32 @@ export default function Audio() {
         }
 
         activePlaylistIndexRef.current = activePlaylistIndex;
+
+        const activeId = activePlaylistIdRef.current;
+        const nextLibrary = ensurePlaylistLibrary(
+            playlistLibraryRef.current
+        ).map((collection) => {
+            if (collection.id !== activeId) {
+                return collection;
+            }
+
+            const safeIndex = clamp(
+                Number(activePlaylistIndex),
+                -1,
+                Math.max(-1, playlistRef.current.length - 1)
+            );
+
+            return collection.lastActiveIndex === safeIndex
+                ? collection
+                : {
+                    ...collection,
+                    lastActiveIndex: safeIndex,
+                    updatedAt: new Date().toISOString(),
+                };
+        });
+
+        playlistLibraryRef.current = nextLibrary;
+        setPlaylistLibraryState(nextLibrary);
     }, [activePlaylistIndex, playlist.length]);
 
     useEffect(() => {
@@ -5759,6 +6261,8 @@ export default function Audio() {
     }, [
         mediaTitle,
         duration,
+        activePlaylistId,
+        activePlaylistName,
         activePlaylistIndex,
         playlist.length,
         settings.speed,
@@ -7571,12 +8075,18 @@ export default function Audio() {
     function getMediaSessionAlbum() {
         const list = playlistRef.current;
         const activeIndex = activePlaylistIndexRef.current;
+        const playlistName =
+            activePlaylistNameRef.current || DEFAULT_PLAYLIST_COLLECTION_NAME;
 
         if (Array.isArray(list) && list.length && activeIndex >= 0) {
-            return `AudioMaster Lab Playlist • ${activeIndex + 1} of ${list.length}`;
+            return `${playlistName} • ${activeIndex + 1} of ${list.length}`;
         }
 
-        return "AudioMaster Lab";
+        if (Array.isArray(list) && list.length) {
+            return `${playlistName} • ${list.length} track${list.length === 1 ? "" : "s"}`;
+        }
+
+        return playlistName || "AudioMaster Lab";
     }
 
     function getMediaSessionPlaybackRate() {
@@ -9045,6 +9555,35 @@ export default function Audio() {
         return didSeek;
     }
 
+    async function seekByFromMediaSession(direction, details = {}) {
+        const durationValue = getMediaSessionDuration();
+
+        if (!durationValue) {
+            updateMediaSessionState(playingRef.current ? "playing" : "paused", {
+                forcePosition: true,
+            });
+            return true;
+        }
+
+        const requestedOffset = Number(details.seekOffset);
+        const fallbackOffset = 10;
+        const magnitude =
+            Number.isFinite(requestedOffset) && requestedOffset > 0
+                ? requestedOffset
+                : fallbackOffset;
+        const currentPosition = getMediaSessionPosition();
+        const nextPosition = clamp(
+            currentPosition + (direction < 0 ? -magnitude : magnitude),
+            0,
+            durationValue
+        );
+
+        return seekToFromMediaSession({
+            seekTime: nextPosition,
+            fastSeek: false,
+        });
+    }
+
     function installMediaSessionHandlers() {
         if (!canUseMediaSession() || typeof navigator.mediaSession.setActionHandler !== "function") {
             return;
@@ -9058,18 +9597,10 @@ export default function Audio() {
             }
         };
 
-        const safeClearAction = (action) => {
-            try {
-                navigator.mediaSession.setActionHandler(action, null);
-            } catch {
-                // Older Safari builds may not support clearing every action.
-            }
-        };
-
-        // Keep real previous/next track buttons by clearing 10-second skip
-        // actions, but publish duration/position and install seekto so the lock
-        // screen / CarPlay scrubber can seek through the current song.
-        ["seekbackward", "seekforward"].forEach(safeClearAction);
+        // Publish every useful Media Session action. Browsers decide which
+        // controls appear on the lock screen, Bluetooth device, or CarPlay, but
+        // play/pause, stop, scrub, previous/next, and ±10-second seeking all
+        // remain connected to the same WebAudio playback clock.
         updateMediaSessionPositionState({ forcePosition: true });
 
         safeSetAction("play", () => {
@@ -9090,7 +9621,18 @@ export default function Audio() {
             );
         });
 
-        // Real track controls only. Do not install seekbackward/seekforward.
+        safeSetAction("seekbackward", (details) => {
+            return runMediaSessionAction("Lock-screen Back 10 Seconds", () =>
+                seekByFromMediaSession(-1, details)
+            );
+        });
+
+        safeSetAction("seekforward", (details) => {
+            return runMediaSessionAction("Lock-screen Forward 10 Seconds", () =>
+                seekByFromMediaSession(1, details)
+            );
+        });
+
         safeSetAction("nexttrack", () => {
             return runMediaSessionAction("Lock-screen Next Track", nextTrackFromMediaSession);
         });
@@ -12021,6 +12563,535 @@ export default function Audio() {
         setError("Load a file or direct media link first, then add the loaded source to the playlist.");
     }
 
+
+    function getUniquePlaylistName(baseName, library = playlistLibraryRef.current) {
+        const cleanBase = normalizePlaylistCollectionName(
+            baseName,
+            DEFAULT_PLAYLIST_COLLECTION_NAME
+        );
+        const existingNames = new Set(
+            ensurePlaylistLibrary(library).map((collection) =>
+                collection.name.toLowerCase()
+            )
+        );
+
+        if (!existingNames.has(cleanBase.toLowerCase())) {
+            return cleanBase;
+        }
+
+        let suffix = 2;
+        let candidate = `${cleanBase} ${suffix}`;
+
+        while (existingNames.has(candidate.toLowerCase())) {
+            suffix += 1;
+            candidate = `${cleanBase} ${suffix}`;
+        }
+
+        return candidate.slice(0, MAX_PLAYLIST_NAME_LENGTH);
+    }
+
+    async function switchActivePlaylistCollection(nextPlaylistId) {
+        const targetCollection = getPlaylistCollectionById(
+            playlistLibraryRef.current,
+            nextPlaylistId
+        );
+
+        if (!targetCollection || targetCollection.id === activePlaylistIdRef.current) {
+            return;
+        }
+
+        if (playingRef.current) {
+            await pausePlayback({ reason: "Switching browser-saved playlists" });
+        }
+
+        playlistAdvanceTokenRef.current += 1;
+        playlistLoadTokenRef.current += 1;
+        playlistPreloadTokenRef.current += 1;
+        playlistPreloadCacheRef.current.clear();
+        clearPendingPlaylistStartSeek();
+
+        commitPlaylistLibrary(playlistLibraryRef.current, {
+            activePlaylistId: targetCollection.id,
+            syncActiveItems: true,
+        });
+
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
+        setSelectedPlaylistItemIds([]);
+        setPlaylistPreloadSummary("");
+        setInfo(
+            `Opened playlist "${targetCollection.name}" with ${
+                targetCollection.items.length
+            } track${targetCollection.items.length === 1 ? "" : "s"}. Its songs and edits are saved in this browser.`
+        );
+    }
+
+    async function createNewPlaylistCollection() {
+        const library = ensurePlaylistLibrary(playlistLibraryRef.current);
+
+        if (library.length >= MAX_PLAYLIST_COLLECTIONS) {
+            setError(
+                `This browser library already has ${MAX_PLAYLIST_COLLECTIONS} playlists. Delete one before creating another.`
+            );
+            return;
+        }
+
+        const requestedName = String(newPlaylistName || "").trim();
+        const name = getUniquePlaylistName(
+            requestedName || `Playlist ${library.length + 1}`,
+            library
+        );
+        const nextCollection = createPlaylistCollection({ name });
+        const nextLibrary = [...library, nextCollection];
+
+        if (playingRef.current) {
+            await pausePlayback({ reason: "Creating and opening a new playlist" });
+        }
+
+        commitPlaylistLibrary(nextLibrary, {
+            activePlaylistId: nextCollection.id,
+            syncActiveItems: true,
+        });
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
+        setNewPlaylistName("");
+        setPlaylistNameDraft(nextCollection.name);
+        setPlaylistDescriptionDraft("");
+        setSelectedPlaylistItemIds([]);
+        setInfo(
+            `Created and opened "${nextCollection.name}". Add files, links, the loaded song, or transfer tracks from another playlist.`
+        );
+    }
+
+    function saveActivePlaylistDetails() {
+        const activeId = activePlaylistIdRef.current;
+        const currentLibrary = ensurePlaylistLibrary(playlistLibraryRef.current);
+        const activeCollection = getPlaylistCollectionById(currentLibrary, activeId);
+
+        if (!activeCollection) {
+            setError("The active playlist could not be found.");
+            return;
+        }
+
+        const nextName = normalizePlaylistCollectionName(
+            playlistNameDraft,
+            activeCollection.name
+        );
+        const duplicateName = currentLibrary.some(
+            (collection) =>
+                collection.id !== activeId &&
+                collection.name.toLowerCase() === nextName.toLowerCase()
+        );
+
+        if (duplicateName) {
+            setError("Another playlist already uses that name. Choose a different name.");
+            return;
+        }
+
+        const nextDescription = normalizePlaylistCollectionDescription(
+            playlistDescriptionDraft
+        );
+        const nextLibrary = currentLibrary.map((collection) =>
+            collection.id === activeId
+                ? {
+                    ...collection,
+                    name: nextName,
+                    description: nextDescription,
+                    updatedAt: new Date().toISOString(),
+                }
+                : collection
+        );
+
+        commitPlaylistLibrary(nextLibrary, {
+            activePlaylistId: activeId,
+            syncActiveItems: false,
+        });
+        setPlaylistNameDraft(nextName);
+        setPlaylistDescriptionDraft(nextDescription);
+        setInfo(`Saved playlist details for "${nextName}".`);
+    }
+
+    async function clonePlaylistItemForLibrary(item) {
+        const now = new Date().toISOString();
+        const clonedId = makePlaylistId();
+        const resetRuntimeState = {
+            loadState: "idle",
+            lastError: "",
+            lastLoadedAt: "",
+            preloadedAt: "",
+            preloadedViaProxy: false,
+        };
+
+        if (item?.kind === "url") {
+            return {
+                ...item,
+                ...resetRuntimeState,
+                id: clonedId,
+                addedAt: now,
+            };
+        }
+
+        if (item?.kind === "file") {
+            const restoredFile =
+                item.file ||
+                (item.indexedDbFileKey
+                    ? await getPlaylistFileBlob(item.indexedDbFileKey)
+                    : null);
+
+            if (restoredFile) {
+                return attachPersistedFileData(
+                    {
+                        ...item,
+                        ...resetRuntimeState,
+                        id: clonedId,
+                        file: restoredFile,
+                        dataUrl: "",
+                        indexedDbFileKey: "",
+                        persistedIndexedDb: false,
+                        persistedDataUrl: false,
+                        needsReselect: false,
+                        addedAt: now,
+                    },
+                    restoredFile,
+                    MAX_PERSISTED_PLAYLIST_FILE_BYTES
+                );
+            }
+
+            // If the browser cannot reopen the blob, preserve the shared storage
+            // key or placeholder metadata. Removal logic checks references before
+            // deleting a shared IndexedDB file.
+            return {
+                ...item,
+                ...resetRuntimeState,
+                id: clonedId,
+                file: null,
+                addedAt: now,
+                needsReselect: !item.indexedDbFileKey && !item.dataUrl,
+            };
+        }
+
+        return null;
+    }
+
+    async function duplicateActivePlaylistCollection() {
+        const library = ensurePlaylistLibrary(playlistLibraryRef.current);
+        const activeCollection = getPlaylistCollectionById(
+            library,
+            activePlaylistIdRef.current
+        );
+
+        if (!activeCollection) {
+            setError("The active playlist could not be duplicated.");
+            return;
+        }
+
+        if (library.length >= MAX_PLAYLIST_COLLECTIONS) {
+            setError(
+                `This browser library already has ${MAX_PLAYLIST_COLLECTIONS} playlists.`
+            );
+            return;
+        }
+
+        if (playingRef.current) {
+            await pausePlayback({ reason: "Duplicating the active playlist" });
+        }
+
+        setIsLoading(true);
+
+        try {
+            const copiedItems = (
+                await Promise.all(
+                    activeCollection.items.map(clonePlaylistItemForLibrary)
+                )
+            ).filter(Boolean);
+            const duplicatedCollection = createPlaylistCollection({
+                name: getUniquePlaylistName(
+                    `${activeCollection.name} Copy`,
+                    library
+                ),
+                description: activeCollection.description,
+                items: copiedItems,
+            });
+
+            commitPlaylistLibrary([...library, duplicatedCollection], {
+                activePlaylistId: duplicatedCollection.id,
+                syncActiveItems: true,
+            });
+            setActivePlaylistIndex(-1);
+            activePlaylistIndexRef.current = -1;
+            setPlaylistNameDraft(duplicatedCollection.name);
+            setPlaylistDescriptionDraft(duplicatedCollection.description);
+            setSelectedPlaylistItemIds([]);
+            setInfo(
+                `Duplicated "${activeCollection.name}" as "${duplicatedCollection.name}" with ${copiedItems.length} track${copiedItems.length === 1 ? "" : "s"}.`
+            );
+        } catch (error) {
+            setError(error?.message || "The playlist could not be duplicated.");
+        } finally {
+            setIsLoading(false);
+            refreshStorageInfo();
+        }
+    }
+
+    async function deleteActivePlaylistCollection() {
+        const library = ensurePlaylistLibrary(playlistLibraryRef.current);
+        const activeId = activePlaylistIdRef.current;
+        const activeCollection = getPlaylistCollectionById(library, activeId);
+
+        if (!activeCollection) {
+            return;
+        }
+
+        if (playingRef.current) {
+            await pausePlayback({ reason: "Deleting the active playlist" });
+        }
+
+        if (library.length === 1) {
+            const resetCollection = createPlaylistCollection({
+                id: activeCollection.id,
+                name: DEFAULT_PLAYLIST_COLLECTION_NAME,
+                items: [],
+                createdAt: activeCollection.createdAt,
+            });
+
+            activeCollection.items.forEach((item) => {
+                if (item?.indexedDbFileKey) {
+                    deletePlaylistFileBlob(item.indexedDbFileKey);
+                }
+            });
+
+            commitPlaylistLibrary([resetCollection], {
+                activePlaylistId: resetCollection.id,
+                syncActiveItems: true,
+            });
+            setActivePlaylistIndex(-1);
+            activePlaylistIndexRef.current = -1;
+            setInfo("The last playlist was reset to an empty My Playlist collection.");
+            return;
+        }
+
+        const remainingLibrary = library.filter(
+            (collection) => collection.id !== activeId
+        );
+
+        activeCollection.items.forEach((item) => {
+            if (
+                item?.indexedDbFileKey &&
+                getPlaylistFileKeyUsageCount(
+                    remainingLibrary,
+                    item.indexedDbFileKey
+                ) === 0
+            ) {
+                deletePlaylistFileBlob(item.indexedDbFileKey);
+            }
+        });
+
+        const nextActiveCollection = remainingLibrary[0];
+        commitPlaylistLibrary(remainingLibrary, {
+            activePlaylistId: nextActiveCollection.id,
+            syncActiveItems: true,
+        });
+        setActivePlaylistIndex(-1);
+        activePlaylistIndexRef.current = -1;
+        setSelectedPlaylistItemIds([]);
+        setInfo(
+            `Deleted "${activeCollection.name}" and opened "${nextActiveCollection.name}".`
+        );
+    }
+
+    function togglePlaylistItemSelection(itemId) {
+        setSelectedPlaylistItemIds((current) =>
+            current.includes(itemId)
+                ? current.filter((id) => id !== itemId)
+                : [...current, itemId]
+        );
+    }
+
+    function selectAllPlaylistItems() {
+        setSelectedPlaylistItemIds(playlistRef.current.map((item) => item.id));
+    }
+
+    function clearPlaylistItemSelection() {
+        setSelectedPlaylistItemIds([]);
+    }
+
+    function beginEditingPlaylistItem(item) {
+        setEditingPlaylistItemId(item?.id || "");
+        setEditingPlaylistItemTitle(item?.title || "");
+    }
+
+    function savePlaylistItemTitle(itemId) {
+        const nextTitle = String(editingPlaylistItemTitle || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 160);
+
+        if (!nextTitle) {
+            setError("Enter a track title before saving.");
+            return;
+        }
+
+        setPlaylist((current) =>
+            current.map((item) =>
+                item.id === itemId
+                    ? {
+                        ...item,
+                        title: nextTitle,
+                    }
+                    : item
+            )
+        );
+        setEditingPlaylistItemId("");
+        setEditingPlaylistItemTitle("");
+        updateMediaSessionMetadata();
+        setInfo(`Renamed the playlist track to "${nextTitle}".`);
+    }
+
+    async function transferSelectedPlaylistItems(mode = "copy") {
+        const sourceId = activePlaylistIdRef.current;
+        const targetId = transferTargetPlaylistId;
+        const library = ensurePlaylistLibrary(playlistLibraryRef.current);
+        const sourceCollection = getPlaylistCollectionById(library, sourceId);
+        const targetCollection = getPlaylistCollectionById(library, targetId);
+        const selectedIds = new Set(selectedPlaylistItemIds);
+        const selectedItems = sourceCollection?.items.filter((item) =>
+            selectedIds.has(item.id)
+        ) || [];
+
+        if (!selectedItems.length) {
+            setError("Select at least one song before copying or moving tracks.");
+            return;
+        }
+
+        if (!targetCollection || targetCollection.id === sourceId) {
+            setError("Choose another playlist as the transfer destination.");
+            return;
+        }
+
+        setIsLoading(true);
+
+        try {
+            const transferredItems =
+                mode === "copy"
+                    ? (
+                        await Promise.all(
+                            selectedItems.map(clonePlaylistItemForLibrary)
+                        )
+                    ).filter(Boolean)
+                    : selectedItems;
+            const nextSourceItems =
+                mode === "move"
+                    ? sourceCollection.items.filter(
+                        (item) => !selectedIds.has(item.id)
+                    )
+                    : sourceCollection.items;
+            const nextLibrary = library.map((collection) => {
+                if (collection.id === sourceId) {
+                    return {
+                        ...collection,
+                        items: nextSourceItems,
+                        lastActiveIndex: -1,
+                        updatedAt: new Date().toISOString(),
+                    };
+                }
+
+                if (collection.id === targetId) {
+                    return {
+                        ...collection,
+                        items: [...collection.items, ...transferredItems],
+                        updatedAt: new Date().toISOString(),
+                    };
+                }
+
+                return collection;
+            });
+
+            commitPlaylistLibrary(nextLibrary, {
+                activePlaylistId: sourceId,
+                syncActiveItems: true,
+            });
+
+            if (mode === "move") {
+                setActivePlaylistIndex(-1);
+                activePlaylistIndexRef.current = -1;
+            }
+
+            setSelectedPlaylistItemIds([]);
+            setInfo(
+                `${mode === "move" ? "Moved" : "Copied"} ${transferredItems.length} song${
+                    transferredItems.length === 1 ? "" : "s"
+                } from "${sourceCollection.name}" to "${targetCollection.name}".`
+            );
+        } catch (error) {
+            setError(
+                error?.message ||
+                `The selected songs could not be ${mode === "move" ? "moved" : "copied"}.`
+            );
+        } finally {
+            setIsLoading(false);
+            refreshStorageInfo();
+        }
+    }
+
+    async function addLoadedSourceToTransferTarget() {
+        const targetCollection = getPlaylistCollectionById(
+            playlistLibraryRef.current,
+            transferTargetPlaylistId
+        );
+
+        if (!targetCollection || targetCollection.id === activePlaylistIdRef.current) {
+            setError("Choose another playlist before transferring the loaded source.");
+            return;
+        }
+
+        setIsLoading(true);
+
+        try {
+            let nextItem = null;
+
+            if (sourceKind === "file" && inputFile) {
+                nextItem = await attachPersistedFileData(
+                    buildPlaylistItemFromFile(inputFile),
+                    inputFile,
+                    MAX_PERSISTED_PLAYLIST_FILE_BYTES
+                );
+            } else if (sourceKind === "url" && sourceUrl) {
+                nextItem = buildPlaylistItemFromUrl(sourceUrl);
+            }
+
+            if (!nextItem) {
+                throw new Error(
+                    "Load a local file or direct media URL before adding it to another playlist."
+                );
+            }
+
+            const nextLibrary = ensurePlaylistLibrary(
+                playlistLibraryRef.current
+            ).map((collection) =>
+                collection.id === targetCollection.id
+                    ? {
+                        ...collection,
+                        items: [...collection.items, nextItem],
+                        updatedAt: new Date().toISOString(),
+                    }
+                    : collection
+            );
+
+            commitPlaylistLibrary(nextLibrary, {
+                activePlaylistId: activePlaylistIdRef.current,
+                syncActiveItems: false,
+            });
+            setInfo(
+                `Added the loaded source "${nextItem.title}" to "${targetCollection.name}" without leaving the current playlist.`
+            );
+        } catch (error) {
+            setError(error?.message || "The loaded source could not be transferred.");
+        } finally {
+            setIsLoading(false);
+            refreshStorageInfo();
+        }
+    }
+
     function buildCurrentCommunityPostPayload() {
         const activeItem = playlistRef.current?.[activePlaylistIndexRef.current] || activePlaylistItem;
         const playlistAudioUrl =
@@ -13313,7 +14384,14 @@ export default function Audio() {
             playlistPreloadCacheRef.current.delete(String(id));
         }
 
-        if (removedItem?.indexedDbFileKey) {
+        if (
+            removedItem?.indexedDbFileKey &&
+            getPlaylistFileKeyUsageCount(
+                playlistLibraryRef.current,
+                removedItem.indexedDbFileKey,
+                removedItem.id
+            ) === 0
+        ) {
             deletePlaylistFileBlob(removedItem.indexedDbFileKey);
         }
 
@@ -13342,13 +14420,37 @@ export default function Audio() {
         playlistLoadTokenRef.current += 1;
         playlistPreloadTokenRef.current += 1;
         playlistPreloadCacheRef.current.clear();
-        clearPlaylistFileBlobs();
+
+        const activeItems = [...playlistRef.current];
+        const libraryWithoutActiveItems = ensurePlaylistLibrary(
+            playlistLibraryRef.current
+        ).map((collection) =>
+            collection.id === activePlaylistIdRef.current
+                ? { ...collection, items: [] }
+                : collection
+        );
+
+        activeItems.forEach((item) => {
+            if (
+                item?.indexedDbFileKey &&
+                getPlaylistFileKeyUsageCount(
+                    libraryWithoutActiveItems,
+                    item.indexedDbFileKey
+                ) === 0
+            ) {
+                deletePlaylistFileBlob(item.indexedDbFileKey);
+            }
+        });
+
         setIsPreloadingPlaylist(false);
         setPlaylistPreloadSummary("");
         setPlaylist([]);
         setActivePlaylistIndex(-1);
         activePlaylistIndexRef.current = -1;
-        setInfo("Playlist cleared. The currently loaded buffer stays loaded until you clear media.");
+        setSelectedPlaylistItemIds([]);
+        setInfo(
+            `Cleared "${activePlaylistNameRef.current}". Other browser-saved playlists and their uploaded files were left untouched.`
+        );
     }
 
     function toggleRepeat() {
@@ -15492,12 +16594,16 @@ export default function Audio() {
                                 "Compression",
                                 "De-essing",
                                 "WAV export",
-                                "Local file playlists",
-                                "Direct media URL playlists",
+                                "Multiple browser-saved playlist collections",
+                                "Local file and direct media URL playlists",
+                                "Playlist naming, descriptions, duplication, and deletion",
+                                "Copy and move songs between playlists",
+                                "Per-track title editing and drag reordering",
                                 "Repeat current song toggle",
                                 "Automatic next-track playback",
+                                "Media Chrome playback and seek controls",
                                 "CarPlay and wired iPhone USB safe output mode",
-                                "Media Session lock-screen and car-control metadata",
+                                "Media Session lock-screen play, pause, seek, previous, and next controls",
                             ],
                         })}
                     </script>
@@ -15507,7 +16613,7 @@ export default function Audio() {
                     <SectionTitle
                         eyebrow="Audio tool"
                         title="Advanced WebAudio mixer, playlist player, visualizer, and renderer"
-                        description="Decode audio/video containers into an AudioBuffer, create playlists from uploaded files or direct media URLs, use a large playlist play button, toggle repeat on or off for the current song, auto-play the next playlist track, visualize the processed signal, scrub the full duration, add effects, render the processed result to WAV, and restore saved browser sessions with localStorage and cookies, and use the CarPlay / USB safe mode for more stable wired iPhone playback."
+                        description="Decode audio/video containers into an AudioBuffer, create and edit multiple browser-saved playlists, copy or move songs between collections, rename tracks, use Media Chrome controls with synchronized Media Session lock-screen actions, auto-play the next track, visualize the processed signal, add effects, render WAV, and use CarPlay / USB safe mode for more stable wired iPhone playback."
                     />
 
                     <StoragePersistencePanel
@@ -15817,6 +16923,220 @@ export default function Audio() {
                                         </Typography>
                                     </Box>
 
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 1.6,
+                                            background:
+                                                "linear-gradient(135deg, rgba(103,232,249,0.09), rgba(167,139,250,0.07))",
+                                            border: "1px solid rgba(103,232,249,0.18)",
+                                        }}
+                                    >
+                                        <Stack spacing={1.5}>
+                                            <Stack
+                                                direction={{ xs: "column", sm: "row" }}
+                                                alignItems={{ xs: "stretch", sm: "center" }}
+                                                justifyContent="space-between"
+                                                spacing={1}
+                                            >
+                                                <Stack direction="row" alignItems="center" spacing={1}>
+                                                    <LibraryMusicRoundedIcon sx={{ color: "#67e8f9" }} />
+                                                    <Box>
+                                                        <Typography sx={{ fontWeight: 950 }}>
+                                                            Browser playlist library
+                                                        </Typography>
+                                                        <Typography
+                                                            variant="caption"
+                                                            sx={{ color: "rgba(255,255,255,0.62)" }}
+                                                        >
+                                                            Create, rename, duplicate, delete, copy, and move songs between saved playlists.
+                                                        </Typography>
+                                                    </Box>
+                                                </Stack>
+
+                                                <Stack direction="row" flexWrap="wrap" gap={0.75}>
+                                                    <Chip
+                                                        size="small"
+                                                        label={`${playlistLibrary.length} playlist${
+                                                            playlistLibrary.length === 1 ? "" : "s"
+                                                        }`}
+                                                        sx={{
+                                                            color: "#67e8f9",
+                                                            background: "rgba(103,232,249,0.1)",
+                                                        }}
+                                                    />
+                                                    <Chip
+                                                        size="small"
+                                                        label={`${playlist.length} active track${
+                                                            playlist.length === 1 ? "" : "s"
+                                                        }`}
+                                                        sx={{
+                                                            color: "#c4b5fd",
+                                                            background: "rgba(167,139,250,0.1)",
+                                                        }}
+                                                    />
+                                                </Stack>
+                                            </Stack>
+
+                                            <FormControl fullWidth>
+                                                <InputLabel id="active-browser-playlist-label">
+                                                    Active playlist
+                                                </InputLabel>
+                                                <Select
+                                                    labelId="active-browser-playlist-label"
+                                                    value={activePlaylistId}
+                                                    label="Active playlist"
+                                                    onChange={(event) =>
+                                                        switchActivePlaylistCollection(event.target.value)
+                                                    }
+                                                    disabled={isRendering || isLoading || isPreloadingPlaylist}
+                                                    sx={{
+                                                        color: "#fff",
+                                                        borderRadius: 3,
+                                                        background: "rgba(7,10,19,0.46)",
+                                                        "& .MuiOutlinedInput-notchedOutline": {
+                                                            borderColor: "rgba(255,255,255,0.16)",
+                                                        },
+                                                    }}
+                                                >
+                                                    {playlistLibrary.map((collection) => (
+                                                        <MenuItem key={collection.id} value={collection.id}>
+                                                            {collection.name} ({collection.items.length})
+                                                        </MenuItem>
+                                                    ))}
+                                                </Select>
+                                            </FormControl>
+
+                                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                                                <TextField
+                                                    fullWidth
+                                                    value={newPlaylistName}
+                                                    onChange={(event) =>
+                                                        setNewPlaylistName(event.target.value)
+                                                    }
+                                                    onKeyDown={(event) => {
+                                                        if (event.key === "Enter") {
+                                                            event.preventDefault();
+                                                            createNewPlaylistCollection();
+                                                        }
+                                                    }}
+                                                    label="New playlist name"
+                                                    placeholder={`Playlist ${playlistLibrary.length + 1}`}
+                                                    inputProps={{ maxLength: MAX_PLAYLIST_NAME_LENGTH }}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        "& .MuiOutlinedInput-root": {
+                                                            color: "#fff",
+                                                            borderRadius: 3,
+                                                        },
+                                                    }}
+                                                />
+                                                <Button
+                                                    variant="contained"
+                                                    startIcon={<AddRoundedIcon />}
+                                                    onClick={createNewPlaylistCollection}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        minWidth: { sm: 150 },
+                                                        borderRadius: 3,
+                                                        color: "#06111e",
+                                                        fontWeight: 950,
+                                                        background:
+                                                            "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                    }}
+                                                >
+                                                    Create list
+                                                </Button>
+                                            </Stack>
+
+                                            <TextField
+                                                fullWidth
+                                                value={playlistNameDraft}
+                                                onChange={(event) =>
+                                                    setPlaylistNameDraft(event.target.value)
+                                                }
+                                                label="Edit active playlist name"
+                                                inputProps={{ maxLength: MAX_PLAYLIST_NAME_LENGTH }}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    "& .MuiOutlinedInput-root": {
+                                                        color: "#fff",
+                                                        borderRadius: 3,
+                                                    },
+                                                }}
+                                            />
+
+                                            <TextField
+                                                fullWidth
+                                                multiline
+                                                minRows={2}
+                                                value={playlistDescriptionDraft}
+                                                onChange={(event) =>
+                                                    setPlaylistDescriptionDraft(event.target.value)
+                                                }
+                                                label="Playlist description"
+                                                placeholder="Optional notes about this collection"
+                                                inputProps={{
+                                                    maxLength: MAX_PLAYLIST_DESCRIPTION_LENGTH,
+                                                }}
+                                                disabled={isRendering || isLoading}
+                                                sx={{
+                                                    "& .MuiOutlinedInput-root": {
+                                                        color: "#fff",
+                                                        borderRadius: 3,
+                                                    },
+                                                }}
+                                            />
+
+                                            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                                                <Button
+                                                    fullWidth
+                                                    variant="contained"
+                                                    startIcon={<SaveRoundedIcon />}
+                                                    onClick={saveActivePlaylistDetails}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: "#06111e",
+                                                        fontWeight: 950,
+                                                        background:
+                                                            "linear-gradient(135deg, #67e8f9, #a78bfa)",
+                                                    }}
+                                                >
+                                                    Save list edits
+                                                </Button>
+                                                <Button
+                                                    fullWidth
+                                                    variant="outlined"
+                                                    startIcon={<ContentCopyRoundedIcon />}
+                                                    onClick={duplicateActivePlaylistCollection}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        borderRadius: 999,
+                                                        color: "#fff",
+                                                        borderColor: "rgba(255,255,255,0.18)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                >
+                                                    Duplicate list
+                                                </Button>
+                                                <Button
+                                                    fullWidth
+                                                    variant="text"
+                                                    startIcon={<DeleteRoundedIcon />}
+                                                    onClick={deleteActivePlaylistCollection}
+                                                    disabled={isRendering || isLoading}
+                                                    sx={{
+                                                        color: "rgba(255,255,255,0.72)",
+                                                        fontWeight: 900,
+                                                    }}
+                                                >
+                                                    Delete list
+                                                </Button>
+                                            </Stack>
+                                        </Stack>
+                                    </Box>
+
                                     <Button
                                         fullWidth
                                         size="large"
@@ -16090,6 +17410,192 @@ export default function Audio() {
                                         </Stack>
                                     </Box>
 
+                                    <Box
+                                        sx={{
+                                            borderRadius: 4,
+                                            p: 1.6,
+                                            background: "rgba(255,255,255,0.045)",
+                                            border: "1px solid rgba(255,255,255,0.08)",
+                                        }}
+                                    >
+                                        <Stack spacing={1.35}>
+                                            <Box>
+                                                <Typography sx={{ fontWeight: 950 }}>
+                                                    Transfer songs between playlists
+                                                </Typography>
+                                                <Typography
+                                                    variant="caption"
+                                                    sx={{ color: "rgba(255,255,255,0.62)" }}
+                                                >
+                                                    Select tracks below, then copy or move them. Copy creates independent saved entries; move keeps the existing file without duplicating storage.
+                                                </Typography>
+                                            </Box>
+
+                                            {transferPlaylistOptions.length ? (
+                                                <>
+                                                    <FormControl fullWidth>
+                                                        <InputLabel id="playlist-transfer-target-label">
+                                                            Destination playlist
+                                                        </InputLabel>
+                                                        <Select
+                                                            labelId="playlist-transfer-target-label"
+                                                            value={transferTargetPlaylistId}
+                                                            label="Destination playlist"
+                                                            onChange={(event) =>
+                                                                setTransferTargetPlaylistId(
+                                                                    event.target.value
+                                                                )
+                                                            }
+                                                            disabled={isRendering || isLoading}
+                                                            sx={{
+                                                                color: "#fff",
+                                                                borderRadius: 3,
+                                                                background: "rgba(7,10,19,0.46)",
+                                                                "& .MuiOutlinedInput-notchedOutline": {
+                                                                    borderColor:
+                                                                        "rgba(255,255,255,0.16)",
+                                                                },
+                                                            }}
+                                                        >
+                                                            {transferPlaylistOptions.map(
+                                                                (collection) => (
+                                                                    <MenuItem
+                                                                        key={collection.id}
+                                                                        value={collection.id}
+                                                                    >
+                                                                        {collection.name} ({
+                                                                        collection.items.length
+                                                                    })
+                                                                    </MenuItem>
+                                                                )
+                                                            )}
+                                                        </Select>
+                                                    </FormControl>
+
+                                                    <Stack
+                                                        direction={{ xs: "column", sm: "row" }}
+                                                        spacing={1}
+                                                    >
+                                                        <Button
+                                                            fullWidth
+                                                            variant="outlined"
+                                                            onClick={selectAllPlaylistItems}
+                                                            disabled={!playlist.length || isLoading}
+                                                            sx={{
+                                                                borderRadius: 999,
+                                                                color: "#fff",
+                                                                borderColor:
+                                                                    "rgba(255,255,255,0.18)",
+                                                                fontWeight: 900,
+                                                            }}
+                                                        >
+                                                            Select all ({playlist.length})
+                                                        </Button>
+                                                        <Button
+                                                            fullWidth
+                                                            variant="text"
+                                                            onClick={clearPlaylistItemSelection}
+                                                            disabled={
+                                                                !selectedPlaylistItemIds.length ||
+                                                                isLoading
+                                                            }
+                                                            sx={{
+                                                                color: "rgba(255,255,255,0.72)",
+                                                                fontWeight: 900,
+                                                            }}
+                                                        >
+                                                            Clear selection
+                                                        </Button>
+                                                    </Stack>
+
+                                                    <Typography
+                                                        variant="caption"
+                                                        sx={{ color: "#67e8f9", fontWeight: 900 }}
+                                                    >
+                                                        {selectedPlaylistItemIds.length} selected
+                                                    </Typography>
+
+                                                    <Stack
+                                                        direction={{ xs: "column", sm: "row" }}
+                                                        spacing={1}
+                                                    >
+                                                        <Button
+                                                            fullWidth
+                                                            variant="outlined"
+                                                            startIcon={<ContentCopyRoundedIcon />}
+                                                            onClick={() =>
+                                                                transferSelectedPlaylistItems("copy")
+                                                            }
+                                                            disabled={
+                                                                !selectedPlaylistItemIds.length ||
+                                                                !transferTargetPlaylistId ||
+                                                                isLoading
+                                                            }
+                                                            sx={{
+                                                                borderRadius: 999,
+                                                                color: "#fff",
+                                                                borderColor:
+                                                                    "rgba(103,232,249,0.35)",
+                                                                fontWeight: 950,
+                                                            }}
+                                                        >
+                                                            Copy selected
+                                                        </Button>
+                                                        <Button
+                                                            fullWidth
+                                                            variant="outlined"
+                                                            startIcon={<DriveFileMoveRoundedIcon />}
+                                                            onClick={() =>
+                                                                transferSelectedPlaylistItems("move")
+                                                            }
+                                                            disabled={
+                                                                !selectedPlaylistItemIds.length ||
+                                                                !transferTargetPlaylistId ||
+                                                                isLoading
+                                                            }
+                                                            sx={{
+                                                                borderRadius: 999,
+                                                                color: "#fff",
+                                                                borderColor:
+                                                                    "rgba(167,139,250,0.38)",
+                                                                fontWeight: 950,
+                                                            }}
+                                                        >
+                                                            Move selected
+                                                        </Button>
+                                                    </Stack>
+
+                                                    <Button
+                                                        fullWidth
+                                                        variant="text"
+                                                        startIcon={<PlaylistAddRoundedIcon />}
+                                                        onClick={addLoadedSourceToTransferTarget}
+                                                        disabled={
+                                                            (!hasMedia && !sourceUrl) ||
+                                                            !transferTargetPlaylistId ||
+                                                            isLoading
+                                                        }
+                                                        sx={{
+                                                            color: "rgba(255,255,255,0.78)",
+                                                            fontWeight: 900,
+                                                        }}
+                                                    >
+                                                        Add loaded source to destination
+                                                    </Button>
+                                                </>
+                                            ) : (
+                                                <Typography
+                                                    sx={{
+                                                        color: "rgba(255,255,255,0.68)",
+                                                        lineHeight: 1.6,
+                                                    }}
+                                                >
+                                                    Create a second playlist above to enable song copying and moving.
+                                                </Typography>
+                                            )}
+                                        </Stack>
+                                    </Box>
+
                                     <Button
                                         variant={repeatEnabled ? "contained" : "outlined"}
                                         startIcon={<RepeatRoundedIcon />}
@@ -16259,6 +17765,8 @@ export default function Audio() {
                                                     getPlaylistItemArtworkSource(item)
                                                 );
                                                 const itemIsCurrentlyPlaying = Boolean(active && showPauseForPlaylistControls);
+                                                const itemSelected = selectedPlaylistItemIdSet.has(item.id);
+                                                const itemBeingEdited = editingPlaylistItemId === item.id;
                                                 const itemPlayButtonLabel = itemIsCurrentlyPlaying
                                                     ? "Pause"
                                                     : active
@@ -16273,8 +17781,8 @@ export default function Audio() {
                                                         sx={{
                                                             display: "grid",
                                                             gridTemplateColumns: {
-                                                                xs: "46px minmax(0, 1fr)",
-                                                                sm: "46px minmax(0, 1fr) auto auto 44px",
+                                                                xs: "42px 46px minmax(0, 1fr)",
+                                                                sm: "42px 46px minmax(0, 1fr) auto auto 44px",
                                                             },
                                                             gap: 1,
                                                             alignItems: "center",
@@ -16303,6 +17811,28 @@ export default function Audio() {
                                                             opacity: isDragSource ? 0.72 : 1,
                                                         }}
                                                     >
+                                                        <Checkbox
+                                                            checked={itemSelected}
+                                                            onChange={() =>
+                                                                togglePlaylistItemSelection(item.id)
+                                                            }
+                                                            disabled={
+                                                                isRendering ||
+                                                                isLoading ||
+                                                                isPreloadingPlaylist
+                                                            }
+                                                            inputProps={{
+                                                                "aria-label": `Select ${item.title} for playlist transfer`,
+                                                            }}
+                                                            sx={{
+                                                                color: "rgba(255,255,255,0.48)",
+                                                                p: 0.5,
+                                                                "&.Mui-checked": {
+                                                                    color: "#67e8f9",
+                                                                },
+                                                            }}
+                                                        />
+
                                                         {itemArtworkSource ? (
                                                             <Box
                                                                 component="img"
@@ -16365,24 +17895,113 @@ export default function Audio() {
                                                         )}
 
                                                         <Box sx={{ minWidth: 0 }}>
-                                                            <Typography
-                                                                sx={{
-                                                                    fontWeight: 900,
-                                                                    overflow: "hidden",
-                                                                    textOverflow: "ellipsis",
-                                                                    whiteSpace: "nowrap",
-                                                                }}
-                                                                title={item.title}
-                                                            >
-                                                                {index + 1}. {item.title}
-                                                            </Typography>
+                                                            {itemBeingEdited ? (
+                                                                <Stack spacing={0.75}>
+                                                                    <TextField
+                                                                        size="small"
+                                                                        fullWidth
+                                                                        autoFocus
+                                                                        value={editingPlaylistItemTitle}
+                                                                        onChange={(event) =>
+                                                                            setEditingPlaylistItemTitle(
+                                                                                event.target.value
+                                                                            )
+                                                                        }
+                                                                        onKeyDown={(event) => {
+                                                                            if (event.key === "Enter") {
+                                                                                event.preventDefault();
+                                                                                savePlaylistItemTitle(item.id);
+                                                                            }
 
-                                                            <Typography
-                                                                variant="caption"
-                                                                sx={{ color: "rgba(255,255,255,0.55)" }}
-                                                            >
-                                                                {getPlaylistItemMeta(item)}
-                                                            </Typography>
+                                                                            if (event.key === "Escape") {
+                                                                                setEditingPlaylistItemId("");
+                                                                                setEditingPlaylistItemTitle("");
+                                                                            }
+                                                                        }}
+                                                                        inputProps={{ maxLength: 160 }}
+                                                                        sx={{
+                                                                            "& .MuiOutlinedInput-root": {
+                                                                                color: "#fff",
+                                                                                borderRadius: 2,
+                                                                            },
+                                                                        }}
+                                                                    />
+                                                                    <Stack direction="row" spacing={0.5}>
+                                                                        <Button
+                                                                            size="small"
+                                                                            startIcon={<SaveRoundedIcon />}
+                                                                            onClick={() =>
+                                                                                savePlaylistItemTitle(item.id)
+                                                                            }
+                                                                            sx={{
+                                                                                color: "#67e8f9",
+                                                                                fontWeight: 900,
+                                                                            }}
+                                                                        >
+                                                                            Save
+                                                                        </Button>
+                                                                        <Button
+                                                                            size="small"
+                                                                            onClick={() => {
+                                                                                setEditingPlaylistItemId("");
+                                                                                setEditingPlaylistItemTitle("");
+                                                                            }}
+                                                                            sx={{
+                                                                                color: "rgba(255,255,255,0.62)",
+                                                                            }}
+                                                                        >
+                                                                            Cancel
+                                                                        </Button>
+                                                                    </Stack>
+                                                                </Stack>
+                                                            ) : (
+                                                                <>
+                                                                    <Typography
+                                                                        sx={{
+                                                                            fontWeight: 900,
+                                                                            overflow: "hidden",
+                                                                            textOverflow: "ellipsis",
+                                                                            whiteSpace: "nowrap",
+                                                                        }}
+                                                                        title={item.title}
+                                                                    >
+                                                                        {index + 1}. {item.title}
+                                                                    </Typography>
+
+                                                                    <Typography
+                                                                        variant="caption"
+                                                                        sx={{
+                                                                            color: "rgba(255,255,255,0.55)",
+                                                                            display: "block",
+                                                                        }}
+                                                                    >
+                                                                        {getPlaylistItemMeta(item)}
+                                                                    </Typography>
+
+                                                                    <Button
+                                                                        size="small"
+                                                                        startIcon={<EditRoundedIcon />}
+                                                                        onClick={() =>
+                                                                            beginEditingPlaylistItem(item)
+                                                                        }
+                                                                        disabled={
+                                                                            isRendering ||
+                                                                            isLoading ||
+                                                                            isPreloadingPlaylist
+                                                                        }
+                                                                        sx={{
+                                                                            mt: 0.4,
+                                                                            p: 0,
+                                                                            minWidth: 0,
+                                                                            color: "rgba(255,255,255,0.62)",
+                                                                            fontSize: 11,
+                                                                            fontWeight: 900,
+                                                                        }}
+                                                                    >
+                                                                        Rename track
+                                                                    </Button>
+                                                                </>
+                                                            )}
                                                         </Box>
 
                                                         <Button
@@ -16431,7 +18050,7 @@ export default function Audio() {
                                                                 borderColor: "rgba(255,255,255,0.18)",
                                                                 fontWeight: 900,
                                                                 gridColumn: {
-                                                                    xs: "1 / span 2",
+                                                                    xs: "1 / span 3",
                                                                     sm: "auto",
                                                                 },
                                                                 background: itemIsCurrentlyPlaying
@@ -16459,7 +18078,7 @@ export default function Audio() {
                                                                     sm: "auto",
                                                                 },
                                                                 gridColumn: {
-                                                                    xs: "1 / span 2",
+                                                                    xs: "1 / span 3",
                                                                     sm: "auto",
                                                                 },
                                                             }}
@@ -16496,7 +18115,7 @@ export default function Audio() {
                                                                 cursor: playlist.length > 1 ? "grab" : "default",
                                                                 justifySelf: "end",
                                                                 gridColumn: {
-                                                                    xs: "2",
+                                                                    xs: "3",
                                                                     sm: "auto",
                                                                 },
                                                                 touchAction: "none",
@@ -16930,6 +18549,24 @@ export default function Audio() {
                                                 label="Restart"
                                                 icon={<RestartAltRoundedIcon />}
                                                 onClick={restartPlayback}
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
+
+                                            <LegacyMediaChromeButton
+                                                label="Back 10 seconds"
+                                                icon={<Replay10RoundedIcon />}
+                                                onClick={() =>
+                                                    seekByFromMediaSession(-1, { seekOffset: 10 })
+                                                }
+                                                disabled={!hasMedia || isRendering || isLoading}
+                                            />
+
+                                            <LegacyMediaChromeButton
+                                                label="Forward 10 seconds"
+                                                icon={<Forward10RoundedIcon />}
+                                                onClick={() =>
+                                                    seekByFromMediaSession(1, { seekOffset: 10 })
+                                                }
                                                 disabled={!hasMedia || isRendering || isLoading}
                                             />
 
