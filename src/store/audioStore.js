@@ -13,7 +13,7 @@ export const audioStore = configureStore({
                 ignoredPaths: ["audioPlayer.native", "audioPlayer.workbox.updateServiceWorker"],
             },
         }),
-    devTools: process.env.NODE_ENV !== "production",
+    devTools: import.meta.env.DEV,
 });
 
 export const getAudioReduxState = () => audioStore.getState().audioPlayer;

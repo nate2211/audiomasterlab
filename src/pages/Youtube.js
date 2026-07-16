@@ -59,7 +59,7 @@ import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownR
 
 import { Helmet } from "react-helmet-async";
 
-const YOUTUBE_API_KEY = process.env.REACT_APP_YOUTUBE_API_KEY;
+const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY;
 
 const SEARCH_PAGE_SIZE = 50;
 const RECOMMENDED_PAGE_SIZE = 50;

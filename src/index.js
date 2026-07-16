@@ -1,9 +1,9 @@
 import React from "react";
-import { createRoot, hydrateRoot } from "react-dom/client";
+import { createRoot } from "react-dom/client";
 
 import "./index.css";
 import App from "./App";
-import reportWebVitals from "./reportWebVitals";
+import { clearLegacyWorker } from "./clearLegacyWorker.js";
 
 const rootElement = document.getElementById("root");
 
@@ -15,6 +15,9 @@ if (!rootElement) {
 
 const application = <App />;
 
+// Do not await cleanup: the fresh Vite UI should mount immediately.
+void clearLegacyWorker();
+
 /*
  * During react-snap:
  *   public/index.html has an empty root, so createRoot renders the page.
@@ -23,17 +26,4 @@ const application = <App />;
  *   react-snap has populated the root with static HTML, so hydrateRoot
  *   preserves that HTML and attaches React functionality to it.
  */
-if (rootElement.hasChildNodes()) {
-    hydrateRoot(rootElement, application, {
-        onRecoverableError(error) {
-            console.warn(
-                "AudioMaster Lab recovered from a hydration mismatch:",
-                error
-            );
-        },
-    });
-} else {
-    createRoot(rootElement).render(application);
-}
-
-reportWebVitals();
+createRoot(rootElement).render(application);

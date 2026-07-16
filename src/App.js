@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useMemo } from "react";
+import React, { Suspense, useMemo } from "react";
 import {
     BrowserRouter,
     Navigate,
@@ -12,7 +12,8 @@ import { Helmet, HelmetProvider } from "react-helmet-async";
 import { Provider } from "react-redux";
 
 import { audioStore } from "./store/audioStore.js";
-import { audioPlayerActions } from "./store/audioPlayerSlice.js";
+import { PlayerProvider } from "./player/PlayerContext.jsx";
+import MiniPlayer from "./player/MiniPlayer.jsx";
 
 import YoutubePage from "./pages/Youtube.js";
 import { NavBar } from "./components/Components.js";
@@ -387,136 +388,10 @@ function AppRoutes() {
                         <Route path="*" element={<NotFoundRedirect />} />
                     </Routes>
                 </Suspense>
+                <MiniPlayer />
             </Box>
         </>
     );
-}
-
-function PwaRegistration() {
-    useEffect(() => {
-        let registrationController;
-        let cancelled = false;
-
-        async function register() {
-            try {
-                const { registerAudioServiceWorker } = await import(
-                    "./pwa/registerAudioServiceWorker.js"
-                    );
-
-                if (cancelled) {
-                    return;
-                }
-
-                registrationController = registerAudioServiceWorker({
-                    onRegistered: () => {
-                        audioStore.dispatch(
-                            audioPlayerActions.setPwaStatus({
-                                serviceWorkerSupported: true,
-                                serviceWorkerRegistered: true,
-                                serviceWorkerReady: false,
-                                offlineReady: false,
-                                updateAvailable: false,
-                                lastMessage:
-                                    "AudioMaster Lab service worker registered.",
-                            })
-                        );
-                    },
-                    onReady: () => {
-                        audioStore.dispatch(
-                            audioPlayerActions.setPwaStatus({
-                                serviceWorkerSupported: true,
-                                serviceWorkerRegistered: true,
-                                serviceWorkerReady: true,
-                                offlineReady: false,
-                                updateAvailable: false,
-                                lastMessage:
-                                    "AudioMaster Lab is ready for app-shell caching.",
-                            })
-                        );
-                    },
-                    onOfflineReady: () => {
-                        audioStore.dispatch(
-                            audioPlayerActions.setPwaStatus({
-                                serviceWorkerSupported: true,
-                                serviceWorkerRegistered: true,
-                                serviceWorkerReady: true,
-                                offlineReady: true,
-                                updateAvailable: false,
-                                lastMessage:
-                                    "AudioMaster Lab app shell is ready offline.",
-                            })
-                        );
-                    },
-                    onNeedRefresh: ({ updateServiceWorker } = {}) => {
-                        audioStore.dispatch(
-                            audioPlayerActions.markPwaUpdateReady({
-                                updateServiceWorkerAvailable:
-                                    Boolean(updateServiceWorker),
-                                lastMessage:
-                                    "A fresh AudioMaster Lab version is ready.",
-                            })
-                        );
-                    },
-                    onControlling: () => {
-                        audioStore.dispatch(
-                            audioPlayerActions.setPwaStatus({
-                                serviceWorkerSupported: true,
-                                serviceWorkerRegistered: true,
-                                serviceWorkerReady: true,
-                                offlineReady: true,
-                                updateAvailable: false,
-                                lastMessage:
-                                    "AudioMaster Lab is now controlled by the updated service worker.",
-                            })
-                        );
-                    },
-                    onError: (error) => {
-                        audioStore.dispatch(
-                            audioPlayerActions.setPwaStatus({
-                                serviceWorkerSupported:
-                                    typeof navigator !== "undefined" &&
-                                    "serviceWorker" in navigator,
-                                serviceWorkerRegistered: false,
-                                serviceWorkerReady: false,
-                                offlineReady: false,
-                                updateAvailable: false,
-                                lastMessage:
-                                    error?.message ||
-                                    "Service worker registration failed.",
-                            })
-                        );
-                    },
-                });
-            } catch (error) {
-                audioStore.dispatch(
-                    audioPlayerActions.setPwaStatus({
-                        serviceWorkerSupported:
-                            typeof navigator !== "undefined" &&
-                            "serviceWorker" in navigator,
-                        serviceWorkerRegistered: false,
-                        serviceWorkerReady: false,
-                        offlineReady: false,
-                        updateAvailable: false,
-                        lastMessage:
-                            error?.message ||
-                            "Service worker module could not be loaded.",
-                    })
-                );
-            }
-        }
-
-        register();
-
-        return () => {
-            cancelled = true;
-
-            if (registrationController?.destroy) {
-                registrationController.destroy();
-            }
-        };
-    }, []);
-
-    return null;
 }
 
 const theme = createTheme({
@@ -556,19 +431,10 @@ const theme = createTheme({
  * correct here because both the snap crawl and the deployed application run
  * in a browser.
  */
-function isReactSnapRun() {
-    return (
-        typeof navigator !== "undefined" &&
-        navigator.userAgent.includes("ReactSnap")
-    );
-}
-
 export default function App({
                                 helmetContext,
                                 store = audioStore,
                             }) {
-    const reactSnapRun = isReactSnapRun();
-
     return (
         <Provider store={store}>
             <HelmetProvider context={helmetContext}>
@@ -580,10 +446,8 @@ export default function App({
                      * temporary ReactSnap Chromium session. Service-worker
                      * caching can make later routes snapshot the wrong shell.
                      */}
-                    {!reactSnapRun ? <PwaRegistration /> : null}
-
                     <BrowserRouter>
-                        <AppRoutes />
+                        <PlayerProvider><AppRoutes /></PlayerProvider>
                     </BrowserRouter>
                 </ThemeProvider>
             </HelmetProvider>

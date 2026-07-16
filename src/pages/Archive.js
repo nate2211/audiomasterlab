@@ -31,6 +31,7 @@ import PlaylistAddRoundedIcon from "@mui/icons-material/PlaylistAddRounded";
 import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
 import { Helmet } from "react-helmet-async";
+import { usePlayer } from "../player/PlayerContext.jsx";
 
 const AUDIO_EXTENSIONS = [
     ".mp3",
@@ -2408,6 +2409,7 @@ const ArchiveResultCard = React.memo(function ArchiveResultCard({
 });
 
 export default function ArchiveAudioBrowser() {
+    const { playTrack } = usePlayer();
     const restoredSessionRef = useRef(null);
 
     if (restoredSessionRef.current === null) {
@@ -3090,10 +3092,13 @@ export default function ArchiveAudioBrowser() {
                 `Opening "${title}" in the Audio player and keeping it selected in "${result.activePlaylistName}".`
             );
 
-            const playerUrl = `${AUDIO_PLAYER_ROUTE}?url=${encodeURIComponent(
-                selectedUrl
-            )}`;
-            window.location.assign(playerUrl);
+            playTrack({
+                url: selectedUrl,
+                title,
+                artist: "Internet Archive",
+                artwork: playlistItem?.artworkUrl || playlistItem?.archiveArtworkUrl || "",
+            });
+            setStatus(`Playing "${title}" now. Playback will continue while you browse other pages.`);
         } catch {
             setError("Could not open this Archive song in the Audio player.");
         }

@@ -40,7 +40,7 @@ import {
 } from "@mui/icons-material";
 
 const SCRAPE_API_ROOT =
-    process.env.REACT_APP_SCRAPE_API_ROOT ||
+    import.meta.env.VITE_SCRAPE_API_ROOT ||
     "https://scrapewebsite.pages.dev/api";
 
 const SITE_ROOT = "https://audiomasterlab.com";

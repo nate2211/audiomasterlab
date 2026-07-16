@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef } from "react";
 import { useDispatch } from "react-redux";
 
 import { audioPlayerActions } from "../store/audioPlayerSlice.js";
-import { registerAudioServiceWorker } from "../pwa/registerAudioServiceWorker.js";
 import {
     getAudioCacheSummary,
     getAudioPlaylistSnapshot,
@@ -131,50 +130,13 @@ export function useAudioReduxDexieControls({
     );
 
     useEffect(() => {
-        const controller = registerAudioServiceWorker({
-            onRegistered: () => {
-                dispatch(audioPlayerActions.setWorkboxStatus({
-                    supported: true,
-                    registered: true,
-                    message: "Audio control service worker registered.",
-                }));
-            },
-            onReady: () => {
-                dispatch(audioPlayerActions.setWorkboxStatus({
-                    supported: true,
-                    registered: true,
-                    ready: true,
-                    message: "Audio control service worker is ready.",
-                }));
-            },
-            onNeedRefresh: ({ updateServiceWorker }) => {
-                dispatch(audioPlayerActions.markWorkboxUpdateAvailable({
-                    updateServiceWorker,
-                    message: "A fresh service worker is ready. Update when playback is stopped.",
-                }));
-            },
-            onControlling: () => {
-                dispatch(audioPlayerActions.setWorkboxStatus({
-                    supported: true,
-                    registered: true,
-                    ready: true,
-                    updateAvailable: false,
-                    message: "Audio control service worker is controlling this page.",
-                }));
-            },
-            onError: (error) => {
-                dispatch(audioPlayerActions.setWorkboxStatus({
-                    supported: typeof navigator !== "undefined" && "serviceWorker" in navigator,
-                    registered: false,
-                    ready: false,
-                    message: error?.message || "Service worker registration failed.",
-                }));
-            },
-        });
-
-        return () => {
-            controller?.destroy?.();
-        };
+        dispatch(audioPlayerActions.setWorkboxStatus({
+            supported: false,
+            registered: false,
+            ready: false,
+            updateAvailable: false,
+            message: "Service worker disabled; Vite always serves the current build.",
+        }));
     }, [dispatch]);
 
     useEffect(() => {
