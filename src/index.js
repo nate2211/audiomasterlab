@@ -3,7 +3,6 @@ import { createRoot } from "react-dom/client";
 
 import "./index.css";
 import App from "./App";
-import { clearLegacyWorker } from "./clearLegacyWorker.js";
 
 const rootElement = document.getElementById("root");
 
@@ -14,9 +13,6 @@ if (!rootElement) {
 }
 
 const application = <App />;
-
-// Do not await cleanup: the fresh Vite UI should mount immediately.
-void clearLegacyWorker();
 
 /*
  * During react-snap:

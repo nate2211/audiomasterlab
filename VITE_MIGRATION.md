@@ -16,13 +16,6 @@ npm run preview
 The production site output is `dist/`. The build generates route-specific HTML
 for crawlers without launching Chromium or relying on react-snap.
 
-The `prestart`, `predev`, and `prebuild` hooks remove CRA's obsolete
-`public/index.html` automatically. Vite is configured to parse JSX retained in
-the original `.js` source files. A one-time cleanup unregisters the former
-Workbox worker and deletes its Cache Storage entries. The `/sw.js` file is only
-a self-destruct response for browsers that still request the old worker URL; it
-does not intercept or cache network requests and unregisters itself immediately.
-
 Vite environment variables use `VITE_` names:
 
 - `VITE_SCRAPE_API_ROOT`
