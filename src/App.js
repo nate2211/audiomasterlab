@@ -26,6 +26,7 @@ import Community from "./pages/Community.js";
 import NewsPage from "./pages/News.js";
 import Transcribe from "./pages/Transcribe.js";
 import Visualizer from "./pages/Visualizer.js";
+import FileShare from "./pages/FileShare.js";
 import {
     Help,
     About,
@@ -102,6 +103,13 @@ const ROUTE_SEO = {
             "Search safe public Archive.org audio collections, load direct media links, build playlists, and play browser-supported audio files in AudioMaster Lab.",
         keywords:
             "Archive.org audio browser, public domain audio, Creative Commons audio, direct media links, Archive.org playlist",
+    },
+    "/share": {
+        title: "Private Browser File Share",
+        description:
+            "Store files privately in your browser and create self-contained download links that friends can open without an account or server upload.",
+        keywords:
+            "browser file share, private file sharing, self-contained download link, IndexedDB file storage, serverless file transfer",
     },
     "/community": {
         title: "Community",
@@ -377,6 +385,7 @@ function AppRoutes() {
                         <Route path="/community" element={<Community />} />
                         <Route path="/visualizer" element={<Visualizer />} />
                         <Route path="/archive" element={<ArchiveAudioBrowser />} />
+                        <Route path="/share" element={<FileShare />} />
 
                         <Route path="/help" element={<Help />} />
                         <Route path="/about" element={<About />} />
@@ -421,16 +430,7 @@ const theme = createTheme({
     },
 });
 
-/**
- * CRA + react-snap application root.
- *
- * react-snap opens the production CRA build in a real headless browser, visits
- * each configured route, and stores the populated DOM as static HTML.
- *
- * This is build-time prerendering/SSG, not request-time SSR. BrowserRouter is
- * correct here because both the snap crawl and the deployed application run
- * in a browser.
- */
+/** Vite application root with deterministic build-time SEO route documents. */
 export default function App({
                                 helmetContext,
                                 store = audioStore,

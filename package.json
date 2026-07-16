@@ -28,10 +28,12 @@
     "dev": "vite",
     "start": "vite",
     "build": "vite build && node scripts/generate-static-seo.mjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.0.4"
+    "@vitejs/plugin-react": "^5.0.4",
+    "wrangler": "^4.111.0"
   },
   "eslintConfig": {
     "extends": [

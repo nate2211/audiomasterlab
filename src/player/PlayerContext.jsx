@@ -5,18 +5,30 @@ const PlayerContext = createContext(null);
 
 const emptyTrack = { url: "", title: "Nothing playing", artist: "AudioMaster Lab", artwork: "" };
 const readSession = () => {
-    try { return { ...emptyTrack, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") }; }
-    catch { return emptyTrack; }
+    try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+        return {
+            track: { ...emptyTrack, ...(saved.track || saved) },
+            queue: Array.isArray(saved.queue) ? saved.queue : [],
+            volume: Number.isFinite(saved.volume) ? saved.volume : 1,
+            currentTime: Number.isFinite(saved.currentTime) ? saved.currentTime : 0,
+        };
+    } catch { return { track: emptyTrack, queue: [], volume: 1, currentTime: 0 }; }
 };
 
 export function PlayerProvider({ children }) {
+    const restoredRef = useRef(null);
+    if (!restoredRef.current) restoredRef.current = readSession();
     const audioRef = useRef(null);
-    const [track, setTrack] = useState(readSession);
+    const pendingAutoplayRef = useRef(false);
+    const restoredPositionRef = useRef(restoredRef.current.currentTime);
+    const persistTimerRef = useRef(null);
+    const [track, setTrack] = useState(restoredRef.current.track);
     const [playing, setPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
-    const [volume, setVolumeState] = useState(1);
-    const [queue, setQueue] = useState([]);
+    const [volume, setVolumeState] = useState(restoredRef.current.volume);
+    const [queue, setQueue] = useState(restoredRef.current.queue);
 
     const publishMetadata = useCallback((value) => {
         if (!("mediaSession" in navigator) || !value?.url) return;
@@ -45,10 +57,11 @@ export function PlayerProvider({ children }) {
     }, []);
     const playTrack = useCallback((nextTrack, nextQueue) => {
         if (!nextTrack?.url) return;
+        pendingAutoplayRef.current = true;
+        restoredPositionRef.current = 0;
         setTrack({ ...emptyTrack, ...nextTrack });
         if (Array.isArray(nextQueue)) setQueue(nextQueue);
-        requestAnimationFrame(() => play());
-    }, [play]);
+    }, []);
     const playRelative = useCallback((direction) => {
         const index = queue.findIndex((item) => item.url === track.url);
         const next = queue[index + direction];
@@ -56,9 +69,33 @@ export function PlayerProvider({ children }) {
     }, [queue, track.url, playTrack]);
 
     useEffect(() => {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(track));
         publishMetadata(track);
     }, [track, publishMetadata]);
+
+    useEffect(() => {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = window.setTimeout(() => {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({
+                track, queue, volume, currentTime, savedAt: Date.now(),
+            }));
+        }, 250);
+        return () => window.clearTimeout(persistTimerRef.current);
+    }, [track, queue, volume, currentTime]);
+
+    useEffect(() => {
+        if (audioRef.current) audioRef.current.volume = volume;
+    }, [volume]);
+
+    useEffect(() => {
+        if (!("mediaSession" in navigator) || !duration || !Number.isFinite(duration)) return;
+        try {
+            navigator.mediaSession.setPositionState({
+                duration,
+                playbackRate: audioRef.current?.playbackRate || 1,
+                position: Math.min(Math.max(0, currentTime), duration),
+            });
+        } catch {}
+    }, [currentTime, duration]);
 
     useEffect(() => {
         const media = navigator.mediaSession;
@@ -83,11 +120,24 @@ export function PlayerProvider({ children }) {
     return <PlayerContext.Provider value={value}>
         {children}
         <audio ref={audioRef} src={track.url || undefined} preload="metadata"
+            onLoadedMetadata={(event) => {
+                event.currentTarget.volume = volume;
+                if (restoredPositionRef.current > 0 && Number.isFinite(event.currentTarget.duration)) {
+                    event.currentTarget.currentTime = Math.min(restoredPositionRef.current, event.currentTarget.duration);
+                    restoredPositionRef.current = 0;
+                }
+            }}
+            onCanPlay={() => {
+                if (!pendingAutoplayRef.current) return;
+                pendingAutoplayRef.current = false;
+                play();
+            }}
             onPlay={() => { setPlaying(true); if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing"; }}
             onPause={() => { setPlaying(false); if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused"; }}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime || 0)}
             onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
-            onEnded={() => playRelative(1)} />
+            onEnded={() => playRelative(1)}
+            onError={() => { pendingAutoplayRef.current = false; setPlaying(false); }} />
     </PlayerContext.Provider>;
 }
 

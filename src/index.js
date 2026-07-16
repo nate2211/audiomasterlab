@@ -14,12 +14,4 @@ if (!rootElement) {
 
 const application = <App />;
 
-/*
- * During react-snap:
- *   public/index.html has an empty root, so createRoot renders the page.
- *
- * After deployment:
- *   react-snap has populated the root with static HTML, so hydrateRoot
- *   preserves that HTML and attaches React functionality to it.
- */
 createRoot(rootElement).render(application);

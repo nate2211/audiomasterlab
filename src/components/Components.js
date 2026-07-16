@@ -39,6 +39,7 @@ import PeopleRoundedIcon from "@mui/icons-material/PeopleRounded";
 import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
 import NewspaperRoundedIcon from "@mui/icons-material/NewspaperRounded";
 import InfoRoundedIcon from "@mui/icons-material/InfoRounded";
+import ShareRoundedIcon from "@mui/icons-material/ShareRounded";
 
 const TOP_LEVEL_NAV_ITEMS = [
     {
@@ -83,6 +84,11 @@ const TOOLS_NAV_ITEMS = [
         label: "Visualizer",
         path: "/visualizer",
         Icon: ThreeDRotationRoundedIcon,
+    },
+        {
+        label: "File Share",
+        path: "/share",
+        Icon: ShareRoundedIcon,
     },
 ];
 

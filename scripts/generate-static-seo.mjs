@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 const routes = {
   audio: ["Audio Player & Browser Audio Tools", "Upload audio, build playlists, apply WebAudio effects and keep playback running while navigating AudioMaster Lab."],
   archive: ["Internet Archive Audio Browser", "Search public Archive.org audio, add direct playable media to playlists and continue listening across every page."],
+  share: ["Private Browser File Share", "Store files in browser storage and create self-contained download links friends can open without an account."],
   news: ["Latest Music News & New Releases", "Read the newest music articles, release updates, videos and public music stories available to AudioMaster Lab."],
   editor: ["Online Audio Editor", "Edit waveforms, effects, regions and browser audio projects, then export finished audio."],
   recorder: ["Online Audio Recorder", "Record microphones, vocals and instruments in your browser with waveform monitoring and export tools."],
